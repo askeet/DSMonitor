@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="DSMonitor.csproj" />
+  <Project Path="tests/DSMonitor.Tests/DSMonitor.Tests.csproj" />
+</Solution>
