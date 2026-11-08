@@ -1,0 +1,11 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/obj
+/.vs
+/bin/Debug/net10.0-windows
+/tests/DSMonitor.Tests/bin
+/tests/DSMonitor.Tests/obj/Debug/net10.0-windows
+/tests/DSMonitor.Tests/obj/Release/net10.0-windows
+/tests/DSMonitor.Tests/obj
