@@ -448,6 +448,8 @@ Raw model text, tool input/output, source files, credentials, and permission pay
 | PERF-009 | Handle multiple jobs without blocking one job's scan on another's I/O. |
 | PERF-010 | Do not duplicate the entire OpenCode conversation into DSMonitor logs or memory. |
 
+**Timeline ordering/retention clarification (2026-11-09, focused):** A missing event timestamp is a source-order barrier, not a sortable `MinValue`. Known-timestamp segments sort newest-first; equal timestamps retain source order. All-known-only histories retain the 500 newest events regardless of arrival position. Once any missing timestamp has been observed for a job during the monitoring run, the most recent 500-event source window remains the retention mode even if that barrier leaves the visible window; this bounded per-job ambiguity flag prevents partition-dependent policy switches. Barriers and ambiguous events cannot be merged or reordered during incremental trimming. The same policy applies before monitoring-service retention and before view-model display.
+
 ---
 
 ## 12. Automated Testing Requirements
@@ -557,3 +559,4 @@ These decisions preserve the original intent and explain implementation choices 
 - **2026-11-08 — Status clarification:** Documented verified absence of forge status and the UNKNOWN/deadline rules. TIMED OUT remains for explicit evidence.
 - **2026-11-08 — Phase assignment clarification:** Settings = Phase 4; full history/replay/search/export = Phase 3; OpenCode REST/tool/test/files/permission details = Phase 2; Phase 1 includes disabled placeholders and logging foundation.
 - **2026-11-08 — Cost clarification:** Phase 1 observed cost is log-derived only; broader cost/cache summaries remain Phase 4.
+- **2026-11-09 — Timeline ordering/retention clarification (focused):** Missing timestamps are source-order barriers. Known segments sort stably newest-first; equal timestamps preserve source order. All-known-only histories retain the 500 newest events regardless of arrival. Once any missing timestamp is observed for a job during the monitoring run, the bounded source-window mode persists even after barrier eviction; this prevents partition-dependent policy switches. The same policy applies before service retention and VM display. No other requirements changed.

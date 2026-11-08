@@ -45,9 +45,15 @@ public sealed class TestWorkspace : IDisposable
         return linkPath;
     }
 
-    public bool TryCreateFileSymbolicLink(string linkPath, string targetPath)
+    public bool TryCreateFileSymbolicLink(
+        string linkPath,
+        string targetPath,
+        out int win32Error)
     {
-        var created = ReparsePointFixture.TryCreateFileSymbolicLink(linkPath, targetPath);
+        var created = ReparsePointFixture.TryCreateFileSymbolicLink(
+            linkPath,
+            targetPath,
+            out win32Error);
         if (created)
         {
             lock (_linkGate)
@@ -146,6 +152,25 @@ public sealed class TestWorkspace : IDisposable
         {
             ["type"] = "step_start",
             ["timestamp"] = timestamp,
+            ["sessionID"] = session,
+            ["part"] = new Dictionary<string, object?>
+            {
+                ["id"] = part,
+                ["sessionID"] = session,
+                ["messageID"] = message,
+                ["type"] = "step-start"
+            }
+        });
+    }
+
+    public static string StepStartWithoutTimestamp(
+        string session = "ses_test0001",
+        string part = "prt_no_timestamp_1",
+        string message = "msg_1")
+    {
+        return JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["type"] = "step_start",
             ["sessionID"] = session,
             ["part"] = new Dictionary<string, object?>
             {

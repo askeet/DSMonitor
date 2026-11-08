@@ -102,9 +102,15 @@ public sealed class SafeFileAccessTests
         File.WriteAllText(secret, TestWorkspace.StepStart(1_800_000_000_000) + "\n");
         var link = Path.Combine(_workspace.RunsRoot, "linked.log");
 
-        if (!_workspace.TryCreateFileSymbolicLink(link, secret))
+        if (!_workspace.TryCreateFileSymbolicLink(link, secret, out var win32Error))
         {
-            Assert.Inconclusive("File symbolic links are not permitted in this test environment.");
+            var message = win32Error == 0
+                ? "unknown Win32 error"
+                : new System.ComponentModel.Win32Exception(win32Error).Message;
+            Assert.Inconclusive(
+                $"File symbolic links are unavailable (Win32 {win32Error}: {message}). " +
+                "Manual gate: run this test under an account with SeCreateSymbolicLinkPrivilege " +
+                "or Windows Developer Mode enabled; do not enable elevation or security settings automatically.");
             return;
         }
 

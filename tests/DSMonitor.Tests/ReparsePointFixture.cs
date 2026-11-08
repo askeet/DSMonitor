@@ -19,6 +19,7 @@ internal static class ReparsePointFixture
     private const uint FileFlagOpenReparsePoint = 0x00200000;
     private const uint FsctlSetReparsePoint = 0x000900A4;
     private const uint IoReparseTagMountPoint = 0xA0000003;
+    private const uint SymbolicLinkFlagAllowUnprivilegedCreate = 0x00000002;
 
     public static bool TryCreateJunction(string linkPath, string targetPath)
     {
@@ -100,7 +101,10 @@ internal static class ReparsePointFixture
         }
     }
 
-    public static bool TryCreateFileSymbolicLink(string linkPath, string targetPath)
+    public static bool TryCreateFileSymbolicLink(
+        string linkPath,
+        string targetPath,
+        out int win32Error)
     {
         var fullLink = Path.GetFullPath(linkPath);
         var fullTarget = Path.GetFullPath(targetPath);
@@ -110,25 +114,41 @@ internal static class ReparsePointFixture
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(fullLink)!);
+        win32Error = 0;
         try
         {
-            if (!CreateSymbolicLinkW(fullLink, fullTarget, 0))
+            // Try the unprivileged flag first. Developer Mode or the
+            // SeCreateSymbolicLinkPrivilege may still be required by Windows.
+            foreach (var flags in new[]
+                     {
+                         SymbolicLinkFlagAllowUnprivilegedCreate,
+                         0u
+                     })
             {
-                return false;
+                if (!CreateSymbolicLinkW(fullLink, fullTarget, flags))
+                {
+                    win32Error = Marshal.GetLastWin32Error();
+                    continue;
+                }
+
+                // Some locked-down environments report success but leave an
+                // unusable/dangling link. Treat that as unsupported for this test.
+                if (!File.Exists(fullLink))
+                {
+                    DeleteLink(fullLink);
+                    win32Error = Marshal.GetLastWin32Error();
+                    continue;
+                }
+
+                return true;
             }
 
-            // Some locked-down environments report success but leave an
-            // unusable/dangling link. Treat that as unsupported for this test.
-            if (!File.Exists(fullLink))
-            {
-                DeleteLink(fullLink);
-                return false;
-            }
-
-            return true;
+            DeleteLink(fullLink);
+            return false;
         }
         catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
         {
+            win32Error = ex is DllNotFoundException ? 126 : 127;
             return false;
         }
     }
@@ -139,6 +159,15 @@ internal static class ReparsePointFixture
         {
             if (!Directory.Exists(path) && !File.Exists(path))
             {
+                try
+                {
+                    File.Delete(path);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FileNotFoundException)
+                {
+                    // No remaining link entry to clean up.
+                }
+
                 return;
             }
 
@@ -178,7 +207,7 @@ internal static class ReparsePointFixture
         }
     }
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern SafeFileHandle CreateFileW(
         string fileName,
         uint desiredAccess,
@@ -188,7 +217,7 @@ internal static class ReparsePointFixture
         uint flagsAndAttributes,
         IntPtr templateFile);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DeviceIoControl(
         SafeFileHandle device,
@@ -200,8 +229,8 @@ internal static class ReparsePointFixture
         out int bytesReturned,
         IntPtr overlapped);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.U1)]
     private static extern bool CreateSymbolicLinkW(
         string symbolicLink,
         string targetFileName,

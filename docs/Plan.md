@@ -3,7 +3,7 @@
 **Document version:** 2.0  
 **Date:** 2026-11-09
 **Source of truth:** `docs/Project Requirements.md` (stable requirement IDs) and this roadmap.  
-**Current phase:** Phase 1 IN PROGRESS; independent Sol remediation review returned CHANGES REQUIRED. Event loss is resolved; timeline defects and file-symlink validation remain open. Prior running-dashboard visual checks passed; no interactive checks were performed during remediation.
+**Current phase:** Phase 1 IN PROGRESS / NOT ACCEPTED. Final independent Sol review returned CHANGES REQUIRED: late arrival of the first missing timestamp still makes retention depend on poll boundaries. Real file-symlink validation remains blocked by Win32 1314. Prior visual checks are retained; no interactive checks occurred during this remediation.
 **Future phases:** Phase 2–4 are **NOT STARTED**.
 
 > Status vocabulary: `NOT STARTED / IN PROGRESS / COMPLETED / BLOCKED`.
@@ -13,7 +13,7 @@
 
 ## Phase 1 — WPF Dashboard and Forge Monitoring
 
-**Status: IN PROGRESS** — independent build passed and full tests returned 82 passed / 1 skipped. Independent remediation review found two timeline defects and incomplete file-symlink coverage. Phase 1 is not accepted.
+**Status: IN PROGRESS** — independent checks: 101 passed / 1 skipped / 102 total; build zero warnings/errors. Remaining late-first-missing retention defect and real-symlink gate prevent acceptance.
 
 **Goal:** Deliver a polished, read-only WPF dashboard that starts and stops DSMonitor monitoring, discovers existing/new forge-delegate jobs, incrementally reads metadata and logs, shows real events/statuses safely, and writes one unique monitoring log per Start.
 
@@ -29,7 +29,7 @@
 - [x] Implement forge runs discovery for existing and newly created jobs. `[FR-010..019, DATA-001..008]`
 - [ ] Complete defensive path validation coverage: guarded opens and junction tests independently verified; file-symlink test remains skipped due to Windows privilege restriction. `[DATA-002..008, SEC-012]`
 - [x] Resolve large-batch event loss: independent reproduction verified all 800 events persisted to both logs with UI capped at 500. `[DATA-010..020, PERF-001..005]`
-- [ ] Complete timeline ordering: newest-event retention and mixed missing/known timestamp ordering remain defective after independent re-review. `[UI-015, DATA-015, PERF-007]`
+- [ ] Complete timeline retention: shared ordering and persistent ambiguity mode implemented, but independent QA reproduced a poll-boundary mismatch when the first missing timestamp arrives after all-known retention. `[UI-015, DATA-015, PERF-004, PERF-007]`
 - [x] Implement event dedupe and bounded timelines. `[DATA-015, DATA-017, TEST-006]`
 - [x] Implement explicit forge status mapping, UNKNOWN default, and separate monitoring state. `[LIFE-001..013]`
 - [x] Implement job/session correlation without merging jobs. `[LIFE-009..013, FR-020]`
@@ -65,12 +65,12 @@
 - [x] Existing jobs are displayed; missing status is UNKNOWN, not guessed.
 - [x] New jobs are detected without restarting DSMonitor.
 - [x] Selecting a job displays actual available metadata/events.
-- [x] Incremental reads preserve all accepted events: independent reproduction persisted 800/800 in both JSONL and text logs with bounded UI retention. Correct selection of the newest retained events remains open separately.
+- [x] Incremental reads preserve all accepted events: independent reproduction persisted 800/800 in both JSONL and text logs with bounded UI retention. Newest-event selection and missing-timestamp barriers now pass service→view-model tests; independent re-review pending.
 - [x] Stop Monitoring stops only DSMonitor and closes its log files.
 - [x] Repeated Start/Stop cycles create unique logs and clean up watchers/writers.
 - [x] Forge files are byte-for-byte unchanged by monitoring.
 - [x] No HTTP/OpenCode REST/Prompt/permission/process-control code exists in Phase 1.
-- [x] All 65 baseline tests and 17 applicable new tests pass; 1 environment-conditional file-symlink fixture is skipped.
+- [x] All 65 original tests and all prior applicable tests pass; final full suite is 101 passed / 1 skipped / 102 total. The only skip is the environment-conditional real file-symlink fixture.
 - [ ] Independent Sol QA accepted. **CHANGES REQUIRED**
 - [x] Independent visual check of running dashboard passed; broader DPI/accessibility validation remains Phase 4.
 
@@ -78,19 +78,20 @@
 
 | Check | Command | Result |
 |---|---|---|
-| Baseline build | `dotnet build .\DSMonitor.slnx` | Passed before remediation: 0 warnings, 0 errors |
-| Baseline tests | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --no-build` | Passed before remediation: 65/65 |
-| Remediation targeted tests | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --filter "FullyQualifiedName~SafeFileAccessTests|FullyQualifiedName~JobRowTimelineOrderingTests"` | 12 passed, 1 skipped (file-symlink fixture unsupported in this environment) |
-| Remediation batch tests | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --filter "FullyQualifiedName~LargeBatch|FullyQualifiedName~SuccessiveLargeBatches"` | 5/5 passed |
+| Baseline build — commit `9e4ac10` | `dotnet build .\DSMonitor.slnx` | Passed before this task: 0 warnings, 0 errors |
+| Baseline full suite | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --no-build` | Passed before this task: 82 passed, 1 skipped, 83 total; all 65 original tests preserved |
+| Timeline policy tests | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --filter "FullyQualifiedName~TimelineOrderingTests|FullyQualifiedName~TimelineServiceViewModelTests|FullyQualifiedName~JobRowTimelineOrderingTests"` | 27/27 passed |
+| 502-event ambiguity/partition regression | `ServiceToViewModel_AmbiguousModePersistsAcrossPartitionsAfterBarrierEviction` | Passed; single/501+1/1+501/250+252/500+2 all retain identical 500..1 window; 502/502 accepted events in each `.log` and `.jsonl` |
+| Symlink fixture | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --filter "FullyQualifiedName~OpenRead_FileSymbolicLink"` | Skipped; Win32 1314 (privilege required) with manual gate message |
 | Phase 1 solution build | `dotnet build .\DSMonitor.slnx` | Passed: 0 warnings, 0 errors |
-| Full local suite | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --no-build` | Passed: 83 total, 82 passed, 1 skipped (environment-conditional symlink test); all 65 baseline tests preserved |
+| Full local suite | `dotnet test .\Tests\DSMonitor.Tests\DSMonitor.Tests.csproj --no-build` | Passed: 102 total, 101 passed, 1 skipped (environment-conditional symlink test); all 65 original and all prior passing tests preserved |
 | UI empty-state smoke | MSTest `MainWindow_LoadsLaysOutAndRendersWithoutException` | Passed in full suite |
 | UI populated-state smoke | MSTest `MainWindow_PopulatedStateRendersAndShowsRealDataControls` | Passed in full suite |
 | Read-only check | `Run_ReadOnly_DoesNotModifyForgeFiles` | Passed |
 | Unique logs / close check | `Run_RepeatedLifecycle_CreatesUniqueLogsAndClosesThem` | Passed |
 | Large-batch logging | `Run_LargeBatch_LogsAllEventsWhileSnapshotRetainsNewest500` | Passed: 800 JSONL events, 500 UI snapshot events |
 | Path confinement | `OpenRead_JunctionEscape_IsRejectedBeforeContentRead`, `Discovery_RootJunction_FailsClosed`, `Reader_PathReplacedWithJunctionAfterConstruction_FailsClosed` | Passed |
-| Timeline ordering | `Update_DistinctTimestampsOutOfOrder_SortsNewestFirst`, equal/missing source-order tests, 500/501/800 retention tests | Passed |
+| Timeline ordering | `TimelineOrderingTests`, `JobRowTimelineOrderingTests`, and `TimelineServiceViewModelTests` | 24/24 passed; service→VM coverage includes 500/501/800, out-of-order batches, missing barriers, all-missing, mixed retention, deterministic repeats |
 
 ### 1.5 Known limitations / risks
 
@@ -100,8 +101,9 @@
 - Tool Activity/Tests/Files tabs are Phase 2 placeholders; Phase 1 only has event summaries and a bounded Raw Log preview.
 - Saved monitoring history browsing/replay is Phase 3. Phase 1 creates the files but does not provide a history UI.
 - Settings is a disabled Phase 4 placeholder.
-- Independent Sol QA returned CHANGES REQUIRED. A single authorized bounded remediation task implemented fixes for the three findings, but their acceptance remains pending independent re-review.
+- Independent Sol QA returned CHANGES REQUIRED. Authorized bounded remediation implemented ordering and path fixes; timeline acceptance and real file-symlink validation remain pending independent re-review.
 - FileSystemWatcher is best-effort; periodic reconciliation is the correctness backstop.
+- File-symlink coverage remains unverified in this environment: `CreateSymbolicLinkW` returns Win32 1314 even with `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`; no elevation/Developer Mode was enabled.
 
 **Remediation evidence for independent review findings (2026-11-09; acceptance pending):**
 
@@ -109,13 +111,13 @@
 - **P2 — Event loss — IMPLEMENTED / PENDING INDEPENDENT QA.** Removed the per-poll 500-event drop from `ForgeLogTailReader`; byte/line bounds remain, dedupe/cursor behavior is preserved, and all accepted events are returned for logging. Tests cover 500/501/800-event batches and successive 300/300/200 appends. End-to-end `Run_LargeBatch_LogsAllEventsWhileSnapshotRetainsNewest500` confirms 800 `log_event` entries in `.jsonl` while the snapshot/UI remains capped at 500.
 - **P2 — Timeline order — IMPLEMENTED / PENDING INDEPENDENT QA.** `JobRowViewModel` now uses a stable newest-first timestamp ordering, no `ObservedAt`/`EventKey` tie-break, and preserves original source order for equal/missing timestamps. Tests cover out-of-order timestamps, equal/missing timestamps across batches, and 500/501/800 retention boundaries. The service snapshot now preserves source order rather than re-sorting by key.
 
-**Remediation validation:** Baseline `dotnet build DSMonitor.slnx` passed 0/0; baseline `dotnet test Tests/DSMonitor.Tests/DSMonitor.Tests.csproj --no-build` passed 65/65. Final build passed 0/0. Final full suite: 83 total, 82 passed, 1 skipped (file-symlink fixture unsupported in this environment); all 65 baseline tests preserved. Targeted remediation filters passed 5/5 batch tests and 12/13 path/ordering tests (1 environment skip).
+**Remediation validation:** Baseline before this final correction: 99 total, 98 passed, 1 skipped; build 0/0. Final build passed 0/0. Final full suite: 102 total, 101 passed, 1 skipped (file-symlink privilege); all original and prior passing tests preserved. Targeted timeline policy/service→VM checks passed 27/27; the real symlink fixture remains explicitly skipped with Win32 1314.
 
-**Repair limit:** original two focused repair cycles were exhausted before this exception. The authorized exception allowed two internal correction attempts; both were used (symlink fixture support handling; outside-root `LogMissing` compatibility). No further correction attempts remain.
+**Repair limit:** prior repair history remains exhausted and was not reset. The final focused correction was used for persistent timeline ambiguity mode and the 502-event partition regression. **Correction 2/2 is now consumed; zero correction attempts remain.** No further repairs or workers will be started.
 
 ### 1.6 Independent remediation review — 2026-11-09
 
-**Verdict: CHANGES REQUIRED.** The one additional user-authorized bounded DeepSeek task is finished; no further implementation was delegated. All 65 original tests still pass, and review found no deleted or weakened original tests. The full suite includes one new skipped symlink test, so the user's no-skipped-tests acceptance condition is unmet.
+**Verdict at that review: CHANGES REQUIRED.** The preceding authorized bounded task was finished; no implementation was delegated during that review. All 65 original tests still passed, and review found no deleted or weakened original tests. The suite included one environment-skipped symlink test, so no-skipped acceptance remained unmet. The bounded follow-up below supersedes the timeline portion of this historical verdict.
 
 | Check | Independently observed result |
 |---|---|
@@ -126,15 +128,19 @@
 | Junction escape, root junction, root replacement | Passed; no concrete remaining path-confinement defect found |
 | File-symlink fixture | Unverified: independent Win32 attempts with flags 0 and 2 returned error 1314; .NET likewise reported missing privilege |
 
-**Remaining findings:**
+**Remaining findings after the bounded ordering/symlink task (2026-11-09):**
 
-- **P2 — Newest timestamp events lost from retained display:** `Services/ForgeMonitoringService.cs:277` trims by source position before timestamp ordering. Independent descending-timestamp appends at 500 → 501 → 800 events retained the true newest event at 500 but discarded it at 501 and 800. Apply agreed ordering before selecting the retained 500, and cover this through the service-to-view-model path.
-- **P2 — Ambiguous mixed timestamp ordering:** `ViewModels/JobRowViewModel.cs:156` substitutes `MinValue` for absent timestamps. Independent `[missing-first, known-second]` input becomes `[known-second, missing-first]`, violating source-order preservation where no reliable comparison exists. Add mixed known/missing timestamp regression coverage across batches.
-- **Validation gap — File symlinks:** run the existing new regression in an environment permitted to create file symlinks; a skip does not establish safety or meet the no-skips requirement. No OpenCode, forge, agent, or Windows security settings were changed.
+- **P2 — Newest timestamp events lost from retained display — IMPLEMENTED / PENDING INDEPENDENT QA.** Shared `TimelineOrdering` applies retention before service selection and again before VM display. All-known-only histories retain the 500 newest timestamps regardless of arrival. The former 500→501→800 descending-arrival reproduction passes through the actual service→view-model path.
+- **P2 — Ambiguous mixed timestamp ordering — IMPLEMENTED / PENDING INDEPENDENT QA.** Missing timestamps are source-order barriers, not `MinValue` sentinels. Known segments sort stably newest-first; equal timestamps preserve source order. A per-job “has observed ambiguous timestamps” flag is persisted for the monitoring run and carried in each `ForgeJobSnapshot`; once set, retention stays in source-window mode even after the barrier leaves the visible window. The independent 502-event repro now yields the same 500..1 window for single-poll and 501+1/1+501/250+252/500+2 partitions; all 502 events remain in both logs.
+- **Validation gap — File symlinks — OPEN.** The explicit real file-symlink test remains skipped because this account lacks the required privilege. `CreateSymbolicLinkW` returns Win32 **1314** (`ERROR_PRIVILEGE_NOT_HELD`) for both flags 0 and `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`; no elevation, Developer Mode, or security settings were enabled. Junction/root-replacement tests and deterministic production-path logic tests pass but are not equivalent to a real file-symlink test.
 
-Earlier implementation/pending-review notes in section 1.5 describe worker evidence; this final independent verdict supersedes their pending labels. The event-loss finding is resolved. The path fix is implemented with independently verified junction protection, but broader symlink validation is incomplete. Timeline acceptance remains open.
+**Agreed ordering policy (applied before service retention and VM display):** source-order barriers are missing timestamps. Each adjacent known-timestamp segment sorts newest-first with stable equal-timestamp source order. A history containing only known timestamps retains the 500 newest regardless of arrival. Once any missing timestamp has been observed for a job during the monitoring run, the most recent 500-event source window remains the retention mode even if that barrier is later evicted from the visible window. The bounded per-job ambiguity flag prevents partition-dependent policy switches; ambiguous events are never reordered across a missing barrier.
 
-**Phase completion gate:** repair and independently revalidate both remaining timeline cases; complete file-symlink testing without skips. Phases 2–4 remain NOT STARTED. No interactive computer use or screen access occurred during remediation.
+**Symlink manual gate:** run `OpenRead_FileSymbolicLink_FailsClosedWhenSupported` under an account with `SeCreateSymbolicLinkPrivilege` or Windows Developer Mode enabled, without automatic elevation or global security changes. The test message includes the Win32 code and manual instructions. Phase 1 cannot be marked COMPLETED unless real file-symlink verification succeeds and independent QA accepts the timeline/symlink remediation.
+
+Earlier implementation/pending-review notes in section 1.5 describe worker evidence; this bounded remediation supersedes their timeline labels but does not constitute independent acceptance. Event-loss remains independently resolved. Junction protection remains independently verified; file-symlink validation remains open.
+
+**Phase completion gate:** independent QA must accept both timeline remediations and the real file-symlink manual gate must pass. Phases 2–4 remain NOT STARTED. No interactive computer use or screen access occurred during remediation.
 
 ---
 
@@ -260,7 +266,7 @@ Earlier implementation/pending-review notes in section 1.5 describe worker evide
 
 | Phase | Requirements | Depends on | Status |
 |---|---|---|---|
-| 1 | `PRJ-001..005`, `ARC-001..008`, `FR-001..046`, `UI-001..020`, `DATA-001..020`, `LIFE-001..015`, `LOG-001..011`, `SEC-001..015`, `ERR-001..011/014..021`, `PERF-001..010`, `TEST-001..017`, `ACC-P1-001..015` | Existing solution, forge runs | IN PROGRESS (CHANGES REQUIRED) |
+| 1 | `PRJ-001..005`, `ARC-001..008`, `FR-001..046`, `UI-001..020`, `DATA-001..020`, `LIFE-001..015`, `LOG-001..011`, `SEC-001..015`, `ERR-001..011/014..021`, `PERF-001..010`, `TEST-001..017`, `ACC-P1-001..015` | Existing solution, forge runs | IN PROGRESS (BOUNDED REMEDIATION; INDEPENDENT QA PENDING) |
 | 2 | `ARC-009`, `OC-001..010`, `FR-020`, `UI-013..014`, `ERR-012..015`, `TEST-018` | Phase 1 accepted, OpenCode service | NOT STARTED |
 | 3 | `LOG-012`, `FR-006`, `UI-012`, `TEST-018`, export/privacy requirements | Phase 2 accepted, stored logs | NOT STARTED |
 | 4 | `PRJ-005`, `PRJ-008`, `FR-045`, `UI-019`, `LOG-013`, `PERF-001..010`, `SEC-009..015`, `TEST-020` | Phase 3 accepted | NOT STARTED |
@@ -268,5 +274,26 @@ Earlier implementation/pending-review notes in section 1.5 describe worker evide
 ## Change Log
 
 - **2026-11-09:** One authorized bounded remediation completed. Independent build clean; 82 tests passed / 1 skipped. All 800 events independently verified in both logs; junction guards verified. Independent Sol review returned CHANGES REQUIRED for newest-timestamp retention and mixed missing/known timestamp order; file-symlink coverage remains blocked by missing Windows privilege. Phase 1 not accepted; Phases 2–4 NOT STARTED.
+- **2026-11-09 — bounded ordering/symlink follow-up:** Added shared `TimelineOrdering` source-order barrier policy, service-retention integration, and service→VM ordering/retention tests. File-symlink fixture P/Invoke now uses `ExactSpelling`, `U1` return marshaling, and explicit Win32 error reporting; real fixture still unavailable (1314). Phase 1 remains IN PROGRESS pending independent QA and manual symlink verification.
+- **2026-11-09 — final correction 2/2:** Persisted a bounded per-job “has observed ambiguous timestamps” mode in the monitoring run and `ForgeJobSnapshot`; source-window retention no longer switches back to all-known mode after barrier eviction. Added the 502-event single/501+1/1+501/250+252/500+2 service→VM regression and `.log`/`.jsonl` 502/502 persistence checks. Remaining correction allowance: zero. Phase 1 remains IN PROGRESS pending independent final QA.
 
 - **2026-11-08:** Reorganized requirements and roadmap; implemented Phase 1 and passed 65 tests/build. Independent Sol review returned CHANGES REQUIRED (path confinement, event loss, timeline order); running-app visual check passed. Phase 1 remains IN PROGRESS and Phases 2–4 remain NOT STARTED.
+
+## Final Independent Follow-up Verdict — 2026-11-09
+
+**CHANGES REQUIRED. Phase 1 remains IN PROGRESS / NOT ACCEPTED.** This verdict supersedes earlier pending-review labels and implementation claims above.
+
+- Independent timeline filters: **27 passed / 0 failed / 0 skipped**.
+- Independent security/junction/parser/tailer filters: **34 passed / 0 failed / 1 skipped**.
+- Full suite: `dotnet test Tests/DSMonitor.Tests/DSMonitor.Tests.csproj --no-build` — **101 passed / 0 failed / 1 skipped / 102 total**.
+- Final independent `dotnet build DSMonitor.slnx --no-restore` — **0 warnings / 0 errors**; worker exact solution build also passed.
+- Original assertions preserved; test changes were additive or fixture/helper adaptations. Production guarded-file code and previously fixed tail logging were unchanged.
+- All 53 source/document/test fingerprints and file inventory captured by the parent remained unchanged during final review. The reviewer separately verified all 12 affected files. Documentation was updated after review to record this verdict.
+
+**Resolved timeline cases:** all-known newest-500 retention, missing-first ordering, equal timestamps, and the earlier missing-first 502-event single/split reproduction. The persistent per-job ambiguity flag is bounded and resets with a new monitoring run. All accepted events still reach the monitoring logs independently of display retention; 800-event and 502-event integration checks passed.
+
+**Remaining P2 — First missing timestamp arrives after retention:** actual service → view-model reproduction used the same 502-event source `[known502, known501, ..., known2, missing]`. A single poll retained `known500..2 + missing`; split `501 + 1` retained `known501..3 + missing`. Both parsed 502 events and displayed 500. Timestamp-based retention had already discarded source arrivals needed by the later source-window policy. A persistent ambiguity flag cannot recover those discarded candidates. No further repair was performed. A possible future bounded repair is to retain both a bounded last-500 source window and newest-500 timestamp candidate set until ambiguity is observed, then consistently use the source window; that design is a proposal, not implemented or verified.
+
+**Real file-symlink gate:** still **UNVERIFIED**. Both unprivileged creation attempts (flags 2 and 0) returned **Win32 1314 / ERROR_PRIVILEGE_NOT_HELD**. The real integration test explicitly reports a skip. Passing junction and deterministic path checks do not establish real file-symlink coverage. Required manual validation: in a separately authorized environment/account already permitted to create file symlinks, run `dotnet test Tests/DSMonitor.Tests/DSMonitor.Tests.csproj --filter FullyQualifiedName~OpenRead_FileSymbolicLink_FailsClosedWhenSupported`; confirm it actually creates the link and passes with zero skips. No automatic elevation, Developer Mode, or security-setting change was performed or is authorized here.
+
+**Bounded task closed:** both local correction attempts consumed (STA harness, persistent ambiguity mode). Zero remaining; original repair history remains intact. One Sol reviewer performed the consolidated review and focused final revalidation. Phases 2–4 remain **NOT STARTED**.

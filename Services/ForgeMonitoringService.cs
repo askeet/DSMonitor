@@ -274,9 +274,22 @@ public sealed class ForgeMonitoringService
                 }
             }
 
+            var hasObservedAmbiguity =
+                state.AmbiguousTimelineJobs.Contains(metadata.JobId) ||
+                recent.Any(item => item.Timestamp is null);
+            if (hasObservedAmbiguity)
+            {
+                state.AmbiguousTimelineJobs.Add(metadata.JobId);
+            }
+
             if (recent.Count > _options.MaxRecentEventsPerJob)
             {
-                recent.RemoveRange(0, recent.Count - _options.MaxRecentEventsPerJob);
+                var retained = TimelineOrdering.RetainSourceOrder(
+                    recent,
+                    _options.MaxRecentEventsPerJob,
+                    hasObservedAmbiguity);
+                recent.Clear();
+                recent.AddRange(retained);
             }
 
             if (state.PreviousStatuses.TryGetValue(metadata.JobId, out var previousStatus) &&
@@ -310,6 +323,7 @@ public sealed class ForgeMonitoringService
                 LastActivity = reader.LastActivity,
                 ParsedEventCount = reader.TotalUniqueEvents,
                 ObservedCost = reader.HasCost ? reader.TotalCost : null,
+                HasObservedAmbiguousTimestamps = hasObservedAmbiguity,
                 Events = recent.ToArray(),
                 Warnings = jobWarnings,
                 ObservedAt = observedAt
@@ -327,6 +341,7 @@ public sealed class ForgeMonitoringService
             state.LastSessions.Remove(staleId);
             state.SeenEventKeys.Remove(staleId);
             state.SeenKeyOrder.Remove(staleId);
+            state.AmbiguousTimelineJobs.Remove(staleId);
         }
 
         if (eventsToLog.Count > 0)
@@ -366,6 +381,8 @@ public sealed class ForgeMonitoringService
         public Dictionary<string, HashSet<string>> SeenEventKeys { get; } =
             new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, Queue<string>> SeenKeyOrder { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> AmbiguousTimelineJobs { get; } =
             new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, ForgeJobStatus> PreviousStatuses { get; } =
             new(StringComparer.OrdinalIgnoreCase);

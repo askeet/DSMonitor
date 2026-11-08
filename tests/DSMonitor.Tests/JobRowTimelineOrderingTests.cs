@@ -98,6 +98,24 @@ public sealed class JobRowTimelineOrderingTests
     }
 
     [TestMethod]
+    public void Update_PersistentAmbiguityMode_KeepsSourceWindowAfterBarrierEviction()
+    {
+        var events = Enumerable.Range(0, 502)
+            .Select(index => Event(
+                "event-" + index.ToString("0000"),
+                new DateTimeOffset(2026, 11, 9, 10, 0, 0, TimeSpan.Zero)
+                    .AddSeconds(502 - index)
+                    .ToUnixTimeMilliseconds()))
+            .ToArray();
+
+        var row = new JobRowViewModel(Snapshot(events, hasObservedAmbiguity: true));
+
+        Assert.AreEqual(500, row.RecentEvents.Count);
+        Assert.AreEqual("event-0002", row.RecentEvents[0].EventKey);
+        Assert.AreEqual("event-0501", row.RecentEvents[^1].EventKey);
+    }
+
+    [TestMethod]
     public void Update_RetentionAcrossIncrementalBatches_RemainsOrderedAndDuplicateFree()
     {
         var all = Enumerable.Range(0, 800)
@@ -128,6 +146,11 @@ public sealed class JobRowTimelineOrderingTests
         new(Snapshot(events));
 
     private static ForgeJobSnapshot Snapshot(params MonitoringEvent[] events) =>
+        Snapshot(events, events.Any(item => item.Timestamp is null));
+
+    private static ForgeJobSnapshot Snapshot(
+        IReadOnlyList<MonitoringEvent> events,
+        bool hasObservedAmbiguity) =>
         new()
         {
             Metadata = new ForgeJobMetadata
@@ -138,8 +161,9 @@ public sealed class JobRowTimelineOrderingTests
             Status = ForgeJobStatus.Unknown,
             SessionId = "ses_timeline_0001",
             ObservedAt = DateTimeOffset.UtcNow,
+            HasObservedAmbiguousTimestamps = hasObservedAmbiguity,
             Events = events,
-            ParsedEventCount = events.Length
+            ParsedEventCount = events.Count
         };
 
     private static MonitoringEvent Event(string key, long? timestamp) =>

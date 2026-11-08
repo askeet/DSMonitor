@@ -1,12 +1,13 @@
 using System.Collections.ObjectModel;
 using System.IO;
 using DSMonitor.Models;
+using DSMonitor.Services;
 
 namespace DSMonitor.ViewModels;
 
 public sealed class JobRowViewModel : ObservableObject
 {
-    public const int MaxTimelineEvents = 500;
+    public const int MaxTimelineEvents = TimelineOrdering.DefaultCapacity;
 
     private ForgeJobStatus _status = ForgeJobStatus.Unknown;
     private string _projectText = "—";
@@ -149,12 +150,14 @@ public sealed class JobRowViewModel : ObservableObject
 
     private void MergeEvents(IReadOnlyList<MonitoringEvent> incoming)
     {
-        // OrderByDescending is stable. Distinct timestamps sort newest-first,
-        // while equal or missing timestamps retain the original source order.
+        // Shared policy: missing timestamps are source-order barriers, known
+        // segments sort newest-first, and equal timestamps keep source order.
         // ObservedAt and EventKey are deliberately not used as tie-breakers.
-        var desired = incoming
-            .OrderByDescending(item => item.Timestamp ?? DateTimeOffset.MinValue)
-            .Take(MaxTimelineEvents)
+        var desired = TimelineOrdering
+            .OrderForDisplay(
+                incoming,
+                MaxTimelineEvents,
+                Snapshot.HasObservedAmbiguousTimestamps)
             .ToList();
 
         var desiredKeys = desired

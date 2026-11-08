@@ -11,6 +11,14 @@ public sealed record ForgeJobSnapshot
     public DateTimeOffset? LastActivity { get; init; }
     public int ParsedEventCount { get; init; }
     public double? ObservedCost { get; init; }
+
+    /// <summary>
+    /// True once any event with a missing timestamp has been observed for this
+    /// monitoring run. The bounded source-window retention policy then remains
+    /// in force even after the barrier itself leaves the visible window.
+    /// </summary>
+    public bool HasObservedAmbiguousTimestamps { get; init; }
+
     public IReadOnlyList<MonitoringEvent> Events { get; init; } = Array.Empty<MonitoringEvent>();
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
     public DateTimeOffset ObservedAt { get; init; }
