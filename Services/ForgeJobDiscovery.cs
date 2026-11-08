@@ -34,6 +34,12 @@ public sealed class ForgeJobDiscovery
             return new ForgeDiscoveryResult(jobs, false, warnings);
         }
 
+        if (!SafeFileAccess.TryValidateTrustedRoot(RunsRoot, out var rootWarning))
+        {
+            warnings.Add(rootWarning ?? "Forge runs directory could not be verified safely.");
+            return new ForgeDiscoveryResult(jobs, false, warnings);
+        }
+
         IEnumerable<string> files;
         try
         {

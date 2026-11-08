@@ -184,6 +184,50 @@ public sealed class ForgeLogTailReaderTests
         Assert.IsTrue(result.NewEvents.Count > 0);
     }
 
+    [DataTestMethod]
+    [DataRow(500)]
+    [DataRow(501)]
+    [DataRow(800)]
+    public void Poll_LargeBatch_ReturnsEveryAcceptedEvent(int eventCount)
+    {
+        var jobId = "job_batch_" + eventCount;
+        var lines = BuildEventLines(eventCount);
+        File.WriteAllText(_workspace.LogPath(jobId), string.Join("\n", lines) + "\n");
+        var reader = CreateReader(jobId);
+
+        var result = reader.Poll(DateTimeOffset.UtcNow);
+
+        Assert.AreEqual(eventCount, result.NewEvents.Count);
+        Assert.AreEqual(eventCount, reader.TotalUniqueEvents);
+        Assert.AreEqual(new FileInfo(_workspace.LogPath(jobId)).Length, reader.Offset);
+        Assert.AreEqual(0, reader.Poll(DateTimeOffset.UtcNow).NewEvents.Count);
+    }
+
+    [TestMethod]
+    public void Poll_SuccessiveLargeBatches_AreDeliveredWithoutLossOrDuplicates()
+    {
+        var jobId = "job_batch_sequence";
+        var reader = CreateReader(jobId);
+
+        File.WriteAllText(
+            _workspace.LogPath(jobId),
+            string.Join("\n", BuildEventLines(0, 300)) + "\n");
+        Assert.AreEqual(300, reader.Poll(DateTimeOffset.UtcNow).NewEvents.Count);
+
+        File.AppendAllText(
+            _workspace.LogPath(jobId),
+            string.Join("\n", BuildEventLines(300, 300)) + "\n");
+        Assert.AreEqual(300, reader.Poll(DateTimeOffset.UtcNow).NewEvents.Count);
+
+        File.AppendAllText(
+            _workspace.LogPath(jobId),
+            string.Join("\n", BuildEventLines(600, 200)) + "\n");
+        Assert.AreEqual(200, reader.Poll(DateTimeOffset.UtcNow).NewEvents.Count);
+
+        Assert.AreEqual(800, reader.TotalUniqueEvents);
+        Assert.AreEqual(0, reader.Poll(DateTimeOffset.UtcNow).NewEvents.Count);
+    }
+
     [TestMethod]
     public void ReadTailPreview_IsBoundedAndConfinedToRunsRoot()
     {
@@ -213,4 +257,22 @@ public sealed class ForgeLogTailReaderTests
             _workspace.LogPath(jobId),
             _workspace.RunsRoot,
             maxBytesPerPoll: 256 * 1024);
+
+    private static string[] BuildEventLines(int eventCount) =>
+        BuildEventLines(0, eventCount);
+
+    private static string[] BuildEventLines(int startIndex, int count)
+    {
+        var lines = new string[count];
+        for (var index = 0; index < count; index++)
+        {
+            var sequence = startIndex + index;
+            lines[index] = TestWorkspace.StepStart(
+                1_800_000_000_000 + sequence,
+                part: "p" + sequence,
+                message: "m" + sequence);
+        }
+
+        return lines;
+    }
 }

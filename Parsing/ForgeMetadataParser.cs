@@ -18,12 +18,17 @@ public static class ForgeMetadataParser
         var fileStem = Path.GetFileNameWithoutExtension(metadataPath);
         try
         {
-            using var stream = new FileStream(
-                metadataPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            using var document = JsonDocument.Parse(stream, new JsonDocumentOptions
+            using var opened = SafeFileAccess.OpenRead(metadataPath, runsRoot);
+            if (opened.Stream is null)
+            {
+                return CreateInvalid(
+                    metadataPath,
+                    fileStem,
+                    runsRoot,
+                    opened.Warning ?? "Job metadata could not be read safely.");
+            }
+
+            using var document = JsonDocument.Parse(opened.Stream!, new JsonDocumentOptions
             {
                 AllowTrailingCommas = true,
                 CommentHandling = JsonCommentHandling.Skip

@@ -28,7 +28,6 @@ public sealed class ForgeLogTailReader
     private readonly string _runsRoot;
     private readonly long _maxBytesPerPoll;
     private readonly long _maxLineBytes;
-    private readonly int _maxEventsPerPoll;
     private readonly byte[] _byteBuffer;
     private readonly char[] _charBuffer;
     private readonly StringBuilder _pending = new();
@@ -45,15 +44,13 @@ public sealed class ForgeLogTailReader
         string logPath,
         string runsRoot,
         long maxBytesPerPoll = 512 * 1024,
-        long maxLineBytes = 1024 * 1024,
-        int maxEventsPerPoll = 500)
+        long maxLineBytes = 1024 * 1024)
     {
         JobId = jobId;
         LogPath = logPath;
         _runsRoot = runsRoot;
         _maxBytesPerPoll = Math.Max(4096, maxBytesPerPoll);
         _maxLineBytes = Math.Max(4096, maxLineBytes);
-        _maxEventsPerPoll = Math.Max(1, maxEventsPerPoll);
         _byteBuffer = new byte[(int)Math.Min(_maxBytesPerPoll, 256 * 1024)];
         _charBuffer = new char[Utf8.GetMaxCharCount(_byteBuffer.Length)];
         IsPathAllowed = PathSafety.IsWithinRoot(logPath, runsRoot);
@@ -77,30 +74,28 @@ public sealed class ForgeLogTailReader
         var newEvents = new List<MonitoringEvent>();
         var warnings = new List<string>();
 
-        if (!IsPathAllowed)
+        using var opened = SafeFileAccess.OpenRead(LogPath, _runsRoot);
+        if (opened.Stream is null)
         {
-            warnings.Add("Log path is outside the forge runs root and was not read.");
-            return new TailPollResult(newEvents, false, true, 0, 0, warnings);
-        }
-
-        if (!File.Exists(LogPath))
-        {
-            IsMissing = true;
-            warnings.Add("Job log is not available yet.");
-            return new TailPollResult(newEvents, false, true, 0, 0, warnings);
+            IsMissing = opened.Failure is
+                SafeReadFailure.Missing or
+                SafeReadFailure.Unavailable or
+                SafeReadFailure.OutsideRoot;
+            warnings.Add(opened.Warning ?? "Job log could not be read safely.");
+            return new TailPollResult(
+                newEvents,
+                false,
+                IsMissing,
+                0,
+                0,
+                warnings);
         }
 
         IsMissing = false;
 
         try
         {
-            using var stream = new FileStream(
-                LogPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete,
-                bufferSize: 4096,
-                FileOptions.SequentialScan);
+            var stream = opened.Stream!;
 
             var identity = FileIdentity.Read(stream, LogPath);
             if (_identity is { } previousIdentity && !previousIdentity.Equals(identity))
@@ -165,20 +160,15 @@ public sealed class ForgeLogTailReader
     /// </summary>
     public static string? ReadTailPreview(string? logPath, string runsRoot, int maxBytes = 64 * 1024)
     {
-        if (!PathSafety.IsWithinRoot(logPath, runsRoot) || !File.Exists(logPath))
+        using var opened = SafeFileAccess.OpenRead(logPath, runsRoot);
+        if (opened.Stream is null)
         {
             return null;
         }
 
         try
         {
-            using var stream = new FileStream(
-                logPath!,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete,
-                bufferSize: 4096,
-                FileOptions.SequentialScan);
+            var stream = opened.Stream!;
 
             if (stream.Length == 0)
             {
@@ -286,11 +276,6 @@ public sealed class ForgeLogTailReader
             if (LastActivity is null || activityTime > LastActivity)
             {
                 LastActivity = activityTime;
-            }
-
-            if (newEvents.Count >= _maxEventsPerPoll)
-            {
-                newEvents.RemoveAt(0);
             }
 
             newEvents.Add(parsed.Event);

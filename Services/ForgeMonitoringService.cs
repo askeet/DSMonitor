@@ -226,8 +226,7 @@ public sealed class ForgeMonitoringService
                     metadata.LogPath ?? Path.Combine(_runsRoot, metadata.JobId + ".log"),
                     _runsRoot,
                     _options.MaxBytesPerPoll,
-                    _options.MaxLogLineBytes,
-                    _options.MaxRecentEventsPerJob);
+                    _options.MaxLogLineBytes);
                 state.Readers[metadata.JobId] = reader;
 
                 if (!state.RecentEvents.ContainsKey(metadata.JobId))
@@ -311,10 +310,7 @@ public sealed class ForgeMonitoringService
                 LastActivity = reader.LastActivity,
                 ParsedEventCount = reader.TotalUniqueEvents,
                 ObservedCost = reader.HasCost ? reader.TotalCost : null,
-                Events = recent
-                    .OrderBy(item => item.Timestamp ?? item.ObservedAt)
-                    .ThenBy(item => item.EventKey, StringComparer.Ordinal)
-                    .ToArray(),
+                Events = recent.ToArray(),
                 Warnings = jobWarnings,
                 ObservedAt = observedAt
             });

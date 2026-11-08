@@ -6,6 +6,8 @@ namespace DSMonitor.ViewModels;
 
 public sealed class JobRowViewModel : ObservableObject
 {
+    public const int MaxTimelineEvents = 500;
+
     private ForgeJobStatus _status = ForgeJobStatus.Unknown;
     private string _projectText = "—";
     private string _projectTooltip = string.Empty;
@@ -147,20 +149,53 @@ public sealed class JobRowViewModel : ObservableObject
 
     private void MergeEvents(IReadOnlyList<MonitoringEvent> incoming)
     {
-        var existingKeys = RecentEvents.Select(item => item.EventKey)
-            .ToHashSet(StringComparer.Ordinal);
-        var newItems = incoming
-            .Where(item => !existingKeys.Contains(item.EventKey))
-            .OrderByDescending(item => item.Timestamp ?? item.ObservedAt)
-            .ThenByDescending(item => item.EventKey, StringComparer.Ordinal)
-            .ToArray();
+        // OrderByDescending is stable. Distinct timestamps sort newest-first,
+        // while equal or missing timestamps retain the original source order.
+        // ObservedAt and EventKey are deliberately not used as tie-breakers.
+        var desired = incoming
+            .OrderByDescending(item => item.Timestamp ?? DateTimeOffset.MinValue)
+            .Take(MaxTimelineEvents)
+            .ToList();
 
-        foreach (var item in newItems)
+        var desiredKeys = desired
+            .Select(item => item.EventKey)
+            .ToHashSet(StringComparer.Ordinal);
+
+        for (var index = RecentEvents.Count - 1; index >= 0; index--)
         {
-            RecentEvents.Insert(0, item);
+            if (!desiredKeys.Contains(RecentEvents[index].EventKey))
+            {
+                RecentEvents.RemoveAt(index);
+            }
         }
 
-        while (RecentEvents.Count > 500)
+        for (var index = 0; index < desired.Count; index++)
+        {
+            var item = desired[index];
+            var currentIndex = -1;
+            for (var candidate = index; candidate < RecentEvents.Count; candidate++)
+            {
+                if (string.Equals(
+                        RecentEvents[candidate].EventKey,
+                        item.EventKey,
+                        StringComparison.Ordinal))
+                {
+                    currentIndex = candidate;
+                    break;
+                }
+            }
+
+            if (currentIndex < 0)
+            {
+                RecentEvents.Insert(index, item);
+            }
+            else if (currentIndex != index)
+            {
+                RecentEvents.Move(currentIndex, index);
+            }
+        }
+
+        while (RecentEvents.Count > desired.Count)
         {
             RecentEvents.RemoveAt(RecentEvents.Count - 1);
         }

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Threading.Channels;
 using DSMonitor.Models;
 using DSMonitor.Services;
@@ -219,6 +220,52 @@ public sealed class ForgeMonitoringServiceTests
         Assert.AreEqual(2, updated.Jobs[0].Events.Count);
         Assert.AreEqual(2, updated.Jobs[0].Events.Select(item => item.EventKey).Distinct().Count());
         Assert.AreEqual(2, updated.Jobs[0].ParsedEventCount);
+    }
+
+    [TestMethod]
+    public async Task Run_LargeBatch_LogsAllEventsWhileSnapshotRetainsNewest500()
+    {
+        const int eventCount = 800;
+        var jobId = "job_large_service_0001";
+        _workspace.WriteMetadata(jobId);
+        var lines = new string[eventCount];
+        for (var index = 0; index < eventCount; index++)
+        {
+            lines[index] = TestWorkspace.StepStart(
+                1_800_000_000_000 + index,
+                part: "p" + index,
+                message: "m" + index);
+        }
+
+        _workspace.WriteLog(jobId, lines);
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateService());
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.Jobs.Count == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == eventCount,
+            TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(eventCount, snapshot.Jobs[0].ParsedEventCount);
+        Assert.AreEqual(500, snapshot.Jobs[0].Events.Count);
+
+        await harness.StopAsync();
+
+        var jsonlPath = Directory.GetFiles(
+            _workspace.LogsRoot,
+            "*.jsonl",
+            SearchOption.AllDirectories).Single();
+        var logEventCount = File.ReadAllLines(jsonlPath)
+            .Select(line => JsonDocument.Parse(line))
+            .Count(document =>
+            {
+                using (document)
+                {
+                    return document.RootElement.GetProperty("kind").GetString() == "log_event";
+                }
+            });
+
+        Assert.AreEqual(eventCount, logEventCount);
     }
 
     [TestMethod]

@@ -22,10 +22,42 @@ public sealed class TestWorkspace : IDisposable
         Directory.CreateDirectory(LogsRoot);
     }
 
+    private readonly List<string> _links = new();
+    private readonly object _linkGate = new();
+
     public string Root { get; }
     public string RunsRoot { get; }
     public string LogsRoot { get; }
     public string OutsidePath => Path.Combine(Root, "outside", "secret.log");
+
+    public string CreateJunction(string linkPath, string targetPath)
+    {
+        if (!ReparsePointFixture.TryCreateJunction(linkPath, targetPath))
+        {
+            throw new IOException($"Could not create test junction '{linkPath}'.");
+        }
+
+        lock (_linkGate)
+        {
+            _links.Add(linkPath);
+        }
+
+        return linkPath;
+    }
+
+    public bool TryCreateFileSymbolicLink(string linkPath, string targetPath)
+    {
+        var created = ReparsePointFixture.TryCreateFileSymbolicLink(linkPath, targetPath);
+        if (created)
+        {
+            lock (_linkGate)
+            {
+                _links.Add(linkPath);
+            }
+        }
+
+        return created;
+    }
 
     public string WriteMetadata(
         string jobId,
@@ -74,6 +106,18 @@ public sealed class TestWorkspace : IDisposable
 
     public void Dispose()
     {
+        string[] links;
+        lock (_linkGate)
+        {
+            links = _links.ToArray();
+            _links.Clear();
+        }
+
+        for (var index = links.Length - 1; index >= 0; index--)
+        {
+            ReparsePointFixture.DeleteLink(links[index]);
+        }
+
         for (var attempt = 0; attempt < 4; attempt++)
         {
             try
