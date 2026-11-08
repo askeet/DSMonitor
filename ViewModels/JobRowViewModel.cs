@@ -1,0 +1,219 @@
+using System.Collections.ObjectModel;
+using System.IO;
+using DSMonitor.Models;
+
+namespace DSMonitor.ViewModels;
+
+public sealed class JobRowViewModel : ObservableObject
+{
+    private ForgeJobStatus _status = ForgeJobStatus.Unknown;
+    private string _projectText = "—";
+    private string _projectTooltip = string.Empty;
+    private string _modelText = "—";
+    private string _startedText = "—";
+    private string _elapsedText = "—";
+    private string _lastActivityText = "—";
+    private string _sessionText = "Not reported";
+    private string _eventCountText = "0";
+    private string _costText = "—";
+    private string _deadlineText = "—";
+    private string _deadlineDetail = "Not reported";
+    private string _warningsText = string.Empty;
+    private string _rawLogText = string.Empty;
+    private bool _hasWarnings;
+    private bool _hasRawLog;
+
+    public JobRowViewModel(ForgeJobSnapshot snapshot)
+    {
+        Update(snapshot, snapshot.ObservedAt);
+    }
+
+    public ObservableCollection<MonitoringEvent> RecentEvents { get; } = new();
+    public string JobId { get; private set; } = string.Empty;
+    public ForgeJobSnapshot Snapshot { get; private set; } = null!;
+    public DateTimeOffset StartedSort { get; private set; } = DateTimeOffset.MinValue;
+    public string StatusText => _status.ToDisplay();
+    public bool IsActive => _status.IsActive();
+    public string ProjectText => _projectText;
+    public string ProjectTooltip => _projectTooltip;
+    public string ModelText => _modelText;
+    public string StartedText => _startedText;
+    public string ElapsedText => _elapsedText;
+    public string LastActivityText => _lastActivityText;
+    public string SessionText => _sessionText;
+    public string EventCountText => _eventCountText;
+    public string CostText => _costText;
+    public string DeadlineText => _deadlineText;
+    public string DeadlineDetail => _deadlineDetail;
+    public string WarningsText => _warningsText;
+    public bool HasWarnings => _hasWarnings;
+    public string RawLogText => _rawLogText;
+    public bool HasRawLog => _hasRawLog;
+    public string ForgeStatusLabel => _status switch
+    {
+        ForgeJobStatus.Running => "Execution confirmed by metadata",
+        ForgeJobStatus.Done => "Completion reported by metadata",
+        ForgeJobStatus.Failed => "Failure reported by metadata",
+        ForgeJobStatus.Interrupted => "Interruption reported by metadata",
+        ForgeJobStatus.TimedOut => "Forge wrapper timed out; worker state unverified",
+        ForgeJobStatus.Blocked => "Blocker reported by metadata",
+        _ => "Status not reported by forge metadata"
+    };
+
+    public void Update(ForgeJobSnapshot snapshot, DateTimeOffset now)
+    {
+        Snapshot = snapshot;
+        JobId = snapshot.JobId;
+        StartedSort = snapshot.Metadata.Started ?? DateTimeOffset.MinValue;
+
+        if (_status != snapshot.Status)
+        {
+            _status = snapshot.Status;
+            OnPropertyChanged(nameof(StatusText));
+            OnPropertyChanged(nameof(IsActive));
+            OnPropertyChanged(nameof(ForgeStatusLabel));
+        }
+
+        SetText(snapshot.Metadata.Directory is { Length: > 0 } directory
+            ? LeafDirectory(directory)
+            : "—", ref _projectText, nameof(ProjectText));
+        SetText(snapshot.Metadata.Directory ?? string.Empty, ref _projectTooltip, nameof(ProjectTooltip));
+        SetText(snapshot.Metadata.Model ?? "—", ref _modelText, nameof(ModelText));
+        SetText(
+            snapshot.Metadata.Started is { } started
+                ? started.ToLocalTime().ToString("MMM dd, HH:mm")
+                : "—",
+            ref _startedText,
+            nameof(StartedText));
+        SetText(snapshot.SessionId ?? "Not reported", ref _sessionText, nameof(SessionText));
+        SetText(snapshot.ParsedEventCount.ToString(), ref _eventCountText, nameof(EventCountText));
+        SetText(snapshot.CostText, ref _costText, nameof(CostText));
+        SetText(snapshot.DeadlineText, ref _deadlineText, nameof(DeadlineText));
+        SetText(snapshot.DeadlineDetail, ref _deadlineDetail, nameof(DeadlineDetail));
+        SetText(snapshot.Warnings.Count == 0 ? string.Empty : string.Join(Environment.NewLine, snapshot.Warnings), ref _warningsText, nameof(WarningsText));
+        SetText(
+            snapshot.LastActivity is { } activity
+                ? activity.ToLocalTime().ToString("HH:mm:ss")
+                : "—",
+            ref _lastActivityText,
+            nameof(LastActivityText));
+
+        var hasWarnings = snapshot.Warnings.Count > 0;
+        if (_hasWarnings != hasWarnings)
+        {
+            _hasWarnings = hasWarnings;
+            OnPropertyChanged(nameof(HasWarnings));
+        }
+
+        MergeEvents(snapshot.Events);
+        RefreshElapsed(now);
+        OnPropertyChanged(nameof(Snapshot));
+    }
+
+    public void SetRawLog(string? text)
+    {
+        var hasRawLog = text is not null;
+        if (SetProperty(ref _rawLogText, text ?? string.Empty, nameof(RawLogText)))
+        {
+            _hasRawLog = hasRawLog;
+            OnPropertyChanged(nameof(HasRawLog));
+        }
+    }
+
+    public void RefreshElapsed(DateTimeOffset now)
+    {
+        var started = Snapshot.Metadata.Started;
+        if (started is null)
+        {
+            SetText("—", ref _elapsedText, nameof(ElapsedText));
+            return;
+        }
+
+        if (_status.IsActive() || _status == ForgeJobStatus.Unknown)
+        {
+            SetText(FormatDuration(now - started.Value), ref _elapsedText, nameof(ElapsedText));
+            return;
+        }
+
+        if (Snapshot.LastActivity is { } lastActivity && lastActivity > started.Value)
+        {
+            SetText(FormatDuration(lastActivity - started.Value), ref _elapsedText, nameof(ElapsedText));
+        }
+        else
+        {
+            SetText("—", ref _elapsedText, nameof(ElapsedText));
+        }
+    }
+
+    private void MergeEvents(IReadOnlyList<MonitoringEvent> incoming)
+    {
+        var existingKeys = RecentEvents.Select(item => item.EventKey)
+            .ToHashSet(StringComparer.Ordinal);
+        var newItems = incoming
+            .Where(item => !existingKeys.Contains(item.EventKey))
+            .OrderByDescending(item => item.Timestamp ?? item.ObservedAt)
+            .ThenByDescending(item => item.EventKey, StringComparer.Ordinal)
+            .ToArray();
+
+        foreach (var item in newItems)
+        {
+            RecentEvents.Insert(0, item);
+        }
+
+        while (RecentEvents.Count > 500)
+        {
+            RecentEvents.RemoveAt(RecentEvents.Count - 1);
+        }
+    }
+
+    private bool SetText(string value, ref string field, string propertyName)
+    {
+        if (string.Equals(field, value, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        field = value;
+        OnPropertyChanged(propertyName);
+        return true;
+    }
+
+    private static string LeafDirectory(string path)
+    {
+        try
+        {
+            var trimmed = Path.TrimEndingDirectorySeparator(path);
+            var leaf = Path.GetFileName(trimmed);
+            return string.IsNullOrWhiteSpace(leaf) ? path : leaf;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return path;
+        }
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+        {
+            duration = TimeSpan.Zero;
+        }
+
+        if (duration.TotalDays >= 1)
+        {
+            return $"{(int)duration.TotalDays}d {duration.Hours}h";
+        }
+
+        if (duration.TotalHours >= 1)
+        {
+            return $"{(int)duration.TotalHours}h {duration.Minutes}m";
+        }
+
+        if (duration.TotalMinutes >= 1)
+        {
+            return $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
+        }
+
+        return $"{(int)duration.TotalSeconds}s";
+    }
+}
