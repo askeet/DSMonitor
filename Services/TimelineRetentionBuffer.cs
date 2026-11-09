@@ -42,6 +42,60 @@ public sealed class TimelineRetentionBuffer
     public int Capacity => _capacity;
 
     /// <summary>
+    /// Restores the two bounded candidate windows and the historical ambiguity
+    /// state from committed storage. Both windows are necessary: restoring only
+    /// the currently displayed window changes later retention when a missing
+    /// timestamp arrives after restart.
+    /// </summary>
+    public void Restore(
+        IReadOnlyList<MonitoringEvent> sourceWindow,
+        IReadOnlyList<MonitoringEvent> newestTimestampedWindow,
+        bool hasObservedAmbiguousTimestamps)
+    {
+        ArgumentNullException.ThrowIfNull(sourceWindow);
+        ArgumentNullException.ThrowIfNull(newestTimestampedWindow);
+
+        _sourceWindow.Clear();
+        _newestTimestampedCandidates.Clear();
+        HasObservedAmbiguousTimestamps = hasObservedAmbiguousTimestamps;
+
+        if (_capacity <= 0)
+        {
+            _retainedKeys.Clear();
+            return;
+        }
+
+        AppendDistinct(
+            _sourceWindow,
+            sourceWindow.Skip(Math.Max(0, sourceWindow.Count - _capacity)));
+        AppendDistinct(
+            _newestTimestampedCandidates,
+            newestTimestampedWindow
+                .Where(item => item.Timestamp is not null)
+                .Take(_capacity));
+
+        TrimToCapacity(_sourceWindow);
+        TrimToCapacity(_newestTimestampedCandidates);
+        RebuildRetainedKeys();
+    }
+
+    private static void AppendDistinct(
+        List<MonitoringEvent> destination,
+        IEnumerable<MonitoringEvent> items)
+    {
+        var seen = destination
+            .Select(item => item.EventKey)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var item in items)
+        {
+            if (seen.Add(item.EventKey))
+            {
+                destination.Add(item);
+            }
+        }
+    }
+
+    /// <summary>
     /// Adds unique newly accepted events in source order. Duplicate filtering
     /// remains the caller's responsibility; this type only applies retention.
     /// </summary>

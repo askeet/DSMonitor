@@ -23,6 +23,12 @@ public sealed record ForgeJobSnapshot
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
     public DateTimeOffset ObservedAt { get; init; }
 
+    /// <summary>
+    /// True when the durable source coverage is incomplete. An observed cost is
+    /// then a committed subtotal, never a claim that the total is complete.
+    /// </summary>
+    public bool HasIncompleteCoverage { get; init; }
+
     public string JobId => Metadata.JobId;
     public string StatusText => Status.ToDisplay();
     public bool HasCost => ObservedCost.HasValue;
@@ -30,7 +36,8 @@ public sealed record ForgeJobSnapshot
         Metadata.Deadline is { } deadline && deadline <= ObservedAt;
 
     public string CostText => ObservedCost is { } cost
-        ? "$" + cost.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture)
+        ? "$" + cost.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture) +
+          (HasIncompleteCoverage ? " (incomplete)" : string.Empty)
         : "—";
 
     public string DeadlineText => Metadata.Deadline is { } deadline

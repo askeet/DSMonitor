@@ -2,6 +2,7 @@
 using System.IO;
 using System.Windows;
 using DSMonitor.Models;
+using DSMonitor.Persistence;
 using DSMonitor.Services;
 using DSMonitor.ViewModels;
 
@@ -27,11 +28,13 @@ public partial class MainWindow : Window
             "Logs");
         var refreshInterval = TimeSpan.FromSeconds(5);
 
+        var projectionDatabasePath = LedgerStoragePaths.DefaultProjectionDatabasePath;
         _viewModel = new MainViewModel(
             () => new ForgeMonitoringService(
                 runsRoot,
                 new MonitoringRunLoggerFactory(logsRoot),
-                new MonitoringOptions(refreshInterval)),
+                new MonitoringOptions(refreshInterval),
+                ledgerFactory: () => EventLedger.OpenProjection(projectionDatabasePath)),
             Dispatcher,
             runsRoot,
             refreshInterval);

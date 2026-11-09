@@ -12,7 +12,10 @@ namespace DSMonitor.Parsing;
 /// </summary>
 public static class ForgeEventParser
 {
+    public const string SourceNamespace = "opencode-jsonl";
+
     private const int MaxSummaryLength = 180;
+    private const decimal MaxCost = 1_000_000_000_000m;
 
     public static bool TryParse(
         string line,
@@ -47,17 +50,25 @@ public static class ForgeEventParser
                 return false;
             }
 
-            var sessionId = GetString(root, "sessionID") ?? GetString(root, "sessionId");
-            var timestamp = ParseTimestamp(root, "timestamp");
             var part = root.TryGetProperty("part", out var partElement) &&
                        partElement.ValueKind == JsonValueKind.Object
                 ? partElement
                 : (JsonElement?)null;
 
+            var sessionId =
+                GetString(root, "sessionID") ??
+                GetString(root, "sessionId") ??
+                (part is { } sessionPart
+                    ? GetString(sessionPart, "sessionID") ?? GetString(sessionPart, "sessionId")
+                    : null);
+            var timestamp = ParseTimestamp(root, "timestamp");
             var partId = part is { } p
-                ? GetString(p, "partID") ?? GetString(p, "id")
+                ? GetString(p, "id") ?? GetString(p, "partID")
                 : null;
-            var messageId = part is { } m ? GetString(m, "messageID") : null;
+            var messageId =
+                (part is { } m ? GetString(m, "messageID") ?? GetString(m, "messageId") : null) ??
+                GetString(root, "messageID") ??
+                GetString(root, "messageId");
             var toolName = part is { } t ? GetString(t, "tool") : null;
             var toolStatus = part is { } s &&
                              s.TryGetProperty("state", out var state) &&
@@ -69,9 +80,12 @@ public static class ForgeEventParser
             var severity = MonitoringEventSeverity.Info;
             var summary = "Observed event";
             double? cost = null;
+            decimal? costAmount = null;
+            var costExpected = false;
 
             var normalizedType = NormalizeToken(type);
             var normalizedPartType = part is { } pt ? NormalizeToken(GetString(pt, "type")) : string.Empty;
+            var canonicalEventType = CanonicalEventType(normalizedType, normalizedPartType);
             var normalizedTool = NormalizeToken(toolName);
             var normalizedToolStatus = NormalizeToken(toolStatus);
 
@@ -85,7 +99,9 @@ public static class ForgeEventParser
                 category = MonitoringEventCategory.Step;
                 if (part is { } finishPart)
                 {
-                    cost = GetDouble(finishPart, "cost");
+                    costExpected = true;
+                    costAmount = GetDecimalCost(finishPart, "cost");
+                    cost = costAmount is { } decimalCost ? (double)decimalCost : null;
                     var reason = part is { } rp && rp.TryGetProperty("reason", out var reasonElement)
                         ? GetString(rp, "reason")
                         : null;
@@ -185,7 +201,17 @@ public static class ForgeEventParser
                 Summary = TrimSummary(summary)
             };
 
-            parsed = new ParsedLogEvent(eventKey, monitoringEvent, cost);
+            parsed = new ParsedLogEvent(eventKey, monitoringEvent, cost)
+            {
+                Identity = new ParsedEventIdentity(
+                    SourceNamespace,
+                    sessionId,
+                    messageId,
+                    partId,
+                    canonicalEventType),
+                CostAmount = costAmount,
+                CostExpected = costExpected
+            };
             return true;
         }
         catch (JsonException)
@@ -303,7 +329,7 @@ public static class ForgeEventParser
         return value.TryGetInt64(out var number) ? number : null;
     }
 
-    private static double? GetDouble(JsonElement root, string propertyName)
+    private static decimal? GetDecimalCost(JsonElement root, string propertyName)
     {
         if (!root.TryGetProperty(propertyName, out var value) ||
             value.ValueKind != JsonValueKind.Number)
@@ -311,15 +337,34 @@ public static class ForgeEventParser
             return null;
         }
 
-        if (!value.TryGetDouble(out var number) ||
-            double.IsNaN(number) ||
-            double.IsInfinity(number) ||
-            number < 0)
+        // Precision is preserved as decimal. Non-finite, negative, or
+        // implausibly large values are rejected as missing cost rather than
+        // being invented, rounded into a different number, or allowed to
+        // overflow the durable aggregate.
+        if (!value.TryGetDecimal(out var number) ||
+            number < 0 ||
+            number > MaxCost)
         {
             return null;
         }
 
         return number;
+    }
+
+    private static string CanonicalEventType(string normalizedType, string normalizedPartType)
+    {
+        var candidate = !string.IsNullOrWhiteSpace(normalizedType) && normalizedType != "unknown"
+            ? normalizedType
+            : normalizedPartType;
+        if (string.IsNullOrWhiteSpace(candidate) || candidate == "unknown")
+        {
+            return "unknown";
+        }
+
+        // OpenCode uses both underscore and hyphen spellings across captures
+        // (for example step_start and step-start). The canonical form is
+        // lowercase hyphenated so equivalent records share one logical key.
+        return candidate.Replace('_', '-');
     }
 
     private static string NormalizeToken(string? value)

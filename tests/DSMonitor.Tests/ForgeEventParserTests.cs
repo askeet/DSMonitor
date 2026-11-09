@@ -120,6 +120,76 @@ public sealed class ForgeEventParserTests
     }
 
     [TestMethod]
+    public void Parse_Identity_UsesStructuredSourceIdsAndCanonicalEventType()
+    {
+        var parsed = Parse(TestWorkspace.StepStart(
+            1_800_000_000_000,
+            session: "ses_identity",
+            part: "part_identity",
+            message: "message_identity"));
+
+        Assert.IsNotNull(parsed.Identity);
+        Assert.IsTrue(parsed.Identity!.HasMessageAndPart);
+        Assert.AreEqual(ForgeEventParser.SourceNamespace, parsed.Identity.Namespace);
+        Assert.AreEqual("ses_identity", parsed.Identity.SessionId);
+        Assert.AreEqual("message_identity", parsed.Identity.MessageId);
+        Assert.AreEqual("part_identity", parsed.Identity.PartId);
+        Assert.AreEqual("step-start", parsed.Identity.CanonicalEventType);
+    }
+
+    [TestMethod]
+    public void Parse_Identity_IsStableWhenTextContentGrows()
+    {
+        var first = Parse(TestWorkspace.Text(
+            1_800_000_000_000,
+            "hello",
+            part: "prt_same",
+            message: "msg_same"));
+        var second = Parse(TestWorkspace.Text(
+            1_800_000_000_000,
+            "hello world",
+            part: "prt_same",
+            message: "msg_same"));
+
+        Assert.AreEqual(first.Identity, second.Identity);
+        Assert.AreNotEqual(first.EventKey, second.EventKey);
+    }
+
+    [TestMethod]
+    public void Parse_Identity_WithoutMessageOrPart_IsExplicitlyIncomplete()
+    {
+        var parsed = Parse("""{"type":"server_connected","timestamp":1800000000000}""");
+
+        Assert.IsNotNull(parsed.Identity);
+        Assert.IsFalse(parsed.Identity!.HasMessageAndPart);
+    }
+
+    [TestMethod]
+    public void Parse_StepFinish_PreservesDecimalCostAndCostExpectedFlag()
+    {
+        var parsed = Parse(TestWorkspace.StepFinish(
+            1_800_000_000_000,
+            0.00125m,
+            part: "cost-part",
+            message: "cost-message"));
+
+        Assert.IsTrue(parsed.CostExpected);
+        Assert.AreEqual(0.00125m, parsed.CostAmount);
+        Assert.AreEqual(0.00125, parsed.Cost!.Value, 1e-12);
+    }
+
+    [TestMethod]
+    public void Parse_StepFinishWithoutCost_IsExpectedButMissing()
+    {
+        var parsed = Parse(
+            """{"type":"step_finish","timestamp":1800000000000,"sessionID":"ses_x","part":{"id":"p1","messageID":"m1","type":"step-finish"}}""");
+
+        Assert.IsTrue(parsed.CostExpected);
+        Assert.IsNull(parsed.CostAmount);
+        Assert.IsNull(parsed.Cost);
+    }
+
+    [TestMethod]
     public void Parse_MissingTimestamp_UsesObservationTimeAndKeepsHint()
     {
         var parsed = Parse("""{"type":"text","sessionID":"ses_x","part":{"id":"p1","type":"text","text":"hi"}}""");

@@ -70,6 +70,43 @@ public sealed class ForgeJobDiscoveryTests
     }
 
     [TestMethod]
+    public void Discover_UnassignedLog_IsReportedBoundedAndNeverBecomesAJob()
+    {
+        _workspace.WriteMetadata("job_associated_0001");
+        _workspace.WriteLog("job_associated_0001", TestWorkspace.StepStart(1_800_000_000_000));
+        var orphan = Path.Combine(_workspace.RunsRoot, "orphan.log");
+        File.WriteAllText(orphan, "{}\n");
+
+        var result = new ForgeJobDiscovery(_workspace.RunsRoot).Discover();
+
+        Assert.AreEqual(1, result.Jobs.Count);
+        Assert.AreEqual(1, result.UnassignedLogCount);
+        Assert.AreEqual(Path.GetFullPath(orphan), result.UnassignedLogs.Single());
+        Assert.IsTrue(result.Warnings.Any(warning =>
+            warning.Contains("unassigned", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [TestMethod]
+    public void Discover_CustomMetadataPath_DoesNotSilentlyAssociateFallbackLog()
+    {
+        var jobId = "job_custom_0001";
+        var customPath = Path.Combine(_workspace.RunsRoot, "custom.log");
+        File.WriteAllText(customPath, "{}\n");
+        _workspace.WriteMetadata(jobId, logPath: customPath);
+        var fallbackPath = _workspace.LogPath(jobId);
+        File.WriteAllText(fallbackPath, "{}\n");
+
+        var result = new ForgeJobDiscovery(_workspace.RunsRoot).Discover();
+
+        Assert.AreEqual(1, result.Jobs.Count);
+        Assert.AreEqual(customPath, result.Jobs[0].LogPath);
+        Assert.AreEqual(1, result.UnassignedLogCount);
+        Assert.AreEqual(Path.GetFullPath(fallbackPath), result.UnassignedLogs.Single());
+        Assert.IsTrue(result.Warnings.Any(warning =>
+            warning.Contains("unassigned", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [TestMethod]
     public void Discover_OrdersByStartedDescending()
     {
         _workspace.WriteMetadata("job_old_0001", 1_800_000_000_000);

@@ -19,6 +19,8 @@ public sealed record MonitoringSnapshot
     public int UnknownCount => Jobs.Count(job => job.Status == ForgeJobStatus.Unknown);
     public int TotalCount => Jobs.Count;
 
+    public bool HasIncompleteCoverage => Jobs.Any(job => job.HasIncompleteCoverage);
+
     public double? ObservedCost
     {
         get

@@ -19,5 +19,13 @@ public sealed record ForgeJobMetadata
     public int? Pid { get; init; }
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
 
+    /// <summary>
+    /// True when the job identity came from an approved file-name fallback or
+    /// malformed metadata rather than a verified forge job id. Provisional
+    /// identities are retained for safe monitoring but always report incomplete
+    /// durable coverage.
+    /// </summary>
+    public bool IsProvisional { get; init; }
+
     public bool HasExplicitStatus => ExplicitStatus != ForgeJobStatus.Unknown;
 }

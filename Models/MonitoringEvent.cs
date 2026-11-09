@@ -66,6 +66,38 @@ public sealed record MonitoringEvent
 }
 
 /// <summary>
-/// Parsed log event plus the cost reported by the source event, when present.
+/// Structured, upstream-assigned identity used by the durable B2 projection.
+/// The namespace is the capture protocol (currently OpenCode JSON lines), not
+/// a provider or model name. Missing message/part values are represented by
+/// <see cref="HasMessageAndPart"/> being false; no hash or local GUID is used
+/// as a substitute for an unavailable upstream identity.
 /// </summary>
-public sealed record ParsedLogEvent(string EventKey, MonitoringEvent Event, double? Cost);
+public sealed record ParsedEventIdentity(
+    string Namespace,
+    string? SessionId,
+    string? MessageId,
+    string? PartId,
+    string CanonicalEventType)
+{
+    public bool HasMessageAndPart =>
+        !string.IsNullOrWhiteSpace(MessageId) &&
+        !string.IsNullOrWhiteSpace(PartId) &&
+        !string.IsNullOrWhiteSpace(CanonicalEventType);
+}
+
+/// <summary>
+/// Parsed log event plus the cost reported by the source event, when present.
+/// <see cref="CostAmount"/> preserves decimal precision for the durable ledger;
+/// <see cref="Cost"/> remains the bounded display/decimal-compatible value used
+/// by the existing live pipeline. <see cref="CostExpected"/> is true for
+/// step-finish records, where an absent cost is a coverage gap rather than an
+/// ordinary event that has no cost by design.
+/// </summary>
+public sealed record ParsedLogEvent(string EventKey, MonitoringEvent Event, double? Cost)
+{
+    public ParsedEventIdentity? Identity { get; init; }
+
+    public decimal? CostAmount { get; init; }
+
+    public bool CostExpected { get; init; }
+}

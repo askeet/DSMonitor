@@ -56,16 +56,19 @@ public static class ForgeMetadataParser
         }
 
         var warnings = new List<string>();
+        var provisional = false;
         var jobId = GetString(root, "id") ?? GetString(root, "jobId");
         if (string.IsNullOrWhiteSpace(jobId) || !PathSafety.IsSafeFileName(jobId))
         {
             warnings.Add("Job id is missing or invalid; using the metadata file name.");
             jobId = fileStem;
+            provisional = true;
         }
 
         if (!PathSafety.IsSafeFileName(jobId))
         {
             jobId = "unknown-job";
+            provisional = true;
         }
 
         var rawLogPath = GetString(root, "logPath") ?? GetString(root, "log_path");
@@ -117,7 +120,8 @@ public static class ForgeMetadataParser
             ExplicitStatus = explicitStatus,
             RawStatus = rawStatus,
             Pid = pid,
-            Warnings = warnings
+            Warnings = warnings,
+            IsProvisional = provisional
         };
     }
 
@@ -134,7 +138,8 @@ public static class ForgeMetadataParser
             MetadataPath = metadataPath,
             LogPath = Path.Combine(PathSafety.NormalizeRoot(runsRoot), safeId + ".log"),
             ExplicitStatus = ForgeJobStatus.Unknown,
-            Warnings = new[] { warning }
+            Warnings = new[] { warning },
+            IsProvisional = true
         };
     }
 

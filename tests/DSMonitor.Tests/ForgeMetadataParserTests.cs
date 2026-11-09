@@ -38,6 +38,7 @@ public sealed class ForgeMetadataParserTests
         Assert.AreEqual(ForgeJobStatus.Unknown, metadata.ExplicitStatus);
         Assert.IsFalse(metadata.HasExplicitStatus);
         Assert.AreEqual(_workspace.LogPath("job_valid_0001"), metadata.LogPath);
+        Assert.IsFalse(metadata.IsProvisional);
     }
 
     [TestMethod]
@@ -49,6 +50,7 @@ public sealed class ForgeMetadataParserTests
 
         Assert.AreEqual("job_broken_0001", metadata.JobId);
         Assert.AreEqual(ForgeJobStatus.Unknown, metadata.ExplicitStatus);
+        Assert.IsTrue(metadata.IsProvisional);
         Assert.IsTrue(metadata.Warnings.Count > 0);
         Assert.IsTrue(PathSafety.IsWithinRoot(metadata.LogPath, _workspace.RunsRoot));
     }
@@ -171,6 +173,7 @@ public sealed class ForgeMetadataParserTests
 
         Assert.AreEqual("job_array_0001", metadata.JobId);
         Assert.AreEqual(ForgeJobStatus.Unknown, metadata.ExplicitStatus);
+        Assert.IsTrue(metadata.IsProvisional);
         StringAssert.Contains(string.Join(" ", metadata.Warnings), "not a JSON object");
     }
 
@@ -190,6 +193,7 @@ public sealed class ForgeMetadataParserTests
         var metadata = ForgeMetadataParser.ParseFile(path, _workspace.RunsRoot);
 
         Assert.AreEqual("job_safe_0001", metadata.JobId);
+        Assert.IsTrue(metadata.IsProvisional);
         Assert.IsTrue(metadata.Warnings.Any(warning =>
             warning.Contains("invalid", StringComparison.OrdinalIgnoreCase)));
     }

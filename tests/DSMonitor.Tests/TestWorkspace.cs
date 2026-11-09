@@ -250,6 +250,21 @@ public sealed class TestWorkspace : IDisposable
 
     public static string StepFinish(
         long timestamp,
+        decimal cost,
+        string reason = "stop",
+        string session = "ses_test0001",
+        string part = "prt_finish_1",
+        string message = "msg_1") =>
+        StepFinish(
+            timestamp,
+            (double)cost,
+            reason,
+            session,
+            part,
+            message);
+
+    public static string StepFinish(
+        long timestamp,
         double cost,
         string reason = "stop",
         string session = "ses_test0001",

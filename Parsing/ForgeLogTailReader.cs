@@ -2,6 +2,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using DSMonitor.Models;
+using DSMonitor.Persistence;
 using DSMonitor.Services;
 using Microsoft.Win32.SafeHandles;
 
@@ -161,6 +162,26 @@ public sealed class ForgeLogTailReader
             warnings.Add("Job log is currently unavailable or locked.");
             return new TailPollResult(newEvents, false, true, 0, 0, warnings);
         }
+    }
+
+    /// <summary>
+    /// Durable ingestion seam used by B2 live monitoring. The ledger owns
+    /// physical records, logical deduplication, aggregates, cursors and
+    /// bootstrap checkpoints; the reader contributes its already verified job
+    /// and runs-root context and never publishes a speculative aggregate.
+    /// </summary>
+    public LedgerIngestResult PollDurable(
+        EventLedger ledger,
+        DateTimeOffset observedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(ledger);
+        return ledger.Ingest(
+            JobId,
+            LogPath,
+            _runsRoot,
+            observedAt,
+            cancellationToken);
     }
 
     /// <summary>

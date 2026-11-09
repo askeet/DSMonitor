@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Threading.Channels;
 using DSMonitor.Models;
+using DSMonitor.Persistence;
 using DSMonitor.Services;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -616,6 +617,430 @@ public sealed class ForgeMonitoringServiceTests
         Assert.AreEqual(lines.Length, CountLoggedTextEvents(jobId));
         Assert.AreEqual(1, CountLoggedJsonlEventTimestamp(jobId, highTimestamp));
     }
+
+    [TestMethod]
+    public async Task Run_DurableBootstrap_RestoresAggregatesAndTimelineAfterRestart()
+    {
+        var jobId = "job_b2_durable_restart_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        _workspace.WriteMetadata(jobId);
+        _workspace.WriteLog(
+            jobId,
+            TestWorkspace.StepStart(1_800_000_000_000, session: "ses_b2_restart"),
+            TestWorkspace.StepFinish(
+                1_800_000_001_000,
+                0.75m,
+                session: "ses_b2_restart",
+                part: "restart-finish",
+                message: "restart-msg"));
+
+        await using (var firstHarness = new MonitoringHarness())
+        {
+            firstHarness.Start(CreateDurableService(databasePath));
+            var first = await firstHarness.WaitForAsync(
+                candidate => candidate.TotalCount == 1 &&
+                             candidate.Jobs[0].ParsedEventCount == 2 &&
+                             candidate.Jobs[0].ObservedCost == 0.75,
+                TimeSpan.FromSeconds(10));
+            Assert.AreEqual("ses_b2_restart", first.Jobs[0].SessionId);
+            Assert.AreEqual(2, first.Jobs[0].Events.Count);
+            await firstHarness.StopAsync();
+        }
+
+        await using (var secondHarness = new MonitoringHarness())
+        {
+            secondHarness.Start(CreateDurableService(databasePath));
+            var restored = await secondHarness.WaitForAsync(
+                candidate => candidate.TotalCount == 1 &&
+                             candidate.Jobs[0].ParsedEventCount == 2 &&
+                             candidate.Jobs[0].ObservedCost == 0.75,
+                TimeSpan.FromSeconds(10));
+            Assert.AreEqual("ses_b2_restart", restored.Jobs[0].SessionId);
+            Assert.AreEqual(2, restored.Jobs[0].Events.Count);
+            await secondHarness.StopAsync();
+        }
+
+        Assert.IsFalse(File.Exists(Path.Combine(_workspace.Root, "data", "events.db")));
+    }
+
+    [TestMethod]
+    public async Task Run_DurableLogPathChange_PreservesAggregatesAndDeduplicatesCopy()
+    {
+        var jobId = "job_b2_durable_path_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        var originalPath = Path.Combine(_workspace.RunsRoot, "original-b2.log");
+        var changedPath = Path.Combine(_workspace.RunsRoot, "changed-b2.log");
+        var originalLine = TestWorkspace.StepFinish(
+            1_800_000_001_000,
+            0.25m,
+            session: "ses_b2_path",
+            part: "path-original",
+            message: "path-msg-original");
+        _workspace.WriteMetadata(jobId, logPath: originalPath);
+        File.WriteAllText(originalPath, originalLine + "\n");
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(databasePath));
+        var before = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == 1 &&
+                         candidate.Jobs[0].ObservedCost == 0.25,
+            TimeSpan.FromSeconds(10));
+
+        File.WriteAllText(
+            changedPath,
+            originalLine + "\n" + TestWorkspace.StepFinish(
+                1_800_000_002_000,
+                0.30m,
+                session: "ses_b2_path",
+                part: "path-new",
+                message: "path-msg-new") + "\n");
+        _workspace.WriteMetadata(jobId, logPath: changedPath);
+
+        var after = await harness.WaitForAsync(
+            candidate => candidate.ObservedAt > before.ObservedAt &&
+                         candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == 2 &&
+                         candidate.Jobs[0].ObservedCost == 0.55,
+            TimeSpan.FromSeconds(10));
+        Assert.AreEqual("ses_b2_path", after.Jobs[0].SessionId);
+        Assert.AreEqual(2, after.Jobs[0].Events.Count);
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableLargeBootstrap_RetainsBoundedFiveHundredEventTimeline()
+    {
+        const int eventCount = 620;
+        var jobId = "job_b2_durable_large_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        var lines = new string[eventCount];
+        for (var index = 0; index < eventCount; index++)
+        {
+            lines[index] = TestWorkspace.StepStart(
+                1_800_000_000_000 + index,
+                part: "large-" + index.ToString("0000"),
+                message: "msg-large-" + index.ToString("0000"));
+        }
+
+        _workspace.WriteMetadata(jobId);
+        _workspace.WriteLog(jobId, lines);
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(
+            databasePath,
+            new MonitoringOptions(TimeSpan.FromMilliseconds(20))));
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == eventCount,
+            TimeSpan.FromSeconds(30));
+
+        Assert.AreEqual(eventCount, snapshot.Jobs[0].ParsedEventCount);
+        Assert.AreEqual(500, snapshot.Jobs[0].Events.Count);
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableMultiJobBootstrap_ProgressesFairlyAndCancelsCleanly()
+    {
+        const int jobCount = 6;
+        const int eventsPerJob = 120;
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        for (var job = 0; job < jobCount; job++)
+        {
+            var jobId = "job_b2_multi_" + job.ToString("000");
+            _workspace.WriteMetadata(jobId);
+            var lines = new string[eventsPerJob];
+            for (var index = 0; index < eventsPerJob; index++)
+            {
+                lines[index] = TestWorkspace.StepStart(
+                    1_800_000_000_000 + index,
+                    session: "ses_b2_multi_" + job.ToString("000"),
+                    part: "multi-" + job.ToString("000") + "-" + index.ToString("0000"),
+                    message: "msg-multi-" + job.ToString("000") + "-" + index.ToString("0000"));
+            }
+
+            _workspace.WriteLog(jobId, lines);
+        }
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(
+            databasePath,
+            new MonitoringOptions(TimeSpan.FromMilliseconds(20))));
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == jobCount &&
+                         candidate.Jobs.All(job => job.ParsedEventCount == eventsPerJob),
+            TimeSpan.FromSeconds(30));
+
+        Assert.AreEqual(jobCount, snapshot.TotalCount);
+        Assert.IsTrue(snapshot.Jobs.All(job => job.Events.Count <= 500));
+        Assert.IsTrue(snapshot.Jobs.All(job =>
+            job.Events.Count == Math.Min(eventsPerJob, 500)));
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableRestart_PreservesAmbiguityAndBothTimelineWindows()
+    {
+        var jobId = "job_b2_dual_restart_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        var lines = new List<string>
+        {
+            TestWorkspace.StepStart(
+                1_800_000_900_000,
+                part: "restart-high",
+                message: "restart-high-msg")
+        };
+        for (var index = 1; index <= 502; index++)
+        {
+            lines.Add(TestWorkspace.StepStart(
+                1_800_000_000_000 + index,
+                part: "restart-" + index.ToString("0000"),
+                message: "restart-msg-" + index.ToString("0000")));
+        }
+
+        _workspace.WriteMetadata(jobId);
+        _workspace.WriteLog(jobId, lines.ToArray());
+
+        await using (var firstHarness = new MonitoringHarness())
+        {
+            firstHarness.Start(CreateDurableService(databasePath));
+            var before = await firstHarness.WaitForAsync(
+                candidate => candidate.TotalCount == 1 &&
+                             candidate.Jobs[0].ParsedEventCount == 503 &&
+                             candidate.Jobs[0].Events.Count == 500,
+                TimeSpan.FromSeconds(20));
+            Assert.IsFalse(before.Jobs[0].HasObservedAmbiguousTimestamps);
+            Assert.IsTrue(before.Jobs[0].Events.Any(item =>
+                item.Timestamp == DateTimeOffset.FromUnixTimeMilliseconds(1_800_000_900_000)));
+            await firstHarness.StopAsync();
+        }
+
+        await using var secondHarness = new MonitoringHarness();
+        secondHarness.Start(CreateDurableService(databasePath));
+        var restored = await secondHarness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == 503 &&
+                         candidate.Jobs[0].Events.Count == 500,
+            TimeSpan.FromSeconds(20));
+        Assert.IsTrue(restored.Jobs[0].Events.Any(item =>
+            item.Timestamp == DateTimeOffset.FromUnixTimeMilliseconds(1_800_000_900_000)));
+
+        _workspace.AppendLog(
+            jobId,
+            TestWorkspace.StepStartWithoutTimestamp(
+                part: "restart-missing",
+                message: "restart-missing-msg"));
+
+        var ambiguous = await secondHarness.WaitForAsync(
+            candidate => candidate.ObservedAt > restored.ObservedAt &&
+                         candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == 504 &&
+                         candidate.Jobs[0].HasObservedAmbiguousTimestamps,
+            TimeSpan.FromSeconds(20));
+        Assert.AreEqual(500, ambiguous.Jobs[0].Events.Count);
+        Assert.IsFalse(ambiguous.Jobs[0].Events.Any(item =>
+            item.Timestamp == DateTimeOffset.FromUnixTimeMilliseconds(1_800_000_900_000)));
+        await secondHarness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableRecordTooLarge_MarksIncompleteCoverage()
+    {
+        var jobId = "job_b2_record_too_large_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        _workspace.WriteMetadata(jobId);
+        File.WriteAllText(_workspace.LogPath(jobId), new string('a', 2048));
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(
+            databasePath,
+            new MonitoringOptions(TimeSpan.FromMilliseconds(20)),
+            new EventLedgerOptions
+            {
+                MaxBytesPerTransaction = 512,
+                MaxLineBytes = 512
+            }));
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].HasIncompleteCoverage &&
+                         candidate.Jobs[0].Warnings.Any(warning =>
+                             warning.Contains("bounded", StringComparison.OrdinalIgnoreCase)),
+            TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(0, snapshot.Jobs[0].ParsedEventCount);
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableNonPrimaryUnavailable_MarksIncompleteCoverage()
+    {
+        var jobId = "job_b2_nonprimary_unavailable_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        var originalPath = Path.Combine(_workspace.RunsRoot, "nonprimary-original.log");
+        var changedPath = Path.Combine(_workspace.RunsRoot, "nonprimary-changed.log");
+        var originalLine = TestWorkspace.StepStart(
+            1_800_000_001_000,
+            part: "nonprimary-original",
+            message: "nonprimary-original-msg");
+        _workspace.WriteMetadata(jobId, logPath: originalPath);
+        File.WriteAllText(originalPath, originalLine + "\n");
+
+        await using (var firstHarness = new MonitoringHarness())
+        {
+            firstHarness.Start(CreateDurableService(databasePath));
+            await firstHarness.WaitForAsync(
+                candidate => candidate.TotalCount == 1 &&
+                             candidate.Jobs[0].ParsedEventCount == 1,
+                TimeSpan.FromSeconds(10));
+            await firstHarness.StopAsync();
+        }
+
+        File.WriteAllText(
+            changedPath,
+            originalLine + "\n" + TestWorkspace.StepStart(
+                1_800_000_002_000,
+                part: "nonprimary-new",
+                message: "nonprimary-new-msg") + "\n");
+        _workspace.WriteMetadata(jobId, logPath: changedPath);
+        File.Delete(originalPath);
+
+        await using var secondHarness = new MonitoringHarness();
+        secondHarness.Start(CreateDurableService(databasePath));
+        var snapshot = await secondHarness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == 2 &&
+                         candidate.Jobs[0].HasIncompleteCoverage &&
+                         candidate.Jobs[0].Warnings.Any(warning =>
+                             warning.Contains("previously registered source", StringComparison.OrdinalIgnoreCase)),
+            TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(2, snapshot.Jobs[0].ParsedEventCount);
+        await secondHarness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableProvisionalMetadata_MarksIncompleteCoverage()
+    {
+        var jobId = "job_provisional_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        _workspace.WriteRawMetadata(jobId + ".json", "{ definitely broken");
+        _workspace.WriteLog(jobId, TestWorkspace.StepStart(1_800_000_000_000));
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(databasePath));
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].HasIncompleteCoverage &&
+                         candidate.Jobs[0].Warnings.Any(warning =>
+                             warning.Contains("provisional", StringComparison.OrdinalIgnoreCase)),
+            TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(1, snapshot.Jobs[0].ParsedEventCount);
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableUnassignedLog_ReportsIncompleteDiscovery()
+    {
+        var jobId = "job_b2_unassigned_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        _workspace.WriteMetadata(jobId);
+        _workspace.WriteLog(jobId, TestWorkspace.StepStart(1_800_000_000_000));
+        File.WriteAllText(
+            Path.Combine(_workspace.RunsRoot, "orphan-unassigned.log"),
+            "{}\n");
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(databasePath));
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Warnings.Any(warning =>
+                             warning.Contains("unassigned", StringComparison.OrdinalIgnoreCase)),
+            TimeSpan.FromSeconds(10));
+
+        Assert.IsTrue(snapshot.Warnings.Any(warning =>
+            warning.Contains("discovery coverage is incomplete", StringComparison.OrdinalIgnoreCase)));
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableCustomMetadataPath_ReportsFallbackUncoveredWithoutIngestingIt()
+    {
+        var jobId = "job_b2_custom_fallback_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        var customPath = Path.Combine(_workspace.RunsRoot, "custom-cost.log");
+        _workspace.WriteMetadata(jobId, logPath: customPath);
+        File.WriteAllText(
+            customPath,
+            TestWorkspace.StepFinish(
+                1_800_000_001_000,
+                0.25m,
+                session: "ses_custom_fallback",
+                part: "custom-part",
+                message: "custom-message") + "\n");
+        _workspace.WriteLog(
+            jobId,
+            TestWorkspace.StepFinish(
+                1_800_000_002_000,
+                0.75m,
+                session: "ses_custom_fallback",
+                part: "fallback-part",
+                message: "fallback-message"));
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(databasePath));
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].ParsedEventCount == 1 &&
+                         candidate.Jobs[0].ObservedCost == 0.25 &&
+                         candidate.Jobs[0].HasIncompleteCoverage &&
+                         candidate.Jobs[0].Warnings.Any(warning =>
+                             warning.Contains("fallback", StringComparison.OrdinalIgnoreCase)),
+            TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(0.25, snapshot.Jobs[0].ObservedCost!.Value, 1e-12);
+        Assert.AreEqual(1, snapshot.Jobs[0].ParsedEventCount);
+        Assert.AreEqual(1, snapshot.Jobs[0].Events.Count);
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Run_DurableMissingIdentity_ReportsIncompleteCoverage()
+    {
+        var jobId = "job_b2_durable_missing_identity_0001";
+        var databasePath = Path.Combine(_workspace.Root, "data", "events-v2.db");
+        _workspace.WriteMetadata(jobId);
+        _workspace.WriteLog(
+            jobId,
+            """{"type":"server_connected","timestamp":1800000000000}""");
+
+        await using var harness = new MonitoringHarness();
+        harness.Start(CreateDurableService(databasePath));
+        var snapshot = await harness.WaitForAsync(
+            candidate => candidate.TotalCount == 1 &&
+                         candidate.Jobs[0].Warnings.Any(warning =>
+                             warning.Contains("message/part", StringComparison.OrdinalIgnoreCase)),
+            TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(0, snapshot.Jobs[0].ParsedEventCount);
+        Assert.IsNull(snapshot.Jobs[0].ObservedCost);
+        await harness.StopAsync();
+    }
+
+    private ForgeMonitoringService CreateDurableService(
+        string databasePath,
+        MonitoringOptions? options = null,
+        EventLedgerOptions? ledgerOptions = null) =>
+        new(
+            _workspace.RunsRoot,
+            new MonitoringRunLoggerFactory(_workspace.LogsRoot),
+            options ?? new MonitoringOptions(TimeSpan.FromMilliseconds(50)),
+            () => DateTimeOffset.UtcNow,
+            () => EventLedger.OpenProjection(
+                databasePath,
+                _workspace.Root,
+                ledgerOptions));
 
     private int CountLoggedJsonlEvents(string jobId)
     {

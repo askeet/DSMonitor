@@ -409,6 +409,24 @@ Raw model text, tool input/output, source files, credentials, and permission pay
 | LEDGER-019 | `ListRecords` and `ListEvents` expose bounded keyset-paginated retrieval with explicit finite limits, deterministic ordering, and bounded result allocation. Unbounded history materialization is not permitted. |
 | LEDGER-020 | Ledger storage confinement validates the approved root, directory chain, database file, and SQLite `-wal`/`-shm` sidecars for reparse points and opened-handle final paths before opening and before writes. A concurrent replacement between validation and SQLite's own open remains a residual TOCTOU limitation and must be documented; no unsafe guarantee is claimed. |
 
+### 8.4 B2 historical bootstrap and durable projection
+
+The user has authorized a fresh version-2 database at `%LOCALAPPDATA%\DSMonitor\Data\events-v2.db`; B1's database and sidecars are not migrated, overwritten or deleted. Create the B2 database only if absent; validate and reopen a valid v2 database, and fail closed on incompatible or corrupt storage. B1's schema, security and continuity contracts remain applicable to the physical ledger; v2 extends its safe metadata with the structured identifiers and numeric cost required below. B1 acceptance remains unchanged.
+
+| ID | B2 requirement |
+|---|---|
+| B2-001 | On Start, discover Forge metadata and safely confined associated logs, including approved filename fallbacks and previously registered paths; never infer a job from session or content alone. Record unassigned or inaccessible sources as incomplete coverage. |
+| B2-002 | Bind durable jobs to the verified runs root and stable Forge job identity, preserving job separation and detecting conflicting or provisional metadata associations. A log-path change does not reset valid job aggregates. |
+| B2-003 | Keep physical identity `(generation, start byte)` distinct from logical identity `(job, protocol namespace, session, message, part, canonical type)`; use ordinal source IDs and a fixed missing-session marker only when message and part exist. Preserve physical occurrences even for logical duplicates. |
+| B2-004 | Apply logical effects once per job-scoped source key. Missing message/part identity produces explicit uncertainty without uncertain aggregate effects; conflicting immutable metadata rolls back and is reported. Content hashes and locally generated IDs are not logical identity. Distinct source IDs remain distinct even with identical content. |
+| B2-005 | Commit physical records, safe event metadata, logical decisions, durable cost presence and total, session, activity, logical count, timeline ambiguity, guarded cursor and bootstrap checkpoint atomically. Publish only committed state. |
+| B2-006 | Capture a verified generation and initial length boundary, ingest complete records incrementally with bounded memory and fair asynchronous scheduling, persist progress and resume after interruption. Bootstrap and live ingestion share the same identity index and cursors. |
+| B2-007 | Persist coverage status separately from progress, including missing, inaccessible, partial, malformed, invalid, missing-ID/cost, replacement, conflicting and uncertain sources. Display observed subtotals as incomplete where appropriate; missing cost is not zero. |
+| B2-008 | Preserve B1 fail-closed truncation and ambiguity handling, read-only sources, storage protections, cancellation, Start/Stop, timeline ordering and 500-event bound. Preserve valid aggregate state across restart and reader recreation. |
+| B2-009 | Retain source and observation timestamps separately; calculate duration only for valid, unambiguously paired source timestamps. Do not claim provider HTTP latency. Bounded committed logical-event retrieval is the B3 seam; durable external-file delivery remains B3. |
+
+`DATA-015` and `ERR-006..008` remain mandatory: B2 prevents repeat aggregation for the same physical record and, across locations for the same job, for matching supported source identities. Missing, reused or regenerated IDs and undetected source rewrites cannot establish arbitrary logical equivalence; these cases remain explicit limitations or failures, not content-hash deduplication guarantees. Identical physical records remain separately recorded under `LEDGER-005`.
+
 ---
 
 ## 9. Security and Strictly Read-Only Behavior

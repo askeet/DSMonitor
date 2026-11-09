@@ -30,6 +30,8 @@ public sealed class EventLedger : IDisposable
     public const int DefaultReadLimit = 500;
     public const int MaxReadLimit = 5_000;
 
+    private const string LogicalKeyVersion = "b2v1";
+
     private static readonly UTF8Encoding StrictUtf8 = new(
         encoderShouldEmitUTF8Identifier: false,
         throwOnInvalidBytes: true);
@@ -37,6 +39,7 @@ public sealed class EventLedger : IDisposable
     private readonly object _gate = new();
     private readonly string _databasePath;
     private readonly EventLedgerOptions _options;
+    private readonly EventLedgerSchemaProfile _schema;
     private readonly LedgerSourceIdentityReader _identityReader;
     private readonly LedgerStorageGuard _storageGuard;
     private SqliteConnection? _connection;
@@ -50,12 +53,44 @@ public sealed class EventLedger : IDisposable
         string? allowedRoot = null,
         EventLedgerOptions? options = null,
         LedgerSourceIdentityReader? identityReader = null)
+        : this(
+            databasePath,
+            allowedRoot,
+            options,
+            identityReader,
+            EventLedgerSchemaProfile.V1)
+    {
+    }
+
+    /// <summary>
+    /// Opens the B2 projection schema in its own fresh database. The B1
+    /// constructor above remains the version-1 physical-only contract.
+    /// </summary>
+    public static EventLedger OpenProjection(
+        string databasePath,
+        string? allowedRoot = null,
+        EventLedgerOptions? options = null,
+        LedgerSourceIdentityReader? identityReader = null) =>
+        new(
+            databasePath,
+            allowedRoot,
+            options,
+            identityReader,
+            EventLedgerSchemaProfile.Projection);
+
+    private EventLedger(
+        string databasePath,
+        string? allowedRoot,
+        EventLedgerOptions? options,
+        LedgerSourceIdentityReader? identityReader,
+        EventLedgerSchemaProfile schema)
     {
         if (string.IsNullOrWhiteSpace(databasePath))
         {
             throw new ArgumentException("A ledger database path is required.", nameof(databasePath));
         }
 
+        _schema = schema;
         _options = options ?? new EventLedgerOptions();
         _identityReader = identityReader ?? ReadWindowsIdentity;
         _databasePath = Path.GetFullPath(databasePath);
@@ -211,6 +246,34 @@ public sealed class EventLedger : IDisposable
                 // written at this point.
                 ValidateWriteTransaction(transaction);
                 EnsureJob(jobId, now, transaction);
+                if (_schema.SupportsProjection)
+                {
+                    var conflictDetail = ExecuteScalar(
+                        transaction,
+                        "SELECT conflict_detail FROM jobs WHERE job_id = $job;",
+                        ("$job", jobId)) as string;
+                    if (!string.IsNullOrWhiteSpace(conflictDetail))
+                    {
+                        transaction.Rollback();
+                        return new LedgerIngestResult(
+                            LedgerIngestStatus.IdentityConflict,
+                            null,
+                            0,
+                            0,
+                            0,
+                            new[]
+                            {
+                                "The durable job has a conflicting runs-root or metadata association; ingestion was refused without mutation."
+                            });
+                    }
+
+                    TouchJobSource(
+                        transaction,
+                        jobId,
+                        fullPath,
+                        "Clean",
+                        now);
+                }
 
                 var matches = ReadMatchingGenerations(transaction, jobId, identity);
                 if (matches.Count > 1)
@@ -235,7 +298,13 @@ public sealed class EventLedger : IDisposable
 
                 if (matches.Count == 0)
                 {
-                    generationId = InsertGeneration(transaction, jobId, fullPath, identity, now);
+                    generationId = InsertGeneration(
+                        transaction,
+                        jobId,
+                        fullPath,
+                        identity,
+                        now,
+                        length);
                     cursor = 0;
                     cursorVersion = 0;
                     created = true;
@@ -271,6 +340,14 @@ public sealed class EventLedger : IDisposable
 
                 if (length == cursor)
                 {
+                    var noDataOutcome = FinalizeProjectionBatch(
+                        transaction,
+                        jobId,
+                        generationId,
+                        cursor,
+                        new ProjectionBatchStats(),
+                        partialTrailing: false,
+                        now);
                     CommitWithPostconditions(
                         transaction,
                         jobId,
@@ -280,14 +357,21 @@ public sealed class EventLedger : IDisposable
                         rangeStart: null,
                         rangeEnd: null,
                         expectedRecords: 0,
-                        expectedEvents: 0);
+                        expectedEvents: 0,
+                        expectedProjectionVersion: noDataOutcome?.Aggregate.Version,
+                        expectedLogicalEvents: null);
                     return new LedgerIngestResult(
                         created ? LedgerIngestStatus.Committed : LedgerIngestStatus.NoData,
                         generationId,
                         cursor,
                         0,
                         0,
-                        Array.Empty<string>());
+                        Array.Empty<string>())
+                    {
+                        Aggregate = noDataOutcome?.Aggregate,
+                        Bootstrap = noDataOutcome?.Bootstrap,
+                        Coverage = noDataOutcome?.Coverage
+                    };
                 }
 
                 cancellationToken.ThrowIfCancellationRequested();
@@ -341,6 +425,14 @@ public sealed class EventLedger : IDisposable
                             });
                     }
 
+                    var partialOutcome = FinalizeProjectionBatch(
+                        transaction,
+                        jobId,
+                        generationId,
+                        cursor,
+                        new ProjectionBatchStats { PartialTrailing = 1 },
+                        partialTrailing: true,
+                        now);
                     CommitWithPostconditions(
                         transaction,
                         jobId,
@@ -350,14 +442,22 @@ public sealed class EventLedger : IDisposable
                         rangeStart: null,
                         rangeEnd: null,
                         expectedRecords: 0,
-                        expectedEvents: 0);
+                        expectedEvents: 0,
+                        expectedProjectionVersion: partialOutcome?.Aggregate.Version,
+                        expectedLogicalEvents: null);
                     return new LedgerIngestResult(
                         created ? LedgerIngestStatus.Committed : LedgerIngestStatus.NoData,
                         generationId,
                         cursor,
                         0,
                         0,
-                        Array.Empty<string>());
+                        Array.Empty<string>())
+                    {
+                        Aggregate = partialOutcome?.Aggregate,
+                        Bootstrap = partialOutcome?.Bootstrap,
+                        Coverage = partialOutcome?.Coverage,
+                        PartialTrailingRecord = _schema.SupportsProjection
+                    };
                 }
 
                 var completeLength = lastNewline + 1;
@@ -366,6 +466,8 @@ public sealed class EventLedger : IDisposable
                 var eventCount = 0;
                 var rangeRecordCount = 0;
                 var rangeEventCount = 0;
+                var projectionStats = new ProjectionBatchStats();
+                var appliedEvents = new List<MonitoringEvent>();
                 var lineStart = 0;
 
                 while (lineStart < completeLength)
@@ -420,10 +522,26 @@ public sealed class EventLedger : IDisposable
                     if (inserted)
                     {
                         recordCount++;
+                        projectionStats.AddDisposition(disposition);
                         if (disposition == LedgerRecordDisposition.Accepted && parsed is not null)
                         {
-                            InsertEvent(transaction, recordId, parsed.Event);
+                            var sourceEventId = InsertEvent(transaction, recordId, parsed.Event);
                             eventCount++;
+                            if (_schema.SupportsProjection)
+                            {
+                                var applied = ApplyLogicalProjection(
+                                    transaction,
+                                    jobId,
+                                    recordId,
+                                    sourceEventId,
+                                    parsed,
+                                    now,
+                                    projectionStats);
+                                if (applied is not null)
+                                {
+                                    appliedEvents.Add(applied);
+                                }
+                            }
                         }
                     }
 
@@ -477,6 +595,21 @@ public sealed class EventLedger : IDisposable
                         "The committed cursor changed concurrently; the batch was rolled back.");
                 }
 
+                // A trailing partial record exists only when the bounded read
+                // reached the captured end of file and bytes remain after the
+                // last complete newline. Unread bytes beyond the window are
+                // normal bounded-bootstrap progress, not a partial record.
+                var readToCapturedEnd = cursor + read >= length;
+                var unreadInWindow = read - completeLength;
+                var hasPartialTrailing = readToCapturedEnd && unreadInWindow > 0;
+                var batchOutcome = FinalizeProjectionBatch(
+                    transaction,
+                    jobId,
+                    generationId,
+                    newCursor,
+                    projectionStats,
+                    partialTrailing: hasPartialTrailing,
+                    now);
                 CommitWithPostconditions(
                     transaction,
                     jobId,
@@ -486,14 +619,23 @@ public sealed class EventLedger : IDisposable
                     rangeStart: cursor,
                     rangeEnd: newCursor,
                     expectedRecords: rangeRecordCount,
-                    expectedEvents: rangeEventCount);
+                    expectedEvents: rangeEventCount,
+                    expectedProjectionVersion: batchOutcome?.Aggregate.Version,
+                    expectedLogicalEvents: _schema.SupportsProjection ? rangeEventCount : null);
                 return new LedgerIngestResult(
                     LedgerIngestStatus.Committed,
                     generationId,
                     newCursor,
                     recordCount,
                     eventCount,
-                    Array.Empty<string>());
+                    Array.Empty<string>())
+                {
+                    AcceptedEvents = appliedEvents,
+                    Aggregate = batchOutcome?.Aggregate,
+                    Bootstrap = batchOutcome?.Bootstrap,
+                    Coverage = batchOutcome?.Coverage,
+                    PartialTrailingRecord = _schema.SupportsProjection && hasPartialTrailing
+                };
             }
             catch (LedgerException)
             {
@@ -817,15 +959,15 @@ public sealed class EventLedger : IDisposable
         var version = Convert.ToInt32(
             ExecuteScalar(connection, null, "PRAGMA user_version;"),
             CultureInfo.InvariantCulture);
-        if (version != EventLedgerSchema.CurrentVersion)
+        if (version != _schema.Version)
         {
             throw new LedgerException(
                 LedgerStorageFailure.IncompatibleSchema,
-                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {EventLedgerSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture)}.");
+                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {_schema.Version.ToString(CultureInfo.InvariantCulture)}.");
         }
 
-        ValidateSchemaObjects(connection, null);
-        ValidateSchemaMetadata(connection, null);
+        ValidateSchemaObjects(connection, null, _schema);
+        ValidateSchemaMetadata(connection, null, _schema);
     }
 
     private void ValidateWriteTransaction(SqliteTransaction transaction)
@@ -833,11 +975,11 @@ public sealed class EventLedger : IDisposable
         var version = Convert.ToInt32(
             ExecuteScalar(transaction, "PRAGMA user_version;"),
             CultureInfo.InvariantCulture);
-        if (version != EventLedgerSchema.CurrentVersion)
+        if (version != _schema.Version)
         {
             throw new LedgerException(
                 LedgerStorageFailure.IncompatibleSchema,
-                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {EventLedgerSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture)}.");
+                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {_schema.Version.ToString(CultureInfo.InvariantCulture)}.");
         }
 
         ValidateSchemaObjects(transaction);
@@ -860,11 +1002,11 @@ public sealed class EventLedger : IDisposable
         {
             InitializeSchema();
         }
-        else if (version != EventLedgerSchema.CurrentVersion)
+        else if (version != _schema.Version)
         {
             throw new LedgerException(
                 LedgerStorageFailure.IncompatibleSchema,
-                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {EventLedgerSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture)}.");
+                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {_schema.Version.ToString(CultureInfo.InvariantCulture)}.");
         }
 
         ValidateSchemaObjects();
@@ -872,21 +1014,22 @@ public sealed class EventLedger : IDisposable
     }
 
     private void ValidateSchemaObjects(SqliteTransaction? transaction = null) =>
-        ValidateSchemaObjects(Connection, transaction);
+        ValidateSchemaObjects(Connection, transaction, _schema);
 
     private static void ValidateSchemaObjects(
         SqliteConnection connection,
-        SqliteTransaction? transaction)
+        SqliteTransaction? transaction,
+        EventLedgerSchemaProfile schema)
     {
         var expected = new Dictionary<string, (string Table, string? Sql)>(StringComparer.Ordinal);
-        foreach (var item in RequiredSchemaObjects)
+        foreach (var item in schema.RequiredObjects)
         {
             expected.Add(
                 SchemaKey(item.Type, item.Name),
                 (item.Table, item.Sql));
         }
 
-        foreach (var item in ExpectedInternalSchemaObjects)
+        foreach (var item in schema.InternalObjects)
         {
             expected.Add(
                 SchemaKey(item.Type, item.Name),
@@ -939,11 +1082,12 @@ public sealed class EventLedger : IDisposable
     }
 
     private void ValidateSchemaMetadata(SqliteTransaction? transaction = null) =>
-        ValidateSchemaMetadata(Connection, transaction);
+        ValidateSchemaMetadata(Connection, transaction, _schema);
 
     private static void ValidateSchemaMetadata(
         SqliteConnection connection,
-        SqliteTransaction? transaction)
+        SqliteTransaction? transaction,
+        EventLedgerSchemaProfile schema)
     {
         var schemaText = ExecuteScalar(
             connection,
@@ -951,7 +1095,7 @@ public sealed class EventLedger : IDisposable
             "SELECT value FROM ledger_meta WHERE key = 'schema_version';") as string;
         if (!string.Equals(
                 schemaText,
-                EventLedgerSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture),
+                schema.Version.ToString(CultureInfo.InvariantCulture),
                 StringComparison.Ordinal))
         {
             throw new LedgerException(
@@ -1122,21 +1266,394 @@ public sealed class EventLedger : IDisposable
             ("index", "sqlite_autoindex_source_records_1", "source_records", null)
         };
 
+    // B2 projection schema. It keeps the complete B1 physical contract but
+    // lives in its own fresh database and adds durable job/source association,
+    // structured logical decisions, bootstrap checkpoints, coverage and the
+    // authoritative aggregate row. It is never used to open or migrate events.db.
+    private static readonly (string Type, string Name, string Table, string Sql)[]
+        ProjectionRequiredSchemaObjects =
+        {
+            (
+                "table",
+                "ledger_meta",
+                "ledger_meta",
+                """
+                CREATE TABLE ledger_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            ),
+            (
+                "table",
+                "jobs",
+                "jobs",
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT PRIMARY KEY,
+                    created_utc TEXT NOT NULL,
+                    runs_root TEXT NULL,
+                    metadata_path TEXT NULL,
+                    last_seen_utc TEXT NULL,
+                    conflict_detail TEXT NULL,
+                    provisional INTEGER NOT NULL DEFAULT 0,
+                    uncovered_detail TEXT NULL
+                )
+                """
+            ),
+            (
+                "table",
+                "source_generations",
+                "source_generations",
+                """
+                CREATE TABLE source_generations (
+                    generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    source_path TEXT NOT NULL,
+                    volume_serial INTEGER NOT NULL,
+                    file_index TEXT NOT NULL,
+                    creation_utc_ticks INTEGER NOT NULL,
+                    first_seen_utc TEXT NOT NULL,
+                    last_seen_utc TEXT NOT NULL,
+                    predecessor_generation_id INTEGER NULL
+                        REFERENCES source_generations(generation_id)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_source_generations_identity",
+                "source_generations",
+                """
+                CREATE INDEX ix_source_generations_identity
+                    ON source_generations(job_id, volume_serial, file_index, creation_utc_ticks)
+                """
+            ),
+            (
+                "table",
+                "source_cursors",
+                "source_cursors",
+                """
+                CREATE TABLE source_cursors (
+                    generation_id INTEGER PRIMARY KEY
+                        REFERENCES source_generations(generation_id),
+                    committed_offset INTEGER NOT NULL CHECK (committed_offset >= 0),
+                    version INTEGER NOT NULL CHECK (version >= 0)
+                )
+                """
+            ),
+            (
+                "table",
+                "source_records",
+                "source_records",
+                """
+                CREATE TABLE source_records (
+                    record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generation_id INTEGER NOT NULL
+                        REFERENCES source_generations(generation_id),
+                    start_byte INTEGER NOT NULL CHECK (start_byte >= 0),
+                    end_byte INTEGER NOT NULL CHECK (end_byte > start_byte),
+                    payload_length INTEGER NOT NULL CHECK (payload_length >= 0),
+                    disposition TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    committed_utc TEXT NOT NULL,
+                    UNIQUE (generation_id, start_byte),
+                    CHECK (end_byte = start_byte + payload_length + 1)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_source_records_generation",
+                "source_records",
+                """
+                CREATE INDEX ix_source_records_generation
+                    ON source_records(generation_id, start_byte)
+                """
+            ),
+            (
+                "table",
+                "source_events",
+                "source_events",
+                """
+                CREATE TABLE source_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL UNIQUE
+                        REFERENCES source_records(record_id),
+                    job_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    session_id TEXT NULL,
+                    event_timestamp_utc TEXT NULL,
+                    observed_at_utc TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    summary TEXT NOT NULL
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_source_events_job",
+                "source_events",
+                """
+                CREATE INDEX ix_source_events_job
+                    ON source_events(job_id, event_id)
+                """
+            ),
+            (
+                "table",
+                "job_sources",
+                "job_sources",
+                """
+                CREATE TABLE job_sources (
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    source_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    first_seen_utc TEXT NOT NULL,
+                    last_seen_utc TEXT NOT NULL,
+                    PRIMARY KEY (job_id, source_path)
+                )
+                """
+            ),
+            (
+                "table",
+                "bootstrap_sources",
+                "bootstrap_sources",
+                """
+                CREATE TABLE bootstrap_sources (
+                    generation_id INTEGER PRIMARY KEY
+                        REFERENCES source_generations(generation_id),
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    initial_boundary INTEGER NOT NULL CHECK (initial_boundary >= 0),
+                    committed_offset INTEGER NOT NULL CHECK (committed_offset >= 0),
+                    completed_utc TEXT NULL,
+                    status TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_bootstrap_sources_job",
+                "bootstrap_sources",
+                """
+                CREATE INDEX ix_bootstrap_sources_job
+                    ON bootstrap_sources(job_id, generation_id)
+                """
+            ),
+            (
+                "table",
+                "source_coverage",
+                "source_coverage",
+                """
+                CREATE TABLE source_coverage (
+                    generation_id INTEGER PRIMARY KEY
+                        REFERENCES source_generations(generation_id),
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    status TEXT NOT NULL,
+                    clean_until_offset INTEGER NULL,
+                    partial_trailing INTEGER NOT NULL DEFAULT 0,
+                    malformed_count INTEGER NOT NULL DEFAULT 0,
+                    invalid_count INTEGER NOT NULL DEFAULT 0,
+                    overlong_count INTEGER NOT NULL DEFAULT 0,
+                    missing_identity_count INTEGER NOT NULL DEFAULT 0,
+                    missing_cost_count INTEGER NOT NULL DEFAULT 0,
+                    duplicate_count INTEGER NOT NULL DEFAULT 0,
+                    conflict_count INTEGER NOT NULL DEFAULT 0,
+                    updated_utc TEXT NOT NULL
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_source_coverage_job",
+                "source_coverage",
+                """
+                CREATE INDEX ix_source_coverage_job
+                    ON source_coverage(job_id, generation_id)
+                """
+            ),
+            (
+                "table",
+                "logical_events",
+                "logical_events",
+                """
+                CREATE TABLE logical_events (
+                    logical_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_event_id INTEGER NOT NULL UNIQUE
+                        REFERENCES source_events(event_id),
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    decision TEXT NOT NULL,
+                    namespace TEXT NULL,
+                    session_key TEXT NULL,
+                    message_id TEXT NULL,
+                    part_id TEXT NULL,
+                    event_type TEXT NULL,
+                    logical_key TEXT NULL,
+                    cost_text TEXT NULL,
+                    cost_expected INTEGER NOT NULL DEFAULT 0,
+                    event_timestamp_utc TEXT NULL,
+                    observed_at_utc TEXT NOT NULL,
+                    applied_utc TEXT NULL
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_logical_events_job",
+                "logical_events",
+                """
+                CREATE INDEX ix_logical_events_job
+                    ON logical_events(job_id, logical_event_id)
+                """
+            ),
+            (
+                "index",
+                "ix_logical_events_key",
+                "logical_events",
+                """
+                CREATE INDEX ix_logical_events_key
+                    ON logical_events(job_id, logical_key)
+                """
+            ),
+            (
+                "table",
+                "job_logical_keys",
+                "job_logical_keys",
+                """
+                CREATE TABLE job_logical_keys (
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    logical_key TEXT NOT NULL,
+                    logical_event_id INTEGER NOT NULL
+                        REFERENCES logical_events(logical_event_id),
+                    cost_text TEXT NULL,
+                    event_timestamp_utc TEXT NULL,
+                    PRIMARY KEY (job_id, logical_key)
+                )
+                """
+            ),
+            (
+                "table",
+                "job_aggregates",
+                "job_aggregates",
+                """
+                CREATE TABLE job_aggregates (
+                    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+                    cost_total TEXT NOT NULL DEFAULT '0',
+                    cost_event_count INTEGER NOT NULL DEFAULT 0,
+                    missing_cost_event_count INTEGER NOT NULL DEFAULT 0,
+                    latest_session_id TEXT NULL,
+                    last_activity_utc TEXT NULL,
+                    logical_event_count INTEGER NOT NULL DEFAULT 0,
+                    missing_identity_count INTEGER NOT NULL DEFAULT 0,
+                    timeline_ambiguous INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    updated_utc TEXT NOT NULL
+                )
+                """
+            ),
+            (
+                "table",
+                "job_coverage",
+                "job_coverage",
+                """
+                CREATE TABLE job_coverage (
+                    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+                    status TEXT NOT NULL,
+                    detail TEXT NULL,
+                    updated_utc TEXT NOT NULL
+                )
+                """
+            ),
+            (
+                "table",
+                "discovery_state",
+                "discovery_state",
+                """
+                CREATE TABLE discovery_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    runs_root TEXT NOT NULL,
+                    directory_available INTEGER NOT NULL,
+                    warnings TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL
+                )
+                """
+            )
+        };
+
+    private static readonly (string Type, string Name, string Table, string? Sql)[]
+        ProjectionInternalSchemaObjects =
+        {
+            (
+                "table",
+                "sqlite_sequence",
+                "sqlite_sequence",
+                "CREATE TABLE sqlite_sequence(name,seq)"
+            ),
+            ("index", "sqlite_autoindex_job_aggregates_1", "job_aggregates", null),
+            ("index", "sqlite_autoindex_job_coverage_1", "job_coverage", null),
+            ("index", "sqlite_autoindex_job_logical_keys_1", "job_logical_keys", null),
+            ("index", "sqlite_autoindex_job_sources_1", "job_sources", null),
+            ("index", "sqlite_autoindex_jobs_1", "jobs", null),
+            ("index", "sqlite_autoindex_ledger_meta_1", "ledger_meta", null),
+            ("index", "sqlite_autoindex_logical_events_1", "logical_events", null),
+            ("index", "sqlite_autoindex_source_events_1", "source_events", null),
+            ("index", "sqlite_autoindex_source_records_1", "source_records", null)
+        };
+
+    private sealed class EventLedgerSchemaProfile
+    {
+        private EventLedgerSchemaProfile(
+            int version,
+            IReadOnlyList<(string Type, string Name, string Table, string Sql)> requiredObjects,
+            IReadOnlyList<(string Type, string Name, string Table, string? Sql)> internalObjects,
+            bool supportsProjection)
+        {
+            Version = version;
+            RequiredObjects = requiredObjects;
+            InternalObjects = internalObjects;
+            SupportsProjection = supportsProjection;
+        }
+
+        public static EventLedgerSchemaProfile V1 { get; } = new(
+            EventLedgerSchema.CurrentVersion,
+            RequiredSchemaObjects,
+            ExpectedInternalSchemaObjects,
+            supportsProjection: false);
+
+        public static EventLedgerSchemaProfile Projection { get; } = new(
+            EventLedgerSchema.ProjectionVersion,
+            ProjectionRequiredSchemaObjects,
+            ProjectionInternalSchemaObjects,
+            supportsProjection: true);
+
+        public int Version { get; }
+
+        public IReadOnlyList<(string Type, string Name, string Table, string Sql)> RequiredObjects { get; }
+
+        public IReadOnlyList<(string Type, string Name, string Table, string? Sql)> InternalObjects { get; }
+
+        public bool SupportsProjection { get; }
+    }
+
     private void InitializeSchema()
     {
         SqliteTransaction? transaction = null;
         try
         {
             transaction = Connection.BeginTransaction(IsolationLevel.Serializable, deferred: false);
-            foreach (var schemaObject in RequiredSchemaObjects)
+            foreach (var schemaObject in _schema.RequiredObjects)
             {
                 ExecuteNonQuery(transaction, schemaObject.Sql);
             }
 
             ExecuteNonQuery(
                 transaction,
-                "INSERT INTO ledger_meta(key, value) VALUES ('schema_version', '1');");
-            ExecuteNonQuery(transaction, "PRAGMA user_version = 1;");
+                "INSERT INTO ledger_meta(key, value) VALUES ('schema_version', $version);",
+                ("$version", _schema.Version.ToString(CultureInfo.InvariantCulture)));
+            ExecuteNonQuery(
+                transaction,
+                $"PRAGMA user_version = {_schema.Version.ToString(CultureInfo.InvariantCulture)};");
             transaction.Commit();
         }
         catch
@@ -1155,16 +1672,1425 @@ public sealed class EventLedger : IDisposable
         DateTimeOffset now,
         SqliteTransaction transaction)
     {
+        if (!_schema.SupportsProjection)
+        {
+            ExecuteNonQuery(
+                transaction,
+                """
+                INSERT INTO jobs(job_id, created_utc)
+                VALUES ($job, $now)
+                ON CONFLICT(job_id) DO NOTHING;
+                """,
+                ("$job", jobId),
+                ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+            return;
+        }
+
         ExecuteNonQuery(
             transaction,
             """
-            INSERT INTO jobs(job_id, created_utc)
+            INSERT INTO jobs(job_id, created_utc, last_seen_utc)
+            VALUES ($job, $now, $now)
+            ON CONFLICT(job_id) DO UPDATE SET last_seen_utc = excluded.last_seen_utc;
+            """,
+            ("$job", jobId),
+            ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+
+        ExecuteNonQuery(
+            transaction,
+            """
+            INSERT INTO job_aggregates(job_id, updated_utc)
             VALUES ($job, $now)
             ON CONFLICT(job_id) DO NOTHING;
             """,
             ("$job", jobId),
             ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+
+        ExecuteNonQuery(
+            transaction,
+            """
+            INSERT INTO job_coverage(job_id, status, detail, updated_utc)
+            VALUES ($job, $status, $detail, $now)
+            ON CONFLICT(job_id) DO NOTHING;
+            """,
+            ("$job", jobId),
+            ("$status", LedgerCoverageState.Clean.ToString()),
+            ("$detail", "Historical coverage has not been evaluated yet."),
+            ("$now", LedgerStoragePaths.FormatTimestamp(now)));
     }
+
+    /// <summary>
+    /// Registers a discovered durable job and its verified runs root. The
+    /// job_id is the stable forge metadata identity; a conflicting runs root
+    /// or metadata path is surfaced as incomplete coverage instead of being
+    /// silently merged into an unrelated job.
+    /// </summary>
+    public bool RegisterJob(
+        string jobId,
+        string runsRoot,
+        string? metadataPath,
+        DateTimeOffset? observedAt = null,
+        bool provisional = false)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        if (string.IsNullOrWhiteSpace(runsRoot))
+        {
+            throw new ArgumentException("A runs root is required.", nameof(runsRoot));
+        }
+
+        var now = observedAt ?? DateTimeOffset.UtcNow;
+        var normalizedRoot = Path.GetFullPath(runsRoot);
+        var normalizedMetadata = string.IsNullOrWhiteSpace(metadataPath)
+            ? null
+            : Path.GetFullPath(metadataPath);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (!_schema.SupportsProjection)
+            {
+                throw new InvalidOperationException(
+                    "Durable job registration requires the B2 projection schema.");
+            }
+
+            _storageGuard.PrepareAndValidate();
+            SqliteTransaction? transaction = null;
+            var conflict = false;
+            try
+            {
+                transaction = Connection.BeginTransaction(IsolationLevel.Serializable, deferred: false);
+                ValidateWriteTransaction(transaction);
+                EnsureJob(jobId, now, transaction);
+
+                var existingRoot = ExecuteScalar(
+                    transaction,
+                    "SELECT runs_root FROM jobs WHERE job_id = $job;",
+                    ("$job", jobId)) as string;
+                var existingMetadata = ExecuteScalar(
+                    transaction,
+                    "SELECT metadata_path FROM jobs WHERE job_id = $job;",
+                    ("$job", jobId)) as string;
+
+                conflict =
+                    (!string.IsNullOrWhiteSpace(existingRoot) &&
+                     !string.Equals(existingRoot, normalizedRoot, StringComparison.OrdinalIgnoreCase)) ||
+                    (normalizedMetadata is not null &&
+                     !string.IsNullOrWhiteSpace(existingMetadata) &&
+                     !string.Equals(existingMetadata, normalizedMetadata, StringComparison.OrdinalIgnoreCase));
+
+                ExecuteNonQuery(
+                    transaction,
+                    """
+                    UPDATE jobs
+                    SET runs_root = COALESCE(runs_root, $root),
+                        metadata_path = COALESCE(metadata_path, $metadata),
+                        last_seen_utc = $now,
+                        provisional = $provisional
+                    WHERE job_id = $job;
+                    """,
+                    ("$root", normalizedRoot),
+                    ("$metadata", normalizedMetadata),
+                    ("$now", LedgerStoragePaths.FormatTimestamp(now)),
+                    ("$provisional", provisional ? 1 : 0),
+                    ("$job", jobId));
+
+                if (conflict)
+                {
+                    ExecuteNonQuery(
+                        transaction,
+                        """
+                        UPDATE jobs
+                        SET conflict_detail = $detail
+                        WHERE job_id = $job;
+                        """,
+                        ("$detail", "Conflicting runs-root or metadata association for the same durable job id."),
+                        ("$job", jobId));
+                }
+
+                RefreshJobCoverage(transaction, jobId, now);
+                transaction.Commit();
+            }
+            catch (LedgerException)
+            {
+                TryRollback(transaction);
+                throw;
+            }
+            catch (SqliteException ex)
+            {
+                TryRollback(transaction);
+                throw MapSqliteException(ex, "The durable job registration failed and was rolled back.");
+            }
+            finally
+            {
+                transaction?.Dispose();
+            }
+
+            return conflict;
+        }
+    }
+
+    /// <summary>Registers a verified or expected job/source association.</summary>
+    public void RegisterJobSource(
+        string jobId,
+        string sourcePath,
+        string status,
+        DateTimeOffset? observedAt = null)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        if (string.IsNullOrWhiteSpace(sourcePath))
+        {
+            throw new ArgumentException("A source path is required.", nameof(sourcePath));
+        }
+
+        var now = observedAt ?? DateTimeOffset.UtcNow;
+        var fullPath = Path.GetFullPath(sourcePath);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (!_schema.SupportsProjection)
+            {
+                throw new InvalidOperationException(
+                    "Durable source registration requires the B2 projection schema.");
+            }
+
+            _storageGuard.PrepareAndValidate();
+            SqliteTransaction? transaction = null;
+            try
+            {
+                transaction = Connection.BeginTransaction(IsolationLevel.Serializable, deferred: false);
+                ValidateWriteTransaction(transaction);
+                EnsureJob(jobId, now, transaction);
+                TouchJobSource(transaction, jobId, fullPath, status, now);
+                RefreshJobCoverage(transaction, jobId, now);
+                transaction.Commit();
+            }
+            catch (LedgerException)
+            {
+                TryRollback(transaction);
+                throw;
+            }
+            catch (SqliteException ex)
+            {
+                TryRollback(transaction);
+                throw MapSqliteException(ex, "The job/source registration failed and was rolled back.");
+            }
+            finally
+            {
+                transaction?.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Persists an explicit job-level uncovered-source condition. Passing null
+    /// clears it when the condition no longer exists, allowing coverage to be
+    /// recalculated without inventing or merging source data.
+    /// </summary>
+    public void SetJobCoverageIncomplete(
+        string jobId,
+        string? detail,
+        DateTimeOffset? observedAt = null)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        var now = observedAt ?? DateTimeOffset.UtcNow;
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (!_schema.SupportsProjection)
+            {
+                throw new InvalidOperationException(
+                    "Durable coverage updates require the B2 projection schema.");
+            }
+
+            _storageGuard.PrepareAndValidate();
+            SqliteTransaction? transaction = null;
+            try
+            {
+                transaction = Connection.BeginTransaction(IsolationLevel.Serializable, deferred: false);
+                ValidateWriteTransaction(transaction);
+                EnsureJob(jobId, now, transaction);
+                ExecuteNonQuery(
+                    transaction,
+                    """
+                    UPDATE jobs
+                    SET uncovered_detail = $detail,
+                        last_seen_utc = $now
+                    WHERE job_id = $job;
+                    """,
+                    ("$detail", detail),
+                    ("$now", LedgerStoragePaths.FormatTimestamp(now)),
+                    ("$job", jobId));
+                RefreshJobCoverage(transaction, jobId, now);
+                transaction.Commit();
+            }
+            catch (LedgerException)
+            {
+                TryRollback(transaction);
+                throw;
+            }
+            catch (SqliteException ex)
+            {
+                TryRollback(transaction);
+                throw MapSqliteException(ex, "The uncovered-source coverage update failed and was rolled back.");
+            }
+            finally
+            {
+                transaction?.Dispose();
+            }
+        }
+    }
+
+    public void MarkSourceUnavailable(
+        string jobId,
+        string sourcePath,
+        DateTimeOffset? observedAt = null) =>
+        RegisterJobSource(
+            jobId,
+            sourcePath,
+            LedgerCoverageState.Unavailable.ToString(),
+            observedAt);
+
+    public void UpdateDiscoveryState(
+        string runsRoot,
+        bool directoryAvailable,
+        IReadOnlyList<string> warnings,
+        DateTimeOffset? observedAt = null)
+    {
+        var now = observedAt ?? DateTimeOffset.UtcNow;
+        var serializedWarnings = string.Join('\n', warnings ?? Array.Empty<string>());
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (!_schema.SupportsProjection)
+            {
+                return;
+            }
+
+            _storageGuard.PrepareAndValidate();
+            SqliteTransaction? transaction = null;
+            try
+            {
+                transaction = Connection.BeginTransaction(IsolationLevel.Serializable, deferred: false);
+                ValidateWriteTransaction(transaction);
+                ExecuteNonQuery(
+                    transaction,
+                    """
+                    INSERT INTO discovery_state(
+                        id, runs_root, directory_available, warnings, updated_utc)
+                    VALUES (1, $root, $available, $warnings, $now)
+                    ON CONFLICT(id) DO UPDATE SET
+                        runs_root = excluded.runs_root,
+                        directory_available = excluded.directory_available,
+                        warnings = excluded.warnings,
+                        updated_utc = excluded.updated_utc;
+                    """,
+                    ("$root", Path.GetFullPath(runsRoot)),
+                    ("$available", directoryAvailable ? 1 : 0),
+                    ("$warnings", serializedWarnings),
+                    ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+                transaction.Commit();
+            }
+            catch (LedgerException)
+            {
+                TryRollback(transaction);
+                throw;
+            }
+            catch (SqliteException ex)
+            {
+                TryRollback(transaction);
+                throw MapSqliteException(ex, "The discovery state could not be persisted.");
+            }
+            finally
+            {
+                transaction?.Dispose();
+            }
+        }
+    }
+
+    public LedgerJobAggregate GetJobAggregate(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            try
+            {
+                return ReadAggregate(null, jobId);
+            }
+            catch (SqliteException ex)
+            {
+                throw MapSqliteException(ex, "The durable job aggregate could not be read.");
+            }
+        }
+    }
+
+    public LedgerCoverage GetJobCoverage(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            try
+            {
+                return ReadCoverage(null, jobId);
+            }
+            catch (SqliteException ex)
+            {
+                throw MapSqliteException(ex, "The durable job coverage could not be read.");
+            }
+        }
+    }
+
+    public IReadOnlyList<LedgerJobSource> ListJobSources(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            using var command = Connection.CreateCommand();
+            command.CommandText =
+                """
+                SELECT job_id, source_path, status, first_seen_utc, last_seen_utc
+                FROM job_sources
+                WHERE job_id = $job
+                ORDER BY source_path;
+                """;
+            command.Parameters.AddWithValue("$job", jobId);
+            var results = new List<LedgerJobSource>();
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                results.Add(new LedgerJobSource(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    LedgerStoragePaths.ParseTimestamp(reader.GetString(3)),
+                    LedgerStoragePaths.ParseTimestamp(reader.GetString(4))));
+            }
+
+            return results;
+        }
+    }
+
+    public IReadOnlyList<LedgerBootstrapProgress> ListBootstrapProgress(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            using var command = Connection.CreateCommand();
+            command.CommandText =
+                """
+                SELECT generation_id, initial_boundary, committed_offset,
+                       completed_utc, status
+                FROM bootstrap_sources
+                WHERE job_id = $job
+                ORDER BY generation_id;
+                """;
+            command.Parameters.AddWithValue("$job", jobId);
+            var results = new List<LedgerBootstrapProgress>();
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                results.Add(new LedgerBootstrapProgress(
+                    reader.GetInt64(0),
+                    reader.GetInt64(1),
+                    reader.GetInt64(2),
+                    reader.IsDBNull(3)
+                        ? null
+                        : LedgerStoragePaths.ParseTimestamp(reader.GetString(3)),
+                    reader.GetString(4)));
+            }
+
+            return results;
+        }
+    }
+
+    /// <summary>
+    /// Restores a bounded timeline. All-known histories use the newest
+    /// timestamped events; a history with any missing timestamp uses the most
+    /// recent source window, matching the live retention policy.
+    /// </summary>
+    public IReadOnlyList<MonitoringEvent> ListTimelineEvents(string jobId, int capacity)
+    {
+        lock (_gate)
+        {
+            var snapshot = ReadTimelineSnapshotLocked(jobId, capacity);
+            return snapshot.HasObservedAmbiguousTimestamps
+                ? snapshot.SourceWindow
+                : snapshot.NewestTimestampedWindow;
+        }
+    }
+
+    /// <summary>
+    /// Restores both bounded candidate windows plus the historical ambiguity
+    /// flag. Selecting only the currently displayed window would make the
+    /// result depend on restart timing once a missing timestamp arrives.
+    /// </summary>
+    public LedgerTimelineSnapshot ListTimelineSnapshot(string jobId, int capacity)
+    {
+        lock (_gate)
+        {
+            return ReadTimelineSnapshotLocked(jobId, capacity);
+        }
+    }
+
+    private LedgerTimelineSnapshot ReadTimelineSnapshotLocked(
+        string jobId,
+        int capacity)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        ValidateReadLimit(capacity);
+        ThrowIfDisposed();
+
+        var hasMissing = Convert.ToInt64(
+            ExecuteScalar(
+                null,
+                """
+                SELECT COUNT(*)
+                FROM logical_events
+                WHERE job_id = $job
+                  AND decision = $decision
+                  AND event_timestamp_utc IS NULL;
+                """,
+                ("$job", jobId),
+                ("$decision", LedgerLogicalDecision.Applied.ToString())),
+            CultureInfo.InvariantCulture) > 0;
+
+        var sourceWindow = ReadTimelineWindow(
+            jobId,
+            capacity,
+            newestTimestamped: false);
+        var newestWindow = ReadTimelineWindow(
+            jobId,
+            capacity,
+            newestTimestamped: true);
+
+        return new LedgerTimelineSnapshot(
+            sourceWindow,
+            newestWindow,
+            hasMissing);
+    }
+
+    private IReadOnlyList<MonitoringEvent> ReadTimelineWindow(
+        string jobId,
+        int capacity,
+        bool newestTimestamped)
+    {
+        var sql = newestTimestamped
+            ? """
+              SELECT l.logical_event_id, e.event_id, e.job_id, e.event_key,
+                     e.session_id, e.event_timestamp_utc, e.observed_at_utc,
+                     e.category, e.severity, e.summary
+              FROM logical_events l
+              JOIN source_events e ON e.event_id = l.source_event_id
+              WHERE l.job_id = $job
+                AND l.decision = $decision
+                AND e.event_timestamp_utc IS NOT NULL
+              ORDER BY e.event_timestamp_utc DESC, l.logical_event_id ASC
+              LIMIT $limit;
+              """
+            : """
+              SELECT l.logical_event_id, e.event_id, e.job_id, e.event_key,
+                     e.session_id, e.event_timestamp_utc, e.observed_at_utc,
+                     e.category, e.severity, e.summary
+              FROM logical_events l
+              JOIN source_events e ON e.event_id = l.source_event_id
+              WHERE l.job_id = $job AND l.decision = $decision
+              ORDER BY l.logical_event_id DESC
+              LIMIT $limit;
+              """;
+
+        using var command = Connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$job", jobId);
+        command.Parameters.AddWithValue("$decision", LedgerLogicalDecision.Applied.ToString());
+        command.Parameters.AddWithValue("$limit", capacity);
+
+        var results = new List<(long LogicalEventId, MonitoringEvent Event)>();
+        using (var reader = command.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                results.Add((
+                    reader.GetInt64(0),
+                    new MonitoringEvent
+                    {
+                        EventKey = reader.GetString(3),
+                        JobId = reader.GetString(2),
+                        SessionId = reader.IsDBNull(4) ? null : reader.GetString(4),
+                        Timestamp = reader.IsDBNull(5)
+                            ? null
+                            : LedgerStoragePaths.ParseTimestamp(reader.GetString(5)),
+                        ObservedAt = LedgerStoragePaths.ParseTimestamp(reader.GetString(6)),
+                        Category = Enum.Parse<MonitoringEventCategory>(reader.GetString(7)),
+                        Severity = Enum.Parse<MonitoringEventSeverity>(reader.GetString(8)),
+                        Summary = reader.GetString(9)
+                    }));
+            }
+        }
+
+        return results
+            .OrderBy(item => item.LogicalEventId)
+            .Select(item => item.Event)
+            .ToArray();
+    }
+
+    /// <summary>Bounded committed logical-event retrieval seam for B3.</summary>
+    public IReadOnlyList<LedgerLogicalEvent> ListCommittedLogicalEvents(
+        string jobId,
+        long? afterLogicalEventId,
+        int limit)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            throw new ArgumentException("A job id is required.", nameof(jobId));
+        }
+
+        ValidateReadLimit(limit);
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            using var command = Connection.CreateCommand();
+            command.CommandText =
+                """
+                SELECT l.logical_event_id, l.source_event_id, e.job_id, e.event_key,
+                       e.session_id, e.event_timestamp_utc, e.observed_at_utc,
+                       e.category, e.severity, e.summary, l.cost_text, l.cost_expected
+                FROM logical_events l
+                JOIN source_events e ON e.event_id = l.source_event_id
+                WHERE l.job_id = $job
+                  AND l.decision = $decision
+                  AND ($after IS NULL OR l.logical_event_id > $after)
+                ORDER BY l.logical_event_id
+                LIMIT $limit;
+                """;
+            command.Parameters.AddWithValue("$job", jobId);
+            command.Parameters.AddWithValue("$decision", LedgerLogicalDecision.Applied.ToString());
+            command.Parameters.AddWithValue(
+                "$after",
+                afterLogicalEventId is null ? DBNull.Value : afterLogicalEventId.Value);
+            command.Parameters.AddWithValue("$limit", limit);
+
+            var results = new List<LedgerLogicalEvent>(Math.Min(limit, 256));
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                results.Add(new LedgerLogicalEvent(
+                    reader.GetInt64(0),
+                    reader.GetInt64(1),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    reader.IsDBNull(5)
+                        ? null
+                        : LedgerStoragePaths.ParseTimestamp(reader.GetString(5)),
+                    LedgerStoragePaths.ParseTimestamp(reader.GetString(6)),
+                    Enum.Parse<MonitoringEventCategory>(reader.GetString(7)),
+                    Enum.Parse<MonitoringEventSeverity>(reader.GetString(8)),
+                    reader.GetString(9),
+                    reader.IsDBNull(10) ? null : ParseDecimal(reader.GetString(10)),
+                    reader.GetInt64(11) != 0));
+            }
+
+            return results;
+        }
+    }
+
+    private void TouchJobSource(
+        SqliteTransaction transaction,
+        string jobId,
+        string sourcePath,
+        string status,
+        DateTimeOffset now)
+    {
+        ExecuteNonQuery(
+            transaction,
+            """
+            INSERT INTO job_sources(
+                job_id, source_path, status, first_seen_utc, last_seen_utc)
+            VALUES ($job, $path, $status, $now, $now)
+            ON CONFLICT(job_id, source_path) DO UPDATE SET
+                status = excluded.status,
+                last_seen_utc = excluded.last_seen_utc;
+            """,
+            ("$job", jobId),
+            ("$path", sourcePath),
+            ("$status", status),
+            ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+    }
+
+    private MonitoringEvent? ApplyLogicalProjection(
+        SqliteTransaction transaction,
+        string jobId,
+        long recordId,
+        long sourceEventId,
+        ParsedLogEvent parsed,
+        DateTimeOffset now,
+        ProjectionBatchStats stats)
+    {
+        _ = recordId;
+        var identity = parsed.Identity;
+        var costText = parsed.CostAmount is { } cost
+            ? cost.ToString(CultureInfo.InvariantCulture)
+            : null;
+        var eventTimestamp = parsed.Event.Timestamp is { } timestamp
+            ? LedgerStoragePaths.FormatTimestamp(timestamp)
+            : null;
+
+        if (identity is null || !identity.HasMessageAndPart)
+        {
+            InsertLogicalEvent(
+                transaction,
+                sourceEventId,
+                jobId,
+                LedgerLogicalDecision.MissingIdentity,
+                identity,
+                logicalKey: null,
+                costText: null,
+                costExpected: parsed.CostExpected,
+                eventTimestamp,
+                now);
+            ExecuteNonQuery(
+                transaction,
+                """
+                UPDATE job_aggregates
+                SET missing_identity_count = missing_identity_count + 1,
+                    version = version + 1,
+                    updated_utc = $now
+                WHERE job_id = $job;
+                """,
+                ("$now", LedgerStoragePaths.FormatTimestamp(now)),
+                ("$job", jobId));
+            stats.MissingIdentity++;
+            return null;
+        }
+
+        var logicalKey = BuildLogicalKey(jobId, identity);
+
+        var existing = ReadLogicalKey(transaction, jobId, logicalKey);
+        if (existing is { } match)
+        {
+            if (match.CostAmount != parsed.CostAmount ||
+                !string.Equals(match.EventTimestamp, eventTimestamp, StringComparison.Ordinal))
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.ConstraintViolation,
+                    "The same logical source identity was observed with conflicting immutable cost or timestamp metadata; the batch was rolled back.");
+            }
+
+            InsertLogicalEvent(
+                transaction,
+                sourceEventId,
+                jobId,
+                LedgerLogicalDecision.Duplicate,
+                identity,
+                logicalKey,
+                costText,
+                parsed.CostExpected,
+                eventTimestamp,
+                now,
+                applied: false);
+            stats.Duplicate++;
+            return null;
+        }
+
+        var logicalEventId = InsertLogicalEvent(
+            transaction,
+            sourceEventId,
+            jobId,
+            LedgerLogicalDecision.Applied,
+            identity,
+            logicalKey,
+            costText,
+            parsed.CostExpected,
+            eventTimestamp,
+            now);
+        ExecuteNonQuery(
+            transaction,
+            """
+            INSERT INTO job_logical_keys(
+                job_id, logical_key, logical_event_id, cost_text, event_timestamp_utc)
+            VALUES ($job, $key, $event, $cost, $eventTimestamp);
+            """,
+            ("$job", jobId),
+            ("$key", logicalKey),
+            ("$event", logicalEventId),
+            ("$cost", costText),
+            ("$eventTimestamp", eventTimestamp));
+
+        var costDelta = parsed.CostAmount ?? 0m;
+        var currentCostText = ExecuteScalar(
+            transaction,
+            "SELECT cost_total FROM job_aggregates WHERE job_id = $job;",
+            ("$job", jobId)) as string;
+        decimal nextCost;
+        try
+        {
+            var currentCost = string.IsNullOrWhiteSpace(currentCostText)
+                ? 0m
+                : ParseDecimal(currentCostText);
+            nextCost = checked(currentCost + costDelta);
+        }
+        catch (OverflowException ex)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.NumericOverflow,
+                "The durable cost total would overflow; the batch was rolled back.",
+                ex);
+        }
+
+        var missingCost = parsed.CostExpected && parsed.CostAmount is null ? 1 : 0;
+        var costPresent = parsed.CostAmount is null ? 0 : 1;
+        if (parsed.CostExpected && parsed.CostAmount is null)
+        {
+            stats.MissingCost++;
+        }
+
+        var activity = eventTimestamp ??
+            LedgerStoragePaths.FormatTimestamp(now);
+        ExecuteNonQuery(
+            transaction,
+            """
+            UPDATE job_aggregates
+            SET cost_total = $costTotal,
+                cost_event_count = cost_event_count + $costPresent,
+                missing_cost_event_count = missing_cost_event_count + $missingCost,
+                latest_session_id = COALESCE($session, latest_session_id),
+                last_activity_utc = CASE
+                    WHEN last_activity_utc IS NULL OR $activity > last_activity_utc
+                        THEN $activity
+                    ELSE last_activity_utc
+                END,
+                logical_event_count = logical_event_count + 1,
+                timeline_ambiguous = CASE
+                    WHEN $ambiguous = 1 THEN 1
+                    ELSE timeline_ambiguous
+                END,
+                version = version + 1,
+                updated_utc = $now
+            WHERE job_id = $job;
+            """,
+            ("$costTotal", nextCost.ToString(CultureInfo.InvariantCulture)),
+            ("$costPresent", costPresent),
+            ("$missingCost", missingCost),
+            ("$session", string.IsNullOrWhiteSpace(identity.SessionId)
+                ? null
+                : identity.SessionId),
+            ("$activity", activity),
+            ("$ambiguous", eventTimestamp is null ? 1 : 0),
+            ("$now", LedgerStoragePaths.FormatTimestamp(now)),
+            ("$job", jobId));
+
+        return parsed.Event;
+    }
+
+    private long InsertLogicalEvent(
+        SqliteTransaction transaction,
+        long sourceEventId,
+        string jobId,
+        LedgerLogicalDecision decision,
+        ParsedEventIdentity? identity,
+        string? logicalKey,
+        string? costText,
+        bool costExpected,
+        string? eventTimestamp,
+        DateTimeOffset now,
+        bool applied = true)
+    {
+        var inserted = ExecuteNonQuery(
+            transaction,
+            """
+            INSERT INTO logical_events(
+                source_event_id, job_id, decision, namespace, session_key,
+                message_id, part_id, event_type, logical_key, cost_text,
+                cost_expected, event_timestamp_utc, observed_at_utc, applied_utc)
+            VALUES (
+                $sourceEvent, $job, $decision, $namespace, $session,
+                $message, $part, $eventType, $logicalKey, $cost,
+                $costExpected, $eventTimestamp, $observedAt, $appliedUtc);
+            """,
+            ("$sourceEvent", sourceEventId),
+            ("$job", jobId),
+            ("$decision", decision.ToString()),
+            ("$namespace", identity?.Namespace),
+            ("$session", string.IsNullOrWhiteSpace(identity?.SessionId)
+                ? null
+                : identity.SessionId),
+            ("$message", identity?.MessageId),
+            ("$part", identity?.PartId),
+            ("$eventType", identity?.CanonicalEventType),
+            ("$logicalKey", logicalKey),
+            ("$cost", costText),
+            ("$costExpected", costExpected ? 1 : 0),
+            ("$eventTimestamp", eventTimestamp),
+            ("$observedAt", LedgerStoragePaths.FormatTimestamp(now)),
+            ("$appliedUtc", applied ? LedgerStoragePaths.FormatTimestamp(now) : null));
+        if (inserted != 1)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.ConstraintViolation,
+                "The logical event insert did not take effect; the batch was rolled back.");
+        }
+
+        return Convert.ToInt64(
+            ExecuteScalar(transaction, "SELECT last_insert_rowid();"),
+            CultureInfo.InvariantCulture);
+    }
+
+    private static string BuildLogicalKey(
+        string jobId,
+        ParsedEventIdentity identity)
+    {
+        // Length-prefixed, type-tagged components make every source value
+        // unambiguous even when it contains separators or control characters.
+        // The missing-session tag is distinct from a literal session value.
+        var builder = new StringBuilder(LogicalKeyVersion);
+        AppendLogicalComponent(builder, 'J', jobId);
+        AppendLogicalComponent(builder, 'N', identity.Namespace);
+        if (string.IsNullOrWhiteSpace(identity.SessionId))
+        {
+            builder.Append('M');
+        }
+        else
+        {
+            AppendLogicalComponent(builder, 'S', identity.SessionId);
+        }
+
+        AppendLogicalComponent(builder, 'A', identity.MessageId);
+        AppendLogicalComponent(builder, 'P', identity.PartId);
+        AppendLogicalComponent(builder, 'T', identity.CanonicalEventType);
+        return builder.ToString();
+    }
+
+    private static void AppendLogicalComponent(
+        StringBuilder builder,
+        char kind,
+        string? value)
+    {
+        builder.Append(kind);
+        if (value is null)
+        {
+            builder.Append('-');
+            return;
+        }
+
+        builder.Append(value.Length.ToString(CultureInfo.InvariantCulture));
+        builder.Append(':');
+        builder.Append(value);
+    }
+
+    private (decimal? CostAmount, string? EventTimestamp)? ReadLogicalKey(
+        SqliteTransaction transaction,
+        string jobId,
+        string logicalKey)
+    {
+        using var command = Connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            SELECT cost_text, event_timestamp_utc
+            FROM job_logical_keys
+            WHERE job_id = $job AND logical_key = $key;
+            """;
+        command.Parameters.AddWithValue("$job", jobId);
+        command.Parameters.AddWithValue("$key", logicalKey);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+        {
+            return null;
+        }
+
+        var costText = reader.IsDBNull(0) ? null : reader.GetString(0);
+        return (
+            costText is null ? null : ParseDecimal(costText),
+            reader.IsDBNull(1) ? null : reader.GetString(1));
+    }
+
+    private ProjectionBatchOutcome? FinalizeProjectionBatch(
+        SqliteTransaction transaction,
+        string jobId,
+        long generationId,
+        long committedOffset,
+        ProjectionBatchStats stats,
+        bool partialTrailing,
+        DateTimeOffset now)
+    {
+        if (!_schema.SupportsProjection)
+        {
+            return null;
+        }
+
+        UpdateBootstrapCheckpoint(transaction, generationId, committedOffset, now);
+        ApplyCoverageBatch(
+            transaction,
+            jobId,
+            generationId,
+            committedOffset,
+            stats,
+            partialTrailing,
+            now);
+        RefreshJobCoverage(transaction, jobId, now);
+        return new ProjectionBatchOutcome(
+            ReadAggregate(transaction, jobId),
+            ReadBootstrap(transaction, generationId),
+            ReadCoverage(transaction, jobId));
+    }
+
+    private void UpdateBootstrapCheckpoint(
+        SqliteTransaction transaction,
+        long generationId,
+        long committedOffset,
+        DateTimeOffset now)
+    {
+        ExecuteNonQuery(
+            transaction,
+            """
+            UPDATE bootstrap_sources
+            SET committed_offset = $cursor,
+                status = CASE
+                    WHEN $cursor >= initial_boundary THEN $clean
+                    ELSE $bootstrapping
+                END,
+                completed_utc = CASE
+                    WHEN $cursor >= initial_boundary THEN COALESCE(completed_utc, $now)
+                    ELSE completed_utc
+                END,
+                updated_utc = $now
+            WHERE generation_id = $generation;
+            """,
+            ("$cursor", committedOffset),
+            ("$clean", LedgerCoverageState.Clean.ToString()),
+            ("$bootstrapping", LedgerCoverageState.Bootstrapping.ToString()),
+            ("$now", LedgerStoragePaths.FormatTimestamp(now)),
+            ("$generation", generationId));
+    }
+
+    private void ApplyCoverageBatch(
+        SqliteTransaction transaction,
+        string jobId,
+        long generationId,
+        long committedOffset,
+        ProjectionBatchStats stats,
+        bool partialTrailing,
+        DateTimeOffset now)
+    {
+        _ = jobId;
+        var status = partialTrailing
+            ? LedgerCoverageState.Partial
+            : stats.MissingIdentity > 0
+                ? LedgerCoverageState.MissingIdentity
+                : stats.MissingCost > 0
+                    ? LedgerCoverageState.MissingCost
+                    : stats.Malformed + stats.Invalid + stats.Overlong > 0
+                        ? LedgerCoverageState.Malformed
+                        : LedgerCoverageState.Clean;
+
+        ExecuteNonQuery(
+            transaction,
+            """
+            UPDATE source_coverage
+            SET status = $status,
+                clean_until_offset = CASE
+                    WHEN $partial = 0 THEN $cursor
+                    ELSE clean_until_offset
+                END,
+                partial_trailing = $partial,
+                malformed_count = malformed_count + $malformed,
+                invalid_count = invalid_count + $invalid,
+                overlong_count = overlong_count + $overlong,
+                missing_identity_count = missing_identity_count + $missingIdentity,
+                missing_cost_count = missing_cost_count + $missingCost,
+                duplicate_count = duplicate_count + $duplicates,
+                updated_utc = $now
+            WHERE generation_id = $generation;
+            """,
+            ("$status", status.ToString()),
+            ("$partial", partialTrailing ? 1 : 0),
+            ("$cursor", committedOffset),
+            ("$malformed", stats.Malformed),
+            ("$invalid", stats.Invalid),
+            ("$overlong", stats.Overlong),
+            ("$missingIdentity", stats.MissingIdentity),
+            ("$missingCost", stats.MissingCost),
+            ("$duplicates", stats.Duplicate),
+            ("$now", LedgerStoragePaths.FormatTimestamp(now)),
+            ("$generation", generationId));
+    }
+
+    private void RefreshJobCoverage(
+        SqliteTransaction transaction,
+        string jobId,
+        DateTimeOffset now)
+    {
+        var state = LedgerCoverageState.Clean;
+        var detail = "Historical coverage is clean through the committed boundary.";
+        var jobConflict = ExecuteScalar(
+            transaction,
+            "SELECT conflict_detail FROM jobs WHERE job_id = $job;",
+            ("$job", jobId)) as string;
+        var provisional = Convert.ToInt64(
+            ExecuteScalar(
+                transaction,
+                "SELECT provisional FROM jobs WHERE job_id = $job;",
+                ("$job", jobId)) ?? 0L,
+            CultureInfo.InvariantCulture) != 0;
+        var uncoveredDetail = ExecuteScalar(
+            transaction,
+            "SELECT uncovered_detail FROM jobs WHERE job_id = $job;",
+            ("$job", jobId)) as string;
+
+        var sourceStatuses = new List<string>();
+        using (var command = Connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "SELECT status FROM job_sources WHERE job_id = $job;";
+            command.Parameters.AddWithValue("$job", jobId);
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                sourceStatuses.Add(reader.GetString(0));
+            }
+        }
+
+        using (var command = Connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText =
+                """
+                SELECT
+                    COALESCE(SUM(partial_trailing), 0),
+                    COALESCE(SUM(malformed_count), 0),
+                    COALESCE(SUM(invalid_count), 0),
+                    COALESCE(SUM(overlong_count), 0),
+                    COALESCE(SUM(missing_identity_count), 0),
+                    COALESCE(SUM(missing_cost_count), 0),
+                    COALESCE(SUM(conflict_count), 0),
+                    COALESCE(SUM(CASE WHEN COALESCE(b.completed_utc, '') = '' THEN 1 ELSE 0 END), 0)
+                FROM source_coverage c
+                LEFT JOIN bootstrap_sources b ON b.generation_id = c.generation_id
+                WHERE c.job_id = $job;
+                """;
+            command.Parameters.AddWithValue("$job", jobId);
+            using var reader = command.ExecuteReader();
+            if (reader.Read())
+            {
+                var partial = reader.GetInt64(0);
+                var malformed = reader.GetInt64(1);
+                var invalid = reader.GetInt64(2);
+                var overlong = reader.GetInt64(3);
+                var missingIdentity = reader.GetInt64(4);
+                var missingCost = reader.GetInt64(5);
+                var conflict = reader.GetInt64(6);
+                var bootstrapping = reader.GetInt64(7);
+
+                if (!string.IsNullOrWhiteSpace(jobConflict) ||
+                    sourceStatuses.Any(status =>
+                        string.Equals(status, LedgerCoverageState.Conflict.ToString(), StringComparison.Ordinal)) ||
+                    conflict > 0)
+                {
+                    state = LedgerCoverageState.Conflict;
+                    detail = jobConflict ??
+                        "Identity conflicts or conflicting source associations were observed.";
+                }
+                else if (provisional)
+                {
+                    state = LedgerCoverageState.Provisional;
+                    detail = "Job identity or metadata is provisional; observed coverage is incomplete.";
+                }
+                else if (!string.IsNullOrWhiteSpace(uncoveredDetail))
+                {
+                    state = LedgerCoverageState.Uncovered;
+                    detail = uncoveredDetail;
+                }
+                else if (sourceStatuses.Any(status =>
+                             string.Equals(status, LedgerCoverageState.Unavailable.ToString(), StringComparison.Ordinal)))
+                {
+                    state = LedgerCoverageState.Unavailable;
+                    detail = "One or more associated sources are currently unavailable; committed data is retained.";
+                }
+                else if (sourceStatuses.Any(status =>
+                             string.Equals(status, LedgerCoverageState.Malformed.ToString(), StringComparison.Ordinal)))
+                {
+                    state = LedgerCoverageState.Malformed;
+                    detail = "One or more associated sources contain a record outside the bounded ingestion window.";
+                }
+                else if (sourceStatuses.Any(status =>
+                             string.Equals(status, LedgerCoverageState.Provisional.ToString(), StringComparison.Ordinal)))
+                {
+                    state = LedgerCoverageState.Provisional;
+                    detail = "One or more associated sources have provisional identity or metadata.";
+                }
+                else if (partial > 0)
+                {
+                    state = LedgerCoverageState.Partial;
+                    detail = "A partial trailing record is waiting for completion; it has not been counted.";
+                }
+                else if (missingIdentity > 0)
+                {
+                    state = LedgerCoverageState.MissingIdentity;
+                    detail = "Some records have no message/part identity and were recorded without aggregate effects.";
+                }
+                else if (missingCost > 0)
+                {
+                    state = LedgerCoverageState.MissingCost;
+                    detail = "Some step-finish records did not report a usable cost; the observed total is incomplete.";
+                }
+                else if (malformed + invalid + overlong > 0)
+                {
+                    state = LedgerCoverageState.Malformed;
+                    detail = "Malformed, invalid, or overlong records were recorded without event aggregates.";
+                }
+                else if (bootstrapping > 0)
+                {
+                    state = LedgerCoverageState.Bootstrapping;
+                    detail = "Historical bootstrap is still in progress; reported totals are committed subtotals.";
+                }
+            }
+        }
+
+        ExecuteNonQuery(
+            transaction,
+            """
+            INSERT INTO job_coverage(job_id, status, detail, updated_utc)
+            VALUES ($job, $status, $detail, $now)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                detail = excluded.detail,
+                updated_utc = excluded.updated_utc;
+            """,
+            ("$job", jobId),
+            ("$status", state.ToString()),
+            ("$detail", detail),
+            ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+    }
+
+    private LedgerJobAggregate ReadAggregate(
+        SqliteTransaction? transaction,
+        string jobId)
+    {
+        using var command = Connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            SELECT job_id, cost_total, cost_event_count, missing_cost_event_count,
+                   latest_session_id, last_activity_utc, logical_event_count,
+                   missing_identity_count, timeline_ambiguous, version
+            FROM job_aggregates
+            WHERE job_id = $job;
+            """;
+        command.Parameters.AddWithValue("$job", jobId);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+        {
+            return LedgerJobAggregate.Empty(jobId);
+        }
+
+        return new LedgerJobAggregate(
+            reader.GetString(0),
+            ParseDecimal(reader.GetString(1)),
+            reader.GetInt64(2),
+            reader.GetInt64(3),
+            reader.IsDBNull(4) ? null : reader.GetString(4),
+            reader.IsDBNull(5)
+                ? null
+                : LedgerStoragePaths.ParseTimestamp(reader.GetString(5)),
+            reader.GetInt64(6),
+            reader.GetInt64(7),
+            reader.GetInt64(8) != 0,
+            reader.GetInt64(9));
+    }
+
+    private LedgerBootstrapProgress ReadBootstrap(
+        SqliteTransaction transaction,
+        long generationId)
+    {
+        using var command = Connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            SELECT generation_id, initial_boundary, committed_offset,
+                   completed_utc, status
+            FROM bootstrap_sources
+            WHERE generation_id = $generation;
+            """;
+        command.Parameters.AddWithValue("$generation", generationId);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+        {
+            return new LedgerBootstrapProgress(generationId, 0, 0, null, "Unknown");
+        }
+
+        return new LedgerBootstrapProgress(
+            reader.GetInt64(0),
+            reader.GetInt64(1),
+            reader.GetInt64(2),
+            reader.IsDBNull(3)
+                ? null
+                : LedgerStoragePaths.ParseTimestamp(reader.GetString(3)),
+            reader.GetString(4));
+    }
+
+    private LedgerCoverage ReadCoverage(
+        SqliteTransaction? transaction,
+        string jobId)
+    {
+        var state = LedgerCoverageState.Clean;
+        var detail = "Historical coverage is clean through the committed boundary.";
+        using (var command = Connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText =
+                "SELECT status, detail FROM job_coverage WHERE job_id = $job;";
+            command.Parameters.AddWithValue("$job", jobId);
+            using var reader = command.ExecuteReader();
+            if (reader.Read())
+            {
+                if (Enum.TryParse<LedgerCoverageState>(reader.GetString(0), out var parsed))
+                {
+                    state = parsed;
+                }
+
+                detail = reader.IsDBNull(1) ? detail : reader.GetString(1);
+            }
+        }
+
+        long malformed = 0;
+        long invalid = 0;
+        long overlong = 0;
+        long missingIdentity = 0;
+        long missingCost = 0;
+        long partial = 0;
+        long conflicts = 0;
+        using (var command = Connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText =
+                """
+                SELECT
+                    COALESCE(SUM(malformed_count), 0),
+                    COALESCE(SUM(invalid_count), 0),
+                    COALESCE(SUM(overlong_count), 0),
+                    COALESCE(SUM(missing_identity_count), 0),
+                    COALESCE(SUM(missing_cost_count), 0),
+                    COALESCE(SUM(partial_trailing), 0),
+                    COALESCE(SUM(conflict_count), 0)
+                FROM source_coverage
+                WHERE job_id = $job;
+                """;
+            command.Parameters.AddWithValue("$job", jobId);
+            using var reader = command.ExecuteReader();
+            if (reader.Read())
+            {
+                malformed = reader.GetInt64(0);
+                invalid = reader.GetInt64(1);
+                overlong = reader.GetInt64(2);
+                missingIdentity = reader.GetInt64(3);
+                missingCost = reader.GetInt64(4);
+                partial = reader.GetInt64(5);
+                conflicts = reader.GetInt64(6);
+            }
+        }
+
+        long unavailable = 0;
+        using (var command = Connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText =
+                """
+                SELECT COUNT(*)
+                FROM job_sources
+                WHERE job_id = $job AND status = $status;
+                """;
+            command.Parameters.AddWithValue("$job", jobId);
+            command.Parameters.AddWithValue("$status", LedgerCoverageState.Unavailable.ToString());
+            unavailable = Convert.ToInt64(
+                command.ExecuteScalar() ?? 0L,
+                CultureInfo.InvariantCulture);
+        }
+
+        return new LedgerCoverage(
+            jobId,
+            state,
+            detail,
+            malformed,
+            invalid,
+            overlong,
+            missingIdentity,
+            missingCost,
+            partial,
+            unavailable,
+            conflicts);
+    }
+
+    private static decimal ParseDecimal(string value) =>
+        decimal.Parse(value, NumberStyles.Number, CultureInfo.InvariantCulture);
+
+    private sealed class ProjectionBatchStats
+    {
+        public int Malformed { get; set; }
+        public int Invalid { get; set; }
+        public int Overlong { get; set; }
+        public int MissingIdentity { get; set; }
+        public int MissingCost { get; set; }
+        public int Duplicate { get; set; }
+        public int PartialTrailing { get; set; }
+
+        public void AddDisposition(LedgerRecordDisposition disposition)
+        {
+            switch (disposition)
+            {
+                case LedgerRecordDisposition.MalformedJson:
+                    Malformed++;
+                    break;
+                case LedgerRecordDisposition.InvalidUtf8:
+                    Invalid++;
+                    break;
+                case LedgerRecordDisposition.Overlong:
+                    Overlong++;
+                    break;
+            }
+        }
+    }
+
+    private sealed record ProjectionBatchOutcome(
+        LedgerJobAggregate Aggregate,
+        LedgerBootstrapProgress Bootstrap,
+        LedgerCoverage Coverage);
 
     private List<LedgerGeneration> ReadMatchingGenerations(
         SqliteTransaction transaction,
@@ -1209,7 +3135,8 @@ public sealed class EventLedger : IDisposable
         string jobId,
         string sourcePath,
         LedgerSourceIdentity identity,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        long initialBoundary)
     {
         var predecessor = ExecuteScalar(
             transaction,
@@ -1260,6 +3187,71 @@ public sealed class EventLedger : IDisposable
                 "The source cursor insert did not take effect; the batch was rolled back.");
         }
 
+        if (_schema.SupportsProjection)
+        {
+            // The boundary is captured once, before the first batch. It is a
+            // resumable bootstrap target, not a limit on later live appends.
+            var bootstrapInserted = ExecuteNonQuery(
+                transaction,
+                """
+                INSERT INTO bootstrap_sources(
+                    generation_id, job_id, initial_boundary, committed_offset,
+                    completed_utc, status, updated_utc)
+                VALUES ($generation, $job, $boundary, 0, NULL, $status, $now);
+                """,
+                ("$generation", generationId),
+                ("$job", jobId),
+                ("$boundary", initialBoundary),
+                ("$status", initialBoundary == 0 ? "Clean" : "Bootstrapping"),
+                ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+            if (bootstrapInserted != 1)
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.ConstraintViolation,
+                    "The bootstrap checkpoint insert did not take effect; the batch was rolled back.");
+            }
+
+            if (initialBoundary == 0)
+            {
+                ExecuteNonQuery(
+                    transaction,
+                    """
+                    UPDATE bootstrap_sources
+                    SET completed_utc = $now
+                    WHERE generation_id = $generation;
+                    """,
+                    ("$now", LedgerStoragePaths.FormatTimestamp(now)),
+                    ("$generation", generationId));
+            }
+
+            var coverageInserted = ExecuteNonQuery(
+                transaction,
+                """
+                INSERT INTO source_coverage(
+                    generation_id, job_id, status, clean_until_offset,
+                    partial_trailing, malformed_count, invalid_count, overlong_count,
+                    missing_identity_count, missing_cost_count, duplicate_count,
+                    conflict_count, updated_utc)
+                VALUES (
+                    $generation, $job, $status, 0,
+                    0, 0, 0, 0,
+                    0, 0, 0,
+                    0, $now);
+                """,
+                ("$generation", generationId),
+                ("$job", jobId),
+                ("$status", initialBoundary == 0
+                    ? LedgerCoverageState.Clean.ToString()
+                    : LedgerCoverageState.Bootstrapping.ToString()),
+                ("$now", LedgerStoragePaths.FormatTimestamp(now)));
+            if (coverageInserted != 1)
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.ConstraintViolation,
+                    "The source coverage insert did not take effect; the batch was rolled back.");
+            }
+        }
+
         return generationId;
     }
 
@@ -1300,8 +3292,11 @@ public sealed class EventLedger : IDisposable
         long? rangeStart,
         long? rangeEnd,
         int expectedRecords,
-        int expectedEvents)
+        int expectedEvents,
+        long? expectedProjectionVersion = null,
+        int? expectedLogicalEvents = null)
     {
+        _options.BeforeCommitFaultInjector?.Invoke();
         ValidateCommittedState(
             Connection,
             transaction,
@@ -1312,7 +3307,9 @@ public sealed class EventLedger : IDisposable
             rangeStart,
             rangeEnd,
             expectedRecords,
-            expectedEvents);
+            expectedEvents,
+            expectedProjectionVersion,
+            expectedLogicalEvents);
         transaction.Commit();
     }
 
@@ -1326,7 +3323,9 @@ public sealed class EventLedger : IDisposable
         long? rangeStart,
         long? rangeEnd,
         int expectedRecords,
-        int expectedEvents)
+        int expectedEvents,
+        long? expectedProjectionVersion = null,
+        int? expectedLogicalEvents = null)
     {
         // Affected-row counts are insufficient: an AFTER INSERT trigger can
         // delete a row while the insert still reports one affected row. Before
@@ -1434,6 +3433,62 @@ public sealed class EventLedger : IDisposable
                     LedgerStorageFailure.ConstraintViolation,
                     "The committed source-event postcondition failed; the batch was rolled back.");
             }
+
+            if (expectedLogicalEvents is { } expectedLogical)
+            {
+                var logicalCount = Convert.ToInt64(
+                    ExecuteScalar(
+                        connection,
+                        transaction,
+                        """
+                        SELECT COUNT(*)
+                        FROM logical_events l
+                        JOIN source_events e ON e.event_id = l.source_event_id
+                        JOIN source_records r ON r.record_id = e.record_id
+                        WHERE r.generation_id = $generation
+                          AND r.start_byte >= $start
+                          AND r.start_byte < $end;
+                        """,
+                        ("$generation", generationId),
+                        ("$start", start),
+                        ("$end", end)),
+                    CultureInfo.InvariantCulture);
+                if (logicalCount != expectedLogical)
+                {
+                    throw new LedgerException(
+                        LedgerStorageFailure.ConstraintViolation,
+                        "The logical projection postcondition failed; the batch was rolled back.");
+                }
+            }
+        }
+
+        if (expectedProjectionVersion is { } expectedVersion)
+        {
+            var aggregateVersion = ExecuteScalar(
+                connection,
+                transaction,
+                "SELECT version FROM job_aggregates WHERE job_id = $job;",
+                ("$job", jobId));
+            if (aggregateVersion is null or DBNull ||
+                Convert.ToInt64(aggregateVersion, CultureInfo.InvariantCulture) != expectedVersion)
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.ConstraintViolation,
+                    "The aggregate postcondition failed; the batch was rolled back.");
+            }
+
+            var checkpointOffset = ExecuteScalar(
+                connection,
+                transaction,
+                "SELECT committed_offset FROM bootstrap_sources WHERE generation_id = $generation;",
+                ("$generation", generationId));
+            if (checkpointOffset is null or DBNull ||
+                Convert.ToInt64(checkpointOffset, CultureInfo.InvariantCulture) != expectedCursor)
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.ConstraintViolation,
+                    "The bootstrap checkpoint postcondition failed; the batch was rolled back.");
+            }
         }
     }
 
@@ -1531,7 +3586,7 @@ public sealed class EventLedger : IDisposable
             reader.GetString(4));
     }
 
-    private void InsertEvent(
+    private long InsertEvent(
         SqliteTransaction transaction,
         long recordId,
         MonitoringEvent item)
@@ -1563,6 +3618,10 @@ public sealed class EventLedger : IDisposable
                 LedgerStorageFailure.ConstraintViolation,
                 "The source event insert did not take effect; the batch was rolled back.");
         }
+
+        return Convert.ToInt64(
+            ExecuteScalar(transaction, "SELECT last_insert_rowid();"),
+            CultureInfo.InvariantCulture);
     }
 
     private bool CurrentPathMatchesIdentity(

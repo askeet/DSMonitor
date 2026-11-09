@@ -449,8 +449,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         if (snapshot.ObservedCost is { } cost)
         {
-            CostText = "$" + cost.ToString("0.0000", CultureInfo.InvariantCulture);
-            CostDetailText = "Observed forge step cost";
+            CostText = "$" + cost.ToString("0.0000", CultureInfo.InvariantCulture) +
+                (snapshot.HasIncompleteCoverage ? " (incomplete)" : string.Empty);
+            CostDetailText = snapshot.HasIncompleteCoverage
+                ? "Observed subtotal; historical coverage is incomplete"
+                : "Observed forge step cost";
         }
         else
         {
