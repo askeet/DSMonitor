@@ -4,6 +4,7 @@
 **Date:** 2026-11-09
 **Source of truth:** `docs/Project Requirements.md` (stable requirement IDs) and this roadmap.  
 **Current phase:** Phase 1 IN PROGRESS / NOT ACCEPTED. The bounded dual-window retention correction and the cost-bearing replay acceptance gate are implemented with independent full-history oracle and deterministic cost-replay coverage; independent Sol QA has not accepted Phase 1. Exact replay idempotency across unbounded history remains impossible under the bounded identity model and is not claimed. B1 durable SQLite event-ledger foundation is **ACCEPTED** as an isolated persistence seam with the limitations and evidence recorded in section 1.10. The live pipeline is not cut over. Real file-symlink integration validation passed in the user's normal Windows session. Prior visual checks are retained; no interactive checks occurred during this remediation.
+**Milestones:** B1 **ACCEPTED**; B2, B3 and B4 **NOT STARTED**, in that order. B4 is an internal Phase 1 gate, distinct from application Phase 4.
 **Future phases:** Phase 2–4 are **NOT STARTED**.
 
 > Status vocabulary: `NOT STARTED / IN PROGRESS / COMPLETED / BLOCKED`.
@@ -41,6 +42,9 @@
 - [x] Add meaningful automated tests for parsing, tailing, lifecycle, status, logs, cancellation, paths, and UI projection. `[TEST-001..017, TEST-019..020]`
 - [x] Run focused tests, full relevant test suite, and solution build. `[ACC-P1-012]`
 - [x] Implement and accept the B1 durable SQLite event-ledger foundation as an isolated byte-oriented persistence seam, within the limits and evidence in section 1.10. Live pipeline cutover is explicitly excluded. `[LEDGER-001..020]`
+- [ ] B2 durable aggregates and live pipeline integration (section 1.11).
+- [ ] B3 durable logging outbox (section 1.12), after B2 acceptance.
+- [ ] B4 final Phase 1 acceptance (section 1.13), after B2 and B3 acceptance.
 - [ ] Independent Sol QA acceptance of Phase 1 behavior: review performed, CHANGES REQUIRED (see findings below). `[ACC-P1-013]`
 - [x] Independent visual check: running dashboard STOPPED → Start → eight real UNKNOWN jobs / IDLE → Stop → STOPPED → clean exit. `[ACC-P1-014]`
 - [ ] Record Phase 1 acceptance sign-off. `[ACC-P1-015]`
@@ -76,6 +80,7 @@
 - [x] All 65 original tests and all prior applicable tests pass; the prior full suite was 101 passed / 1 skipped / 102 total. Its only skip was the environment-conditional real file-symlink fixture, which subsequently passed in a separate targeted run.
 - [ ] Independent Sol QA accepted. **CHANGES REQUIRED**
 - [x] B1 ledger foundation accepted within the limits and evidence in section 1.10; no live-pipeline cutover.
+- [ ] B2 and B3 accepted and B4 completed; checked items above record historical evidence, not acceptance of the integrated pipeline.
 - [x] Independent visual check of running dashboard passed; broader DPI/accessibility validation remains Phase 4.
 
 ### 1.4 Validation evidence
@@ -353,6 +358,55 @@ Phase 1 remains **IN PROGRESS / NOT ACCEPTED**; Phases 2–4 remain **NOT STARTE
 
 ---
 
+### 1.11 B2 — Durable Aggregates and Live Pipeline Integration
+
+**Status: NOT STARTED. Goal:** Integrate the accepted ledger with live monitoring and persist cost, session and activity state under explicit source-identity and replay guarantees. **Dependencies:** accepted B1 and the pre-implementation architecture approval below. No approach is approved by this roadmap.
+
+**Scope and boundaries.** `EventLedger` owns verified physical generations, complete records, safe event metadata and transactional cursors (`LEDGER-001..020`); it is isolated from live monitoring. `ForgeLogTailReader` owns cost, latest session, activity and unique-event projections; `ForgeMonitoringService` recreates readers on path changes and owns bounded acceptance and timeline state. The logger writes per-run outputs separately. Establish durable job aggregate ownership and persist observed cost and its presence, latest session, activity and any accepted count or other state required for compatible projections. The gate must define job-to-generation and record relationships, initialization for existing installations, and whether safe ledger metadata suffices or additional permitted state is needed. Do not persist raw source content or secrets. Preserve job separation and existing WPF projections.
+
+For supported physical records, aggregate updates, accepted record/event disposition and cursor advancement must commit atomically or all roll back. Restore committed state after restart. Reader recreation must preserve valid job aggregates; validate continuity before associating a source with a job and handle a verified replacement as a separate generation under the approved policy. Surface storage, stale cursor, identity and continuity failures without publishing uncommitted updates; retain last valid state and recover only when safe. Preserve B1's fail-closed and bounded-read contracts.
+
+**Identity and unresolved requirements.** A physical record is identified by verified generation and start offset, with existing consistency checks. A previously accepted physical record must not aggregate twice after memory eviction. Identical bytes at different offsets or generations are distinct physical records. A copied or newly appended logical replay has a different physical identity and may be indistinguishable from a legitimate identical occurrence; hashes are not identity. `DATA-015` and `ERR-006..008` require duplicate-free behavior across repeated reads, truncation and replacement using a stable event key, while B1 cannot establish arbitrary logical identity or detect every rewrite. The requirements document also retains historical B1 pending-review labels (`LEDGER-018` and section 13.1); the later acceptance in section 1.10 supersedes those status notes, without changing the requirements. The gate must resolve the identity tension with evidence and an authorized decision; broader requirements remain unresolved, not weakened or claimed satisfied. Truncation below the cursor and weak or ambiguous identity fail closed under B1; undetected rewrite/regrowth and active path-replacement races remain limitations.
+
+**Pre-implementation architecture gate — REQUIRED, not approved.** Before implementation use Terra Medium → Sol High architecture gate → DeepSeek Flash implementation → independent Sol QA → Terra acceptance. Direct Sol High → DeepSeek delegation is permitted only if the active runtime and authorization support it. The reviewer must establish aggregate ownership, atomic boundaries, supported event identity, replay and continuity guarantees, migration and compatibility with version-1 data and strict schema validation, recovery and failure invariants, adversarial tests, and the B2/B3 boundary. Resolve requirement conflicts and storage/security implications before implementation; return to the gate if assumptions fail. This roadmap does not launch the workflow.
+
+**Acceptance criteria:**
+
+- [ ] Restart restores correct committed cost, session and activity, including absent-cost semantics, without merging jobs. Reader recreation and a verified path change preserve valid aggregates.
+- [ ] Already accepted physical records do not change aggregates or accepted counts on replay, including after bounded-memory eviction. Cover the independently observed cost `0.75` → `1.50` and reverted-session defect within the supported physical identity contract; explicitly identify logical replay at a new physical location when equivalence cannot be proven.
+- [ ] Fault injection, stale cursor and storage failures demonstrate rollback of record/event, aggregate and cursor updates, no uncommitted UI projection and correct restart recovery.
+- [ ] Exercise same-identity rename, verified replacement, truncation, weak identity and ambiguous continuity; follow B1 fail-closed rules, retain valid prior aggregates and report unresolved cases. Legitimate identical-content records at different physical locations remain distinct.
+- [ ] Preserve Start/Stop, timeline ordering and partition behavior, 500-event UI retention, read-only monitored files, path/security checks and dashboard behavior; run applicable focused and regression checks.
+
+**Exclusions and B3 seam.** B2 does not deliver durable `.log`/`.jsonl` output or claim to fix every duplicate-log symptom in the historical replay reproduction. Define only the safe accepted-event and ordering seam needed by B3; B3 owns durable external-log delivery. No history browsing, search, export or Phase 3 replay UI.
+
+### 1.12 B3 — Durable Logging Outbox
+
+**Status: NOT STARTED. Goal:** Recoverably deliver accepted monitoring events to existing text and JSONL logs through a durable outbox or another architecture approved at the later architecture gate. **Dependencies:** accepted B2 and preservation of B1 guarantees. **Scope:** delivery intent, recovery and reconciliation for existing per-run logs; exclude history browsing, search, export and Phase 3 replay UI.
+
+SQLite transactions cannot atomically commit arbitrary writes to separate external files. The later architecture gate must decide durable intent, event/run identity and ordering, delivery checkpoints, recovery and partial-output reconciliation, including duplicate prevention or detection and correspondence between formats. Exactly-once file delivery is not promised without an implementable, verified mechanism. Establish how persistence and recovery file operations comply with `SEC-011`, create-new and preservation requirements; no additional file location or modification permission is assumed.
+
+**Acceptance criteria:**
+
+- [ ] Durable intent exists for each accepted event within the approved transaction boundary; crashes or restarts before, during and after each output write are recoverable without silent loss.
+- [ ] Partial writes, one-format-only writes and interrupted reconciliation are detected and safely reconciled; duplicate prevention or detection is demonstrated within explicit guarantees. Both outputs represent the same accepted events in stable order, with discrepancies visible until recovered.
+- [ ] Preserve existing logs and per-Start unique create-new behavior; do not modify unauthorized files. Keep safe summaries and existing privacy and path-security rules.
+- [ ] Write and storage failures surface as nonfatal warnings while monitoring continues; pending intent remains recoverable. Recovery work per operation and memory are bounded, with backlog handled without silent loss. Test restart, repeated recovery, ordering, failures and both formats.
+
+### 1.13 B4 — Final Phase 1 Acceptance
+
+**Status: NOT STARTED. Goal:** Validate and sign off integrated Phase 1 after B2 and B3 acceptance. This internal Phase 1 milestone is not application Phase 4 Production Hardening. **Dependencies:** B1, B2 and B3 accepted; outstanding requirement conflicts resolved or explicitly brought to the authorized decision-maker without silently weakening them.
+
+**Acceptance criteria:**
+
+- [ ] Verify existing and newly discovered Forge jobs, dashboard behavior, monitoring lifecycle and repeated Start/Stop, read-only monitored files, and correct cost/session projections across reader recreation, restart and supported replay.
+- [ ] Verify timeline partition invariance and ordering, the 500-event UI bound, complete accepted-event logging in both formats, large batches and bounded memory, source continuity and explicit failure states, and file-path security.
+- [ ] Run the full regression suite and solution build on the integrated result; obtain independent native QA, review remaining risks and identity/security limits, and record explicit Phase 1 sign-off only when acceptance is supported.
+
+Reuse historical B1 and unchanged-check evidence where applicable; repeat checks when integration changes assumptions or contradictory evidence warrants it. Distinguish worker-reported from independently verified results. The known Codex VSTest/testhost localhost `10013` failure is infrastructure-blocked, neither an application failure nor a pass; existing user-executed non-admin PowerShell results remain valid external evidence. Record missing required independent evidence rather than claiming acceptance.
+
+---
+
 ## Phase 2 - OpenCode Live Monitoring
 
 **Status: NOT STARTED**
@@ -475,7 +529,7 @@ Phase 1 remains **IN PROGRESS / NOT ACCEPTED**; Phases 2–4 remain **NOT STARTE
 
 | Phase | Requirements | Depends on | Status |
 |---|---|---|---|
-| 1 | `PRJ-001..005`, `ARC-001..008`, `FR-001..046`, `UI-001..020`, `DATA-001..020`, `LIFE-001..015`, `LOG-001..011`, `SEC-001..015`, `ERR-001..011/014..021`, `PERF-001..010`, `TEST-001..017/019..021`, `LEDGER-001..020`, `ACC-P1-001..015` | Existing solution, forge runs | IN PROGRESS (BOUNDED REMEDIATION + B1 CORRECTION; INDEPENDENT QA PENDING) |
+| 1 | `PRJ-001..005`, `ARC-001..008`, `FR-001..046`, `UI-001..020`, `DATA-001..020`, `LIFE-001..015`, `LOG-001..011`, `SEC-001..015`, `ERR-001..011/014..021`, `PERF-001..010`, `TEST-001..017/019..021`, `LEDGER-001..020`, `ACC-P1-001..015` | Existing solution, forge runs | IN PROGRESS / NOT ACCEPTED (B1 ACCEPTED; B2, B3, B4 NOT STARTED) |
 | 2 | `ARC-009`, `OC-001..010`, `FR-020`, `UI-013..014`, `ERR-012..015`, `TEST-018` | Phase 1 accepted, OpenCode service | NOT STARTED |
 | 3 | `LOG-012`, `FR-006`, `UI-012`, `TEST-018`, export/privacy requirements | Phase 2 accepted, stored logs | NOT STARTED |
 | 4 | `PRJ-005`, `PRJ-008`, `FR-045`, `UI-019`, `LOG-013`, `PERF-001..010`, `SEC-009..015`, `TEST-020` | Phase 3 accepted | NOT STARTED |
