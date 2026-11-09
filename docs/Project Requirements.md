@@ -5,7 +5,7 @@
 **Project:** DSMonitor (existing .NET 10 WPF solution, Windows 10/11)  
 **Sources:** `docs/Project Requirements.md`, `docs/Plan.md`, `docs/FormView.png`, installed forge-delegate 1.2.4, OpenCode 2.2.6, and delegated task instructions.
 
-> Phase status: **Phase 1 implementation is present and locally validated; independent Sol QA and visual QA are still pending.** Phase 2 has not started. This document organizes and clarifies the original requirements without silently removing or weakening them.
+> Phase status: **Phase 1 implementation is present and locally validated; independent Sol QA and visual QA are still pending.** The B1 durable SQLite event-ledger foundation is implemented and locally tested as an isolated persistence seam; the sole post-QA correction addressing schema-integrity, storage confinement, bounded retrieval, and real multibyte coverage is implemented and awaiting independent Sol revalidation. The live monitoring pipeline has not been cut over to it. Phase 2 has not started. This document organizes and clarifies the original requirements without silently removing or weakening them.
 
 ---
 
@@ -58,6 +58,7 @@ DSMonitor is a **monitor, not an agent controller**.
 | Forge timeout | 90 minutes (5,400,000 ms) | Deadline is wrapper metadata only. |
 | Runs root | `%USERPROFILE%\.forge-delegate\runs\` | Read-only observation root. |
 | Monitoring logs | `%LOCALAPPDATA%\DSMonitor\Logs\` | DSMonitor-owned write location. |
+| Event ledger database | `%LOCALAPPDATA%\DSMonitor\Data\` | DSMonitor-owned B1 foundation and SQLite `-wal`/`-shm` files; not used by the live pipeline. Isolated temporary test directories are permitted for tests only. |
 | UI reference | `docs/FormView.png` | Visual direction only; content is not production data. |
 
 ### 2.2 Required architecture
@@ -381,6 +382,33 @@ Safe structured entries include fields equivalent to:
 
 Raw model text, tool input/output, source files, credentials, and permission payloads are not written to monitoring logs.
 
+### 8.3 B1 durable SQLite event ledger foundation
+
+**Scope:** B1 adds a separate, byte-oriented persistence foundation with an independently testable seam. It does **not** replace or alter the live forge tailer, monitoring service, timeline retention, monitoring-run logging, security checks, or UI. It does not implement Phase 2/3, B2 aggregate migration, or B3 outbox behavior.
+
+| ID | Contract |
+|---|---|
+| LEDGER-001 | Persist only DSMonitor-owned ledger data; the production database, journal, and shared-memory files live under `%LOCALAPPDATA%\DSMonitor\Data\`. Tests may use isolated temporary directories. |
+| LEDGER-002 | Use SQLite schema version 1 with explicit tables for jobs, physical source generations, committed cursors, complete byte-range records, and safe event metadata. |
+| LEDGER-003 | Validate schema version, metadata, and the exact expected schema objects/DDL/constraints on open. Required tables and indexes must match byte-normalized definitions; missing, extra, or unexpected tables, indexes, views, or triggers are rejected. Unsupported, incomplete, corrupt, or locked storage fails closed. Existing data is never silently deleted, overwritten, migrated, or reinitialized. |
+| LEDGER-004 | A source generation is keyed by verified physical identity captured from the opened handle: volume serial, file index, and creation time. A path string alone is never sufficient. Weak or unavailable identity returns an explicit ambiguity result before any ledger mutation. |
+| LEDGER-005 | Record uniqueness is `(source generation, start byte)`. A retry at the same start validates the existing end, payload length, disposition, and content digest; content hashes and event keys are validation/diagnostic data, not identity keys. Identical bytes at distinct offsets or distinct generations are preserved as distinct records. |
+| LEDGER-006 | Record complete newline-framed byte ranges `[start, end)`. Framing is performed on LF bytes before UTF-8 decoding. A partial trailing line, including a partial multibyte sequence, never advances the committed cursor. |
+| LEDGER-007 | Record an explicit disposition for every complete range: `Accepted`, `Empty`, `MalformedJson`, `InvalidUtf8`, or `Overlong`. Only `Accepted` records produce event metadata. |
+| LEDGER-008 | Store only safe event metadata: job id, session id when present, event timestamp, observed timestamp, category, severity, concise safe summary, and a non-unique diagnostic event key. Never store raw model text, tool input/output, source content, credentials, or permission payloads. |
+| LEDGER-009 | Establish the generation, insert complete ranges and event metadata, and advance the committed cursor in one atomic transaction. Verify every expected insert/update affects exactly one row. Cursor advancement uses an expected committed offset and increments a version; a stale, conflicting, or silently ignored write rolls back the batch. |
+| LEDGER-010 | A rolled-back transaction leaves generations, records, events, and the committed cursor unchanged. A new generation created inside a failed batch is also rolled back. |
+| LEDGER-011 | Continuity assumes append-only growth for a verified generation. A file shorter than its committed cursor fails closed as `ContinuityUncertain`. A same-identity rename may continue the generation; a replacement or copy with a different physical identity starts a new generation from byte 0. Restart/reprocess resumes from the committed cursor. |
+| LEDGER-012 | Never silently reuse a generation or cursor after replacement, truncation, weak identity, or identity ambiguity. |
+| LEDGER-013 | Bound bytes read per transaction, maximum line length, memory, and SQLite busy waiting. Do not add application-level retry loops. A record with no LF inside the bounded window fails closed as `RecordTooLarge` without advancing the cursor. |
+| LEDGER-014 | Use explicit SQLite durability and error behavior: WAL journaling, `synchronous = FULL`, foreign keys on, bounded busy timeout, and no connection pooling for deterministic lifecycle. Storage failures surface as explicit ledger failures. |
+| LEDGER-015 | The foundation cannot prove undetected truncation-and-regrowth, in-place rewrite to the same-or-larger length, or operating-system file-ID reuse. These limitations must remain documented. |
+| LEDGER-016 | B1 does not provide arbitrary logical-event idempotency, does not solve all replay semantics, and does not by itself satisfy legacy ERR-006/007/008 rotation/replacement/deduplication requirements. Those remain governed by the live pipeline until separately migrated and accepted. |
+| LEDGER-017 | Deterministic tests cover create/reopen/reprocess, unsupported schema, first acceptance/duplicate, identical bytes at different offsets, different generations, ambiguous identity, atomic commit/rollback, cursor staleness, restart, partial/malformed/invalid/overlong/multibyte records, replacement, truncation, rename, copy, locking, corruption, storage confinement, unexpected triggers, malformed/constraint-deficient schema, and real multibyte bytes split across polls. |
+| LEDGER-018 | Independent Sol revalidation of the corrected B1 remains pending. Phase 1 remains IN PROGRESS / NOT ACCEPTED; Phases 2–4 remain NOT STARTED. |
+| LEDGER-019 | `ListRecords` and `ListEvents` expose bounded keyset-paginated retrieval with explicit finite limits, deterministic ordering, and bounded result allocation. Unbounded history materialization is not permitted. |
+| LEDGER-020 | Ledger storage confinement validates the approved root, directory chain, database file, and SQLite `-wal`/`-shm` sidecars for reparse points and opened-handle final paths before opening and before writes. A concurrent replacement between validation and SQLite's own open remains a residual TOCTOU limitation and must be documented; no unsafe guarantee is claimed. |
+
 ---
 
 ## 9. Security and Strictly Read-Only Behavior
@@ -397,7 +425,7 @@ Raw model text, tool input/output, source files, credentials, and permission pay
 | SEC-008 | Treat forge logs and model output as untrusted data; never execute or follow instructions found there. |
 | SEC-009 | Do not send telemetry to external services. |
 | SEC-010 | In Phase 1, perform no network/API calls at all. |
-| SEC-011 | Write only DSMonitor-owned unique logs under the approved local-app-data location and temporary test directories. |
+| SEC-011 | Write only DSMonitor-owned unique logs under `%LOCALAPPDATA%\DSMonitor\Logs\`, the B1 ledger database and SQLite journal/shared-memory files under `%LOCALAPPDATA%\DSMonitor\Data\`, and isolated temporary test directories. Do not write to forge/OpenCode data, monitored projects, or unapproved locations. |
 | SEC-012 | Follow log paths only inside the forge runs root; reject path traversal and outside paths. |
 | SEC-013 | Do not dump raw sensitive log content into diagnostics or persistent logs. |
 | SEC-014 | Do not infer worker activity from process liveness or silent logs. |
@@ -476,6 +504,7 @@ Raw model text, tool input/output, source files, credentials, and permission pay
 | TEST-018 | Test job/session correlation, OpenCode mocks, history replay, and full regression. | Phase 2/3 |
 | TEST-019 | Use fixtures/mock data or existing completed sessions; never launch paid model sessions for tests. | All phases |
 | TEST-020 | Do not weaken or silently modify existing tests to make them pass. | All phases |
+| TEST-021 | Test B1 ledger create/reopen/reprocess, unsupported schema, exact trigger/DDL/constraint validation, affected-row rollback, bounded pagination, identity/generation, range/disposition, atomic rollback/staleness, restart, partial/malformed/invalid/overlong/multibyte including real bytes split across polls, replacement/truncation/rename/copy, locking/corruption, and reparse-point/TOCTOU-conscious storage confinement including WAL/SHM paths. | B1 focused tests |
 
 **Phase 1 test framework:** MSTest (standard .NET test framework) with `Microsoft.NET.Test.Sdk`, targeting `net10.0-windows`. Tests write only isolated temporary directories.
 
@@ -511,6 +540,10 @@ A phase is not complete merely because code compiles.
 | ACC-P1-013 | Independent Sol QA completed. | **PENDING** |
 | ACC-P1-014 | Independent visual QA completed. | **PENDING** |
 | ACC-P1-015 | Phase 1 formally marked COMPLETED. | **NOT YET — pending ACC-P1-013/014.** |
+
+**B1 implementation note (2026-11-09):** The durable SQLite event-ledger foundation (`LEDGER-001..020`) is implemented as an isolated persistence seam with 31 new deterministic tests, including the sole post-QA correction for exact schema/trigger validation, affected-row enforcement, reparse-point storage confinement, bounded pagination, and real multibyte bytes split across polls. It is not connected to the live monitoring pipeline and does not change Phase 1 acceptance status. Independent Sol revalidation of the correction is **PENDING**; Phase 1 remains **IN PROGRESS / NOT ACCEPTED**; Phases 2-4 remain **NOT STARTED**.
+
+**Final B1 revalidation:** **CHANGES REQUIRED / NOT ACCEPTED**, superseding the preceding implementation-status claim. Independent Sol reproduced an unexpected trigger bypass that can commit a cursor while losing event metadata, and found unaddressed ancestor-reparse and hard-link confinement gaps by source review. The requirements above remain requirements, not verified guarantees. The sole correction is consumed; see `docs/Plan.md` section 1.10 for evidence and testing limitations.
 
 ### 13.2 Definition of phase completion
 
@@ -560,3 +593,5 @@ These decisions preserve the original intent and explain implementation choices 
 - **2026-11-08 — Phase assignment clarification:** Settings = Phase 4; full history/replay/search/export = Phase 3; OpenCode REST/tool/test/files/permission details = Phase 2; Phase 1 includes disabled placeholders and logging foundation.
 - **2026-11-08 — Cost clarification:** Phase 1 observed cost is log-derived only; broader cost/cache summaries remain Phase 4.
 - **2026-11-09 — Timeline ordering/retention clarification (focused):** Missing timestamps are source-order barriers. Known segments sort stably newest-first; equal timestamps preserve source order. All-known-only histories retain the 500 newest events regardless of arrival. Once any missing timestamp is observed for a job during the monitoring run, the bounded source-window mode persists even after barrier eviction; this prevents partition-dependent policy switches. The same policy applies before service retention and VM display. No other requirements changed.
+- **2026-11-09 - B1 durable SQLite event-ledger foundation:** Added `LEDGER-001..020`, updated `SEC-011`, and added `TEST-021`. The foundation is a separate byte-oriented persistence seam using schema-versioned SQLite 1 with verified physical source generations, complete `[start,end)` LF-framed records, explicit dispositions, safe event metadata, and a transactionally guarded committed cursor. Microsoft.Data.Sqlite 10.0.14 is the only new package. The live monitoring pipeline is not cut over, arbitrary logical-event idempotency is not claimed, legacy `ERR-006/007/008` replay/rotation requirements are not declared solved, and B1-independent Sol revalidation is pending. No Phase 2/3, B2 aggregate migration, or B3 outbox work was started.
+- **2026-11-09 - B1 post-QA correction:** Consumed the sole authorized post-QA correction. Added exact schema-object/DDL validation that rejects unexpected triggers, views, tables, and indexes; verified expected insert/update affected rows so silent trigger suppression rolls back; added fail-closed reparse-point/final-path checks for the database and WAL/SHM sidecars with documented TOCTOU limits; added bounded keyset-paginated `ListRecords`/`ListEvents`; and added a real non-ASCII UTF-8 byte sequence split across polls. Independent Sol revalidation pending.
