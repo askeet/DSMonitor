@@ -69,6 +69,92 @@ public sealed class ForgeLogTailReaderTests
     }
 
     [TestMethod]
+    public void Poll_ReplayAfterBoundedDedupeWindow_IsReemittedByReader()
+    {
+        var jobId = "job_replay_reader_0001";
+        var highTimestamp = 1_800_100_000_000;
+        var highLine = TestWorkspace.StepStart(
+            highTimestamp,
+            part: "high-retained",
+            message: "high-retained");
+        var builder = new StringBuilder();
+        builder.Append(highLine).Append('\n');
+        for (var index = 1; index <= 10_000; index++)
+        {
+            builder.Append(TestWorkspace.StepStart(
+                1_800_000_000_000 + index,
+                part: "reader-replay-" + index.ToString("0000"),
+                message: "reader-replay-" + index.ToString("0000")));
+            builder.Append('\n');
+        }
+
+        File.WriteAllText(_workspace.LogPath(jobId), builder.ToString());
+        var reader = CreateReader(jobId);
+        var emitted = 0;
+        while (reader.Offset < new FileInfo(_workspace.LogPath(jobId)).Length)
+        {
+            emitted += reader.Poll(DateTimeOffset.UtcNow).NewEvents.Count;
+        }
+
+        Assert.AreEqual(10_001, emitted);
+        Assert.AreEqual(10_001, reader.TotalUniqueEvents);
+        Assert.IsTrue(ForgeEventParser.TryParse(
+            highLine,
+            jobId,
+            DateTimeOffset.UtcNow,
+            out var parsed));
+
+        File.AppendAllText(_workspace.LogPath(jobId), highLine + "\n");
+        var replay = reader.Poll(DateTimeOffset.UtcNow);
+
+        Assert.AreEqual(
+            1,
+            replay.NewEvents.Count,
+            "the reader's bounded 10,000-key window is expected to re-emit the evicted key");
+        Assert.AreEqual(parsed!.EventKey, replay.NewEvents[0].EventKey);
+        Assert.AreEqual(10_002, reader.TotalUniqueEvents);
+    }
+
+    [TestMethod]
+    public void Poll_RejectedCostEvent_DoesNotUpdateAggregates()
+    {
+        var jobId = "job_accept_gate_0001";
+        var rejectedLine = TestWorkspace.StepFinish(
+            1_800_000_000_000,
+            0.375,
+            session: "ses_rejected",
+            part: "rejected-finish",
+            message: "rejected-message");
+        File.WriteAllText(_workspace.LogPath(jobId), rejectedLine + "\n");
+        var reader = CreateReader(jobId);
+
+        var rejected = reader.Poll(DateTimeOffset.UtcNow, _ => false);
+
+        Assert.AreEqual(0, rejected.NewEvents.Count);
+        Assert.AreEqual(0, reader.TotalUniqueEvents);
+        Assert.AreEqual(0, reader.TotalCost);
+        Assert.IsFalse(reader.HasCost);
+        Assert.IsNull(reader.LatestSessionId);
+        Assert.IsNull(reader.LastActivity);
+
+        var acceptedLine = TestWorkspace.StepFinish(
+            1_800_000_001_000,
+            0.125,
+            session: "ses_accepted",
+            part: "accepted-finish",
+            message: "accepted-message");
+        File.AppendAllText(_workspace.LogPath(jobId), acceptedLine + "\n");
+        var accepted = reader.Poll(DateTimeOffset.UtcNow);
+
+        Assert.AreEqual(1, accepted.NewEvents.Count);
+        Assert.AreEqual(1, reader.TotalUniqueEvents);
+        Assert.AreEqual(0.125, reader.TotalCost, 1e-12);
+        Assert.IsTrue(reader.HasCost);
+        Assert.AreEqual("ses_accepted", reader.LatestSessionId);
+        Assert.IsNotNull(reader.LastActivity);
+    }
+
+    [TestMethod]
     public void Poll_MalformedLine_IsSkippedAndParsingContinues()
     {
         var jobId = "job_malformed_0001";

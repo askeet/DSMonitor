@@ -229,15 +229,21 @@ public sealed class ForgeMonitoringService
                     _options.MaxLogLineBytes);
                 state.Readers[metadata.JobId] = reader;
 
-                if (!state.RecentEvents.ContainsKey(metadata.JobId))
+                if (!state.TimelineBuffers.ContainsKey(metadata.JobId))
                 {
-                    state.RecentEvents[metadata.JobId] = new List<MonitoringEvent>();
+                    state.TimelineBuffers[metadata.JobId] = new TimelineRetentionBuffer(
+                        _options.MaxRecentEventsPerJob);
                 }
 
                 if (!state.SeenEventKeys.ContainsKey(metadata.JobId))
                 {
                     state.SeenEventKeys[metadata.JobId] = new HashSet<string>(StringComparer.Ordinal);
                     state.SeenKeyOrder[metadata.JobId] = new Queue<string>();
+                }
+
+                if (!state.AcceptedEventCounts.ContainsKey(metadata.JobId))
+                {
+                    state.AcceptedEventCounts[metadata.JobId] = 0;
                 }
 
                 if (!state.PreviousStatuses.ContainsKey(metadata.JobId))
@@ -247,7 +253,25 @@ public sealed class ForgeMonitoringService
                 }
             }
 
-            var poll = reader.Poll(observedAt);
+            var timeline = state.TimelineBuffers[metadata.JobId];
+            var seen = state.SeenEventKeys[metadata.JobId];
+            var seenOrder = state.SeenKeyOrder[metadata.JobId];
+
+            // The 10,000-key recent window is bounded, so an old key can be
+            // evicted while its high-timestamp event is still retained. The
+            // reader evaluates this predicate before updating cost, session,
+            // activity, or accepted-count aggregates, so a rejected replay has
+            // no projected effect at all. The per-poll set makes the decision
+            // consistent even if the reader's own bounded window evicts a key
+            // before an identical line later in the same poll.
+            var acceptedThisPoll = new HashSet<string>(StringComparer.Ordinal);
+            var poll = reader.Poll(
+                observedAt,
+                observedEvent =>
+                    !acceptedThisPoll.Contains(observedEvent.EventKey) &&
+                    !seen.Contains(observedEvent.EventKey) &&
+                    !timeline.ContainsRetainedKey(observedEvent.EventKey) &&
+                    acceptedThisPoll.Add(observedEvent.EventKey));
             foreach (var warning in poll.Warnings)
             {
                 if (!globalWarnings.Contains(warning, StringComparer.Ordinal))
@@ -256,41 +280,37 @@ public sealed class ForgeMonitoringService
                 }
             }
 
-            var recent = state.RecentEvents[metadata.JobId];
-            var seen = state.SeenEventKeys[metadata.JobId];
-            var seenOrder = state.SeenKeyOrder[metadata.JobId];
+            var acceptedEventCount = state.AcceptedEventCounts[metadata.JobId];
+            var newlyAccepted = new List<MonitoringEvent>();
             foreach (var observedEvent in poll.NewEvents)
             {
-                if (seen.Add(observedEvent.EventKey))
+                // Reader-local dedupe guarantees one occurrence per key in a
+                // poll; this guard keeps the service acceptance set consistent
+                // if that invariant is ever changed.
+                if (!seen.Add(observedEvent.EventKey))
                 {
-                    seenOrder.Enqueue(observedEvent.EventKey);
-                    while (seenOrder.Count > 10_000)
-                    {
-                        seen.Remove(seenOrder.Dequeue());
-                    }
-
-                    recent.Add(observedEvent);
-                    eventsToLog.Add(observedEvent);
+                    continue;
                 }
+
+                seenOrder.Enqueue(observedEvent.EventKey);
+                while (seenOrder.Count > 10_000)
+                {
+                    seen.Remove(seenOrder.Dequeue());
+                }
+
+                acceptedEventCount++;
+                newlyAccepted.Add(observedEvent);
+                eventsToLog.Add(observedEvent);
             }
 
-            var hasObservedAmbiguity =
-                state.AmbiguousTimelineJobs.Contains(metadata.JobId) ||
-                recent.Any(item => item.Timestamp is null);
-            if (hasObservedAmbiguity)
+            state.AcceptedEventCounts[metadata.JobId] = acceptedEventCount;
+
+            if (newlyAccepted.Count > 0)
             {
-                state.AmbiguousTimelineJobs.Add(metadata.JobId);
+                timeline.AddRange(newlyAccepted);
             }
 
-            if (recent.Count > _options.MaxRecentEventsPerJob)
-            {
-                var retained = TimelineOrdering.RetainSourceOrder(
-                    recent,
-                    _options.MaxRecentEventsPerJob,
-                    hasObservedAmbiguity);
-                recent.Clear();
-                recent.AddRange(retained);
-            }
+            var hasObservedAmbiguity = timeline.HasObservedAmbiguousTimestamps;
 
             if (state.PreviousStatuses.TryGetValue(metadata.JobId, out var previousStatus) &&
                 previousStatus != metadata.ExplicitStatus)
@@ -321,10 +341,10 @@ public sealed class ForgeMonitoringService
                 Status = metadata.ExplicitStatus,
                 SessionId = sessionId,
                 LastActivity = reader.LastActivity,
-                ParsedEventCount = reader.TotalUniqueEvents,
+                ParsedEventCount = state.AcceptedEventCounts[metadata.JobId],
                 ObservedCost = reader.HasCost ? reader.TotalCost : null,
                 HasObservedAmbiguousTimestamps = hasObservedAmbiguity,
-                Events = recent.ToArray(),
+                Events = timeline.RetainSourceOrder(),
                 Warnings = jobWarnings,
                 ObservedAt = observedAt
             });
@@ -336,12 +356,12 @@ public sealed class ForgeMonitoringService
         foreach (var staleId in staleIds)
         {
             state.Readers.Remove(staleId);
-            state.RecentEvents.Remove(staleId);
+            state.TimelineBuffers.Remove(staleId);
             state.PreviousStatuses.Remove(staleId);
             state.LastSessions.Remove(staleId);
             state.SeenEventKeys.Remove(staleId);
             state.SeenKeyOrder.Remove(staleId);
-            state.AmbiguousTimelineJobs.Remove(staleId);
+            state.AcceptedEventCounts.Remove(staleId);
         }
 
         if (eventsToLog.Count > 0)
@@ -376,13 +396,13 @@ public sealed class ForgeMonitoringService
         public IReadOnlyList<string> StartupWarnings { get; }
         public Dictionary<string, ForgeLogTailReader> Readers { get; } =
             new(StringComparer.OrdinalIgnoreCase);
-        public Dictionary<string, List<MonitoringEvent>> RecentEvents { get; } =
+        public Dictionary<string, TimelineRetentionBuffer> TimelineBuffers { get; } =
             new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, HashSet<string>> SeenEventKeys { get; } =
             new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, Queue<string>> SeenKeyOrder { get; } =
             new(StringComparer.OrdinalIgnoreCase);
-        public HashSet<string> AmbiguousTimelineJobs { get; } =
+        public Dictionary<string, int> AcceptedEventCounts { get; } =
             new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, ForgeJobStatus> PreviousStatuses { get; } =
             new(StringComparer.OrdinalIgnoreCase);

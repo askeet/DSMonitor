@@ -69,7 +69,16 @@ public sealed class ForgeLogTailReader
     public int ResetCount { get; private set; }
     public bool IsMissing { get; private set; }
 
-    public TailPollResult Poll(DateTimeOffset observedAt)
+    /// <summary>
+    /// Incrementally reads newly appended complete lines. When
+    /// <paramref name="acceptEvent"/> is supplied, it is evaluated after the
+    /// reader's own bounded dedupe and before any cost, session, activity, or
+    /// accepted-count aggregate is updated. Returning false discards the event
+    /// without any aggregate effect or inclusion in <see cref="TailPollResult.NewEvents"/>.
+    /// </summary>
+    public TailPollResult Poll(
+        DateTimeOffset observedAt,
+        Func<MonitoringEvent, bool>? acceptEvent = null)
     {
         var newEvents = new List<MonitoringEvent>();
         var warnings = new List<string>();
@@ -127,7 +136,7 @@ public sealed class ForgeLogTailReader
                     bytesRead = read;
                     var charCount = _decoder.GetChars(_byteBuffer, 0, read, _charBuffer, 0, flush: false);
                     _pending.Append(_charBuffer, 0, charCount);
-                    ProcessBufferedLines(newEvents, observedAt, warnings);
+                    ProcessBufferedLines(newEvents, observedAt, warnings, acceptEvent);
                 }
             }
 
@@ -203,7 +212,8 @@ public sealed class ForgeLogTailReader
     private void ProcessBufferedLines(
         List<MonitoringEvent> newEvents,
         DateTimeOffset observedAt,
-        List<string> warnings)
+        List<string> warnings,
+        Func<MonitoringEvent, bool>? acceptEvent)
     {
         var text = _pending.ToString();
         var consumed = 0;
@@ -258,6 +268,15 @@ public sealed class ForgeLogTailReader
             while (_seenKeyOrder.Count > MaxSeenEventKeys)
             {
                 _seenKeys.Remove(_seenKeyOrder.Dequeue());
+            }
+
+            // Acceptance is evaluated before any projected aggregate is
+            // mutated. A duplicate rejected by the caller must not add cost,
+            // replace the latest session, advance activity, or increment the
+            // accepted unique-event count.
+            if (acceptEvent is not null && !acceptEvent(parsed.Event))
+            {
+                continue;
             }
 
             TotalUniqueEvents++;

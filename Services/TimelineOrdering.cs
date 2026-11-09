@@ -3,10 +3,13 @@ using DSMonitor.Models;
 namespace DSMonitor.Services;
 
 /// <summary>
-/// Deterministic timeline policy shared by monitoring retention and the view
-/// model. Missing timestamps are source-order barriers, not sortable MinValue
-/// values. Known timestamp segments sort newest-first; equal timestamps keep
-/// their original source order. Retention is bounded and preserves the barrier
+/// Deterministic timeline policy shared by the view model and policy tests.
+/// Service-side incremental retention is handled by <see cref="TimelineRetentionBuffer"/>,
+/// which keeps both the source window and newest-timestamp candidates so a
+/// late missing timestamp cannot make the result depend on poll boundaries.
+/// Missing timestamps are source-order barriers, not sortable MinValue values.
+/// Known timestamp segments sort newest-first; equal timestamps keep their
+/// original source order. Retention is bounded and preserves the barrier
 /// context needed by later incremental updates.
 /// </summary>
 public static class TimelineOrdering
