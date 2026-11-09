@@ -64,8 +64,18 @@ public sealed class EventLedger : IDisposable
 
         try
         {
-            // Check reparse points and existing sidecars before SQLite gets a
-            // chance to open or create any path.
+            // Check the complete existing ancestry, reparse points, current
+            // hard-link counts, and existing sidecars before SQLite gets a
+            // chance to open, create, or recover any path.
+            _storageGuard.PrepareAndValidate();
+
+            // Validate an existing database through a read-only connection
+            // before opening it read/write. This keeps incompatible, corrupt,
+            // or unexpected databases byte-for-byte untouched in the normal
+            // path. A concurrent replacement between this check and the write
+            // open remains a documented residual race.
+            ValidateExistingDatabaseReadOnly();
+
             _storageGuard.PrepareAndValidate();
 
             var builder = new SqliteConnectionStringBuilder
@@ -79,9 +89,16 @@ public sealed class EventLedger : IDisposable
 
             _connection = new SqliteConnection(builder.ToString());
             _connection.Open();
-            ConfigureConnection();
+
+            // Connection-local settings are safe on an incompatible database;
+            // the persistent WAL switch is deferred until the exact schema has
+            // been validated or initialized.
+            ConfigureConnectionDefaults();
             _storageGuard.PrepareAndValidate();
             ValidateOrInitializeSchema();
+            ConfigureConnectionDurability();
+            ValidateSchemaObjects();
+            ValidateSchemaMetadata();
             _storageGuard.PrepareAndValidate();
         }
         catch (LedgerException)
@@ -186,6 +203,13 @@ public sealed class EventLedger : IDisposable
             try
             {
                 transaction = Connection.BeginTransaction(IsolationLevel.Serializable, deferred: false);
+
+                // The transaction is an immediate write transaction. Validate
+                // the complete schema now, while the write lock is held, so an
+                // external SQLite writer cannot add a trigger or replace an
+                // object between validation and mutation. Nothing has been
+                // written at this point.
+                ValidateWriteTransaction(transaction);
                 EnsureJob(jobId, now, transaction);
 
                 var matches = ReadMatchingGenerations(transaction, jobId, identity);
@@ -206,12 +230,14 @@ public sealed class EventLedger : IDisposable
 
                 long generationId;
                 long cursor;
+                long cursorVersion;
                 var created = false;
 
                 if (matches.Count == 0)
                 {
                     generationId = InsertGeneration(transaction, jobId, fullPath, identity, now);
                     cursor = 0;
+                    cursorVersion = 0;
                     created = true;
                 }
                 else
@@ -219,6 +245,7 @@ public sealed class EventLedger : IDisposable
                     var existing = matches[0];
                     generationId = existing.GenerationId;
                     cursor = existing.CommittedOffset;
+                    cursorVersion = existing.CursorVersion;
 
                     if (length < cursor)
                     {
@@ -244,7 +271,16 @@ public sealed class EventLedger : IDisposable
 
                 if (length == cursor)
                 {
-                    transaction.Commit();
+                    CommitWithPostconditions(
+                        transaction,
+                        jobId,
+                        generationId,
+                        cursor,
+                        cursorVersion,
+                        rangeStart: null,
+                        rangeEnd: null,
+                        expectedRecords: 0,
+                        expectedEvents: 0);
                     return new LedgerIngestResult(
                         created ? LedgerIngestStatus.Committed : LedgerIngestStatus.NoData,
                         generationId,
@@ -305,7 +341,16 @@ public sealed class EventLedger : IDisposable
                             });
                     }
 
-                    transaction.Commit();
+                    CommitWithPostconditions(
+                        transaction,
+                        jobId,
+                        generationId,
+                        cursor,
+                        cursorVersion,
+                        rangeStart: null,
+                        rangeEnd: null,
+                        expectedRecords: 0,
+                        expectedEvents: 0);
                     return new LedgerIngestResult(
                         created ? LedgerIngestStatus.Committed : LedgerIngestStatus.NoData,
                         generationId,
@@ -319,6 +364,8 @@ public sealed class EventLedger : IDisposable
                 var newCursor = cursor;
                 var recordCount = 0;
                 var eventCount = 0;
+                var rangeRecordCount = 0;
+                var rangeEventCount = 0;
                 var lineStart = 0;
 
                 while (lineStart < completeLength)
@@ -363,6 +410,12 @@ public sealed class EventLedger : IDisposable
                         disposition,
                         contentSha256,
                         now);
+
+                    rangeRecordCount++;
+                    if (disposition == LedgerRecordDisposition.Accepted && parsed is not null)
+                    {
+                        rangeEventCount++;
+                    }
 
                     if (inserted)
                     {
@@ -424,7 +477,16 @@ public sealed class EventLedger : IDisposable
                         "The committed cursor changed concurrently; the batch was rolled back.");
                 }
 
-                transaction.Commit();
+                CommitWithPostconditions(
+                    transaction,
+                    jobId,
+                    generationId,
+                    newCursor,
+                    cursorVersion + 1,
+                    rangeStart: cursor,
+                    rangeEnd: newCursor,
+                    expectedRecords: rangeRecordCount,
+                    expectedEvents: rangeEventCount);
                 return new LedgerIngestResult(
                     LedgerIngestStatus.Committed,
                     generationId,
@@ -685,14 +747,101 @@ public sealed class EventLedger : IDisposable
         return AnalyzeRecord(content, jobId, observedAt, out parsed, out contentSha256);
     }
 
-    private void ConfigureConnection()
+    private void ConfigureConnectionDefaults()
     {
         ExecuteNonQuery(null, "PRAGMA foreign_keys = ON;");
         ExecuteNonQuery(null, $"PRAGMA busy_timeout = {_options.EffectiveBusyTimeout.ToString(CultureInfo.InvariantCulture)};");
-        ExecuteScalar(null, "PRAGMA journal_mode = WAL;");
-        ExecuteNonQuery(null, "PRAGMA synchronous = FULL;");
         ExecuteNonQuery(null, "PRAGMA temp_store = MEMORY;");
         ExecuteNonQuery(null, "PRAGMA trusted_schema = OFF;");
+    }
+
+    private void ConfigureConnectionDurability()
+    {
+        // journal_mode is persistent in the database header. It is applied only
+        // after the exact schema has been validated or initialized so that an
+        // incompatible existing database is not rewritten by this switch.
+        ExecuteScalar(null, "PRAGMA journal_mode = WAL;");
+        ExecuteNonQuery(null, "PRAGMA synchronous = FULL;");
+    }
+
+    private void ValidateExistingDatabaseReadOnly()
+    {
+        if (!File.Exists(_databasePath))
+        {
+            return;
+        }
+
+        long length;
+        try
+        {
+            length = new FileInfo(_databasePath).Length;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.Unavailable,
+                "The existing ledger database could not be inspected safely.",
+                ex);
+        }
+
+        if (length == 0)
+        {
+            // SQLite will initialize this file on the read/write open.
+            return;
+        }
+
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = _databasePath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Cache = SqliteCacheMode.Private,
+            Pooling = false,
+            DefaultTimeout = Math.Max(1, _options.EffectiveBusyTimeout / 1000)
+        };
+
+        using var connection = new SqliteConnection(builder.ToString());
+        connection.Open();
+
+        // Read-only plus query_only means validation cannot change the
+        // candidate database or recover/write a journal. SQLite may still
+        // inspect sidecars; observable path/link/reparse checks happened
+        // before this open.
+        ExecuteNonQuery(connection, null, "PRAGMA query_only = ON;");
+        ExecuteNonQuery(
+            connection,
+            null,
+            $"PRAGMA busy_timeout = {_options.EffectiveBusyTimeout.ToString(CultureInfo.InvariantCulture)};");
+        ExecuteNonQuery(connection, null, "PRAGMA trusted_schema = OFF;");
+
+        var version = Convert.ToInt32(
+            ExecuteScalar(connection, null, "PRAGMA user_version;"),
+            CultureInfo.InvariantCulture);
+        if (version != EventLedgerSchema.CurrentVersion)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.IncompatibleSchema,
+                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {EventLedgerSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture)}.");
+        }
+
+        ValidateSchemaObjects(connection, null);
+        ValidateSchemaMetadata(connection, null);
+    }
+
+    private void ValidateWriteTransaction(SqliteTransaction transaction)
+    {
+        var version = Convert.ToInt32(
+            ExecuteScalar(transaction, "PRAGMA user_version;"),
+            CultureInfo.InvariantCulture);
+        if (version != EventLedgerSchema.CurrentVersion)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.IncompatibleSchema,
+                $"Unsupported ledger schema version {version.ToString(CultureInfo.InvariantCulture)}; expected {EventLedgerSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture)}.");
+        }
+
+        ValidateSchemaObjects(transaction);
+        ValidateSchemaMetadata(transaction);
     }
 
     private void ValidateOrInitializeSchema()
@@ -700,13 +849,14 @@ public sealed class EventLedger : IDisposable
         var version = Convert.ToInt32(
             ExecuteScalar(null, "PRAGMA user_version;"),
             CultureInfo.InvariantCulture);
-        var tableCount = Convert.ToInt64(
-            ExecuteScalar(
-                null,
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';"),
+        var objectCount = Convert.ToInt64(
+            ExecuteScalar(null, "SELECT COUNT(*) FROM sqlite_master;"),
             CultureInfo.InvariantCulture);
 
-        if (version == 0 && tableCount == 0)
+        // Only a completely empty database is initialized. Any existing
+        // object, including an oddly named or SQLite-looking object, makes the
+        // file incompatible and it is left untouched.
+        if (version == 0 && objectCount == 0)
         {
             InitializeSchema();
         }
@@ -718,9 +868,86 @@ public sealed class EventLedger : IDisposable
         }
 
         ValidateSchemaObjects();
+        ValidateSchemaMetadata();
+    }
 
+    private void ValidateSchemaObjects(SqliteTransaction? transaction = null) =>
+        ValidateSchemaObjects(Connection, transaction);
+
+    private static void ValidateSchemaObjects(
+        SqliteConnection connection,
+        SqliteTransaction? transaction)
+    {
+        var expected = new Dictionary<string, (string Table, string? Sql)>(StringComparer.Ordinal);
+        foreach (var item in RequiredSchemaObjects)
+        {
+            expected.Add(
+                SchemaKey(item.Type, item.Name),
+                (item.Table, item.Sql));
+        }
+
+        foreach (var item in ExpectedInternalSchemaObjects)
+        {
+            expected.Add(
+                SchemaKey(item.Type, item.Name),
+                (item.Table, item.Sql));
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+
+        // No LIKE filter and no implicit assumption that every name starting
+        // with "sqlite" is an internal object. SQLite's LIKE treats '_' as a
+        // wildcard, so the previous 'sqlite_%' filter could hide a trigger
+        // named e.g. sqliteXdrop_events. Every actual object is enumerated and
+        // must match this complete allowlist exactly.
+        command.CommandText =
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name;";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var type = reader.GetString(0);
+            var name = reader.GetString(1);
+            var tableName = reader.GetString(2);
+            var sql = reader.IsDBNull(3) ? null : reader.GetString(3);
+            var key = SchemaKey(type, name);
+
+            if (!expected.TryGetValue(key, out var descriptor) ||
+                !string.Equals(tableName, descriptor.Table, StringComparison.Ordinal) ||
+                !SqlMatches(sql, descriptor.Sql))
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.IncompatibleSchema,
+                    $"The ledger schema object '{type}:{name}' is unexpected or incompatible; existing data was not modified.");
+            }
+
+            if (!seen.Add(key))
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.IncompatibleSchema,
+                    $"The ledger schema object '{type}:{name}' is duplicated; existing data was not modified.");
+            }
+        }
+
+        if (seen.Count != expected.Count)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.IncompatibleSchema,
+                "The ledger schema is incomplete; existing data was not modified.");
+        }
+    }
+
+    private void ValidateSchemaMetadata(SqliteTransaction? transaction = null) =>
+        ValidateSchemaMetadata(Connection, transaction);
+
+    private static void ValidateSchemaMetadata(
+        SqliteConnection connection,
+        SqliteTransaction? transaction)
+    {
         var schemaText = ExecuteScalar(
-            null,
+            connection,
+            transaction,
             "SELECT value FROM ledger_meta WHERE key = 'schema_version';") as string;
         if (!string.Equals(
                 schemaText,
@@ -733,41 +960,16 @@ public sealed class EventLedger : IDisposable
         }
     }
 
-    private void ValidateSchemaObjects()
+    private static string SchemaKey(string type, string name) => type + "\0" + name;
+
+    private static bool SqlMatches(string? actual, string? expected)
     {
-        var expected = RequiredSchemaObjects.ToDictionary(
-            item => item.Type + "\0" + item.Name,
-            item => NormalizeSql(item.Sql),
-            StringComparer.Ordinal);
-
-        using var command = Connection.CreateCommand();
-        command.CommandText =
-            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%';";
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
+        if (actual is null || expected is null)
         {
-            var type = reader.GetString(0);
-            var name = reader.GetString(1);
-            var sql = reader.IsDBNull(2) ? null : reader.GetString(2);
-            var key = type + "\0" + name;
-            if (sql is null ||
-                !expected.TryGetValue(key, out var expectedSql) ||
-                !string.Equals(NormalizeSql(sql), expectedSql, StringComparison.Ordinal))
-            {
-                throw new LedgerException(
-                    LedgerStorageFailure.IncompatibleSchema,
-                    $"The ledger schema object '{type}:{name}' is unexpected or incompatible; existing data was not modified.");
-            }
-
-            expected.Remove(key);
+            return actual is null && expected is null;
         }
 
-        if (expected.Count != 0)
-        {
-            throw new LedgerException(
-                LedgerStorageFailure.IncompatibleSchema,
-                "The ledger schema is incomplete; existing data was not modified.");
-        }
+        return string.Equals(NormalizeSql(actual), NormalizeSql(expected), StringComparison.Ordinal);
     }
 
     private static string NormalizeSql(string sql) =>
@@ -775,10 +977,11 @@ public sealed class EventLedger : IDisposable
             ' ',
             sql.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
-    private static readonly (string Type, string Name, string Sql)[] RequiredSchemaObjects =
+    private static readonly (string Type, string Name, string Table, string Sql)[] RequiredSchemaObjects =
     {
         (
             "table",
+            "ledger_meta",
             "ledger_meta",
             """
             CREATE TABLE ledger_meta (
@@ -790,6 +993,7 @@ public sealed class EventLedger : IDisposable
         (
             "table",
             "jobs",
+            "jobs",
             """
             CREATE TABLE jobs (
                 job_id TEXT PRIMARY KEY,
@@ -799,6 +1003,7 @@ public sealed class EventLedger : IDisposable
         ),
         (
             "table",
+            "source_generations",
             "source_generations",
             """
             CREATE TABLE source_generations (
@@ -818,6 +1023,7 @@ public sealed class EventLedger : IDisposable
         (
             "index",
             "ix_source_generations_identity",
+            "source_generations",
             """
             CREATE INDEX ix_source_generations_identity
                 ON source_generations(job_id, volume_serial, file_index, creation_utc_ticks)
@@ -825,6 +1031,7 @@ public sealed class EventLedger : IDisposable
         ),
         (
             "table",
+            "source_cursors",
             "source_cursors",
             """
             CREATE TABLE source_cursors (
@@ -837,6 +1044,7 @@ public sealed class EventLedger : IDisposable
         ),
         (
             "table",
+            "source_records",
             "source_records",
             """
             CREATE TABLE source_records (
@@ -857,6 +1065,7 @@ public sealed class EventLedger : IDisposable
         (
             "index",
             "ix_source_records_generation",
+            "source_records",
             """
             CREATE INDEX ix_source_records_generation
                 ON source_records(generation_id, start_byte)
@@ -864,6 +1073,7 @@ public sealed class EventLedger : IDisposable
         ),
         (
             "table",
+            "source_events",
             "source_events",
             """
             CREATE TABLE source_events (
@@ -884,12 +1094,33 @@ public sealed class EventLedger : IDisposable
         (
             "index",
             "ix_source_events_job",
+            "source_events",
             """
             CREATE INDEX ix_source_events_job
                 ON source_events(job_id, event_id)
             """
         )
     };
+
+    // Exact SQLite-owned objects expected for this schema. sqlite_sequence
+    // exists because three tables use AUTOINCREMENT. The sqlite_autoindex_*
+    // rows are SQLite's implementation of the declared PRIMARY KEY and UNIQUE
+    // constraints; their SQL text is NULL by design. Any other internal-looking
+    // name is rejected as unexpected.
+    private static readonly (string Type, string Name, string Table, string? Sql)[]
+        ExpectedInternalSchemaObjects =
+        {
+            (
+                "table",
+                "sqlite_sequence",
+                "sqlite_sequence",
+                "CREATE TABLE sqlite_sequence(name,seq)"
+            ),
+            ("index", "sqlite_autoindex_jobs_1", "jobs", null),
+            ("index", "sqlite_autoindex_ledger_meta_1", "ledger_meta", null),
+            ("index", "sqlite_autoindex_source_events_1", "source_events", null),
+            ("index", "sqlite_autoindex_source_records_1", "source_records", null)
+        };
 
     private void InitializeSchema()
     {
@@ -1057,6 +1288,152 @@ public sealed class EventLedger : IDisposable
             throw new LedgerException(
                 LedgerStorageFailure.ConstraintViolation,
                 "The source generation update did not take effect; the batch was rolled back.");
+        }
+    }
+
+    private void CommitWithPostconditions(
+        SqliteTransaction transaction,
+        string jobId,
+        long generationId,
+        long expectedCursor,
+        long expectedCursorVersion,
+        long? rangeStart,
+        long? rangeEnd,
+        int expectedRecords,
+        int expectedEvents)
+    {
+        ValidateCommittedState(
+            Connection,
+            transaction,
+            jobId,
+            generationId,
+            expectedCursor,
+            expectedCursorVersion,
+            rangeStart,
+            rangeEnd,
+            expectedRecords,
+            expectedEvents);
+        transaction.Commit();
+    }
+
+    internal static void ValidateCommittedState(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string jobId,
+        long generationId,
+        long expectedCursor,
+        long expectedCursorVersion,
+        long? rangeStart,
+        long? rangeEnd,
+        int expectedRecords,
+        int expectedEvents)
+    {
+        // Affected-row counts are insufficient: an AFTER INSERT trigger can
+        // delete a row while the insert still reports one affected row. Before
+        // committing, re-read the required job, generation, cursor, records,
+        // and events through the same transaction and require the exact
+        // expected state. Any mismatch rolls the whole batch back.
+        var jobCount = Convert.ToInt64(
+            ExecuteScalar(
+                connection,
+                transaction,
+                "SELECT COUNT(*) FROM jobs WHERE job_id = $job;",
+                ("$job", jobId)),
+            CultureInfo.InvariantCulture);
+        if (jobCount != 1)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.ConstraintViolation,
+                "The job postcondition failed; the batch was rolled back.");
+        }
+
+        var generationCount = Convert.ToInt64(
+            ExecuteScalar(
+                connection,
+                transaction,
+                """
+                SELECT COUNT(*)
+                FROM source_generations
+                WHERE generation_id = $generation AND job_id = $job;
+                """,
+                ("$generation", generationId),
+                ("$job", jobId)),
+            CultureInfo.InvariantCulture);
+        if (generationCount != 1)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.ConstraintViolation,
+                "The source generation postcondition failed; the batch was rolled back.");
+        }
+
+        var cursorCount = Convert.ToInt64(
+            ExecuteScalar(
+                connection,
+                transaction,
+                """
+                SELECT COUNT(*)
+                FROM source_cursors
+                WHERE generation_id = $generation
+                  AND committed_offset = $cursor
+                  AND version = $version;
+                """,
+                ("$generation", generationId),
+                ("$cursor", expectedCursor),
+                ("$version", expectedCursorVersion)),
+            CultureInfo.InvariantCulture);
+        if (cursorCount != 1)
+        {
+            throw new LedgerException(
+                LedgerStorageFailure.ConstraintViolation,
+                "The committed cursor postcondition failed; the batch was rolled back.");
+        }
+
+        if (rangeStart is { } start && rangeEnd is { } end && end > start)
+        {
+            var recordCount = Convert.ToInt64(
+                ExecuteScalar(
+                    connection,
+                    transaction,
+                    """
+                    SELECT COUNT(*)
+                    FROM source_records
+                    WHERE generation_id = $generation
+                      AND start_byte >= $start
+                      AND start_byte < $end;
+                    """,
+                    ("$generation", generationId),
+                    ("$start", start),
+                    ("$end", end)),
+                CultureInfo.InvariantCulture);
+            if (recordCount != expectedRecords)
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.ConstraintViolation,
+                    "The committed source-record postcondition failed; the batch was rolled back.");
+            }
+
+            var eventCount = Convert.ToInt64(
+                ExecuteScalar(
+                    connection,
+                    transaction,
+                    """
+                    SELECT COUNT(*)
+                    FROM source_events e
+                    JOIN source_records r ON r.record_id = e.record_id
+                    WHERE r.generation_id = $generation
+                      AND r.start_byte >= $start
+                      AND r.start_byte < $end;
+                    """,
+                    ("$generation", generationId),
+                    ("$start", start),
+                    ("$end", end)),
+                CultureInfo.InvariantCulture);
+            if (eventCount != expectedEvents)
+            {
+                throw new LedgerException(
+                    LedgerStorageFailure.ConstraintViolation,
+                    "The committed source-event postcondition failed; the batch was rolled back.");
+            }
         }
     }
 
@@ -1269,9 +1646,16 @@ public sealed class EventLedger : IDisposable
     private object? ExecuteScalar(
         SqliteTransaction? transaction,
         string sql,
+        params (string Name, object? Value)[] parameters) =>
+        ExecuteScalar(Connection, transaction, sql, parameters);
+
+    private static object? ExecuteScalar(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string sql,
         params (string Name, object? Value)[] parameters)
     {
-        using var command = Connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = sql;
         foreach (var (name, value) in parameters)
@@ -1285,9 +1669,16 @@ public sealed class EventLedger : IDisposable
     private int ExecuteNonQuery(
         SqliteTransaction? transaction,
         string sql,
+        params (string Name, object? Value)[] parameters) =>
+        ExecuteNonQuery(Connection, transaction, sql, parameters);
+
+    private static int ExecuteNonQuery(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string sql,
         params (string Name, object? Value)[] parameters)
     {
-        using var command = Connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = sql;
         foreach (var (name, value) in parameters)

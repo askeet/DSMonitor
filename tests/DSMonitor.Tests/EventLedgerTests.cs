@@ -1,3 +1,4 @@
+using System.Data;
 using System.Text;
 using System.Text.Json;
 using DSMonitor.Persistence;
@@ -575,6 +576,7 @@ public sealed class EventLedgerTests
             command.ExecuteNonQuery();
         }
 
+        var before = File.ReadAllBytes(_databasePath);
         try
         {
             using var ignored = CreateLedger();
@@ -584,6 +586,8 @@ public sealed class EventLedgerTests
         {
             Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
         }
+
+        CollectionAssert.AreEqual(before, File.ReadAllBytes(_databasePath));
 
         using var verify = OpenRawConnection();
         using var verifyCommand = verify.CreateCommand();
@@ -753,7 +757,10 @@ public sealed class EventLedgerTests
         }
         catch (LedgerException ex)
         {
-            Assert.AreEqual(LedgerStorageFailure.ConstraintViolation, ex.Failure);
+            // The stronger in-transaction schema validation now rejects the
+            // unexpected trigger before any mutation. The integrity assertions
+            // below still verify that no partial batch was committed.
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
         }
 
         var generation = ledger.ListGenerations(JobId).Single();
@@ -1002,7 +1009,10 @@ public sealed class EventLedgerTests
         }
         catch (LedgerException ex)
         {
-            Assert.AreEqual(LedgerStorageFailure.ConstraintViolation, ex.Failure);
+            // The unexpected trigger is rejected by the in-transaction schema
+            // check before mutation; the assertions below verify that the
+            // generation, records, events, and cursor were not created.
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
         }
 
         Assert.AreEqual(0, ledger.ListGenerations(JobId).Count);
@@ -1061,7 +1071,10 @@ public sealed class EventLedgerTests
         }
         catch (LedgerException ex)
         {
-            Assert.AreEqual(LedgerStorageFailure.ConstraintViolation, ex.Failure);
+            // The unexpected trigger is rejected by the in-transaction schema
+            // check before mutation; the assertions below verify cursor and
+            // record/event preservation.
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
         }
 
         var generation = ledger.ListGenerations(JobId).Single();
@@ -1113,6 +1126,641 @@ public sealed class EventLedgerTests
         Assert.AreEqual(new FileInfo(logPath).Length, generations[0].CommittedOffset);
         Assert.AreEqual(100, first.ListRecords(generations[0].GenerationId).Count);
         Assert.AreEqual(100, first.ListEvents(generations[0].GenerationId).Count);
+    }
+
+    [TestMethod]
+    public void Schema_SqliteWildcardTrigger_IsRejectedOnOpenAndPreservesState()
+    {
+        var logPath = LogPath("job_ledger_sqlite_trigger_open.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "sqlite-trigger-1") + "\n",
+            new UTF8Encoding(false));
+
+        long committedOffset;
+        long generationId;
+        using (var ledger = CreateLedger())
+        {
+            var ingest = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+            Assert.AreEqual(LedgerIngestStatus.Committed, ingest.Status);
+            committedOffset = ingest.CommittedOffset;
+            generationId = ingest.GenerationId!.Value;
+        }
+
+        using (var raw = OpenRawConnection())
+        using (var trigger = raw.CreateCommand())
+        {
+            // This name was omitted by the old LIKE 'sqlite_%' filter because
+            // '_' is a SQLite wildcard matching the 'X'.
+            trigger.CommandText =
+                """
+                CREATE TRIGGER sqliteXdrop_events
+                AFTER INSERT ON source_events
+                BEGIN
+                    DELETE FROM source_events WHERE event_id = NEW.event_id;
+                END;
+                """;
+            trigger.ExecuteNonQuery();
+        }
+
+        var before = File.ReadAllBytes(_databasePath);
+        try
+        {
+            using var ignored = CreateLedger();
+            Assert.Fail("The sqliteX-prefixed trigger must be rejected by the exact allowlist.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
+        }
+
+        CollectionAssert.AreEqual(before, File.ReadAllBytes(_databasePath));
+        AssertPersistedState(generationId, committedOffset, 1, 1);
+    }
+
+    [TestMethod]
+    public void Schema_SqliteWildcardAfterTriggerAddedAfterOpen_IsRejectedBeforeMutation()
+    {
+        var logPath = LogPath("job_ledger_sqlite_trigger_runtime.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "sqlite-trigger-2") + "\n",
+            new UTF8Encoding(false));
+
+        using var ledger = CreateLedger();
+        var first = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+        Assert.AreEqual(LedgerIngestStatus.Committed, first.Status);
+
+        File.AppendAllText(
+            logPath,
+            TestWorkspace.Text(1_800_000_001_000, "after trigger", part: "sqlite-trigger-3") + "\n",
+            new UTF8Encoding(false));
+
+        using (var raw = OpenRawConnection())
+        using (var trigger = raw.CreateCommand())
+        {
+            trigger.CommandText =
+                """
+                CREATE TRIGGER sqliteXdrop_events
+                AFTER INSERT ON source_events
+                BEGIN
+                    DELETE FROM source_events WHERE event_id = NEW.event_id;
+                END;
+                """;
+            trigger.ExecuteNonQuery();
+        }
+
+        try
+        {
+            ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+            Assert.Fail("The trigger must be rejected inside the immediate write transaction.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
+        }
+
+        AssertPersistedState(first.GenerationId!.Value, first.CommittedOffset, 1, 1);
+
+        using (var raw = OpenRawConnection())
+        using (var trigger = raw.CreateCommand())
+        {
+            trigger.CommandText = "DROP TRIGGER sqliteXdrop_events;";
+            trigger.ExecuteNonQuery();
+        }
+
+        var retried = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+        Assert.AreEqual(LedgerIngestStatus.Committed, retried.Status);
+        Assert.AreEqual(1, retried.RecordsCommitted);
+        Assert.AreEqual(1, retried.EventsCommitted);
+        AssertPersistedState(first.GenerationId.Value, retried.CommittedOffset, 2, 2);
+    }
+
+    [TestMethod]
+    public void Schema_QuotedWildcardTrigger_IsRejectedOnOpenAndDatabaseReopensAfterRemoval()
+    {
+        var logPath = LogPath("job_ledger_quoted_trigger.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "quoted-trigger-1") + "\n",
+            new UTF8Encoding(false));
+
+        long committedOffset;
+        long generationId;
+        using (var ledger = CreateLedger())
+        {
+            var ingest = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+            committedOffset = ingest.CommittedOffset;
+            generationId = ingest.GenerationId!.Value;
+        }
+
+        using (var raw = OpenRawConnection())
+        using (var trigger = raw.CreateCommand())
+        {
+            // A quoted identifier containing an embedded quote is still stored
+            // as sqliteXdrop"events and was also hidden by the old wildcard.
+            trigger.CommandText =
+                """
+                CREATE TRIGGER "sqliteXdrop""events"
+                AFTER INSERT ON source_events
+                BEGIN
+                    DELETE FROM source_events WHERE event_id = NEW.event_id;
+                END;
+                """;
+            trigger.ExecuteNonQuery();
+        }
+
+        using (var raw = OpenRawConnection())
+        using (var name = raw.CreateCommand())
+        {
+            name.CommandText = "SELECT name FROM sqlite_master WHERE type = 'trigger';";
+            Assert.AreEqual("sqliteXdrop\"events", Convert.ToString(name.ExecuteScalar()));
+        }
+
+        try
+        {
+            using var ignored = CreateLedger();
+            Assert.Fail("A quoted sqliteX-prefixed trigger must be rejected.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
+        }
+
+        AssertPersistedState(generationId, committedOffset, 1, 1);
+
+        using (var raw = OpenRawConnection())
+        using (var trigger = raw.CreateCommand())
+        {
+            trigger.CommandText = "DROP TRIGGER \"sqliteXdrop\"\"events\";";
+            trigger.ExecuteNonQuery();
+        }
+
+        using var reopened = CreateLedger();
+        Assert.AreEqual(1, reopened.ListRecords(generationId).Count);
+        Assert.AreEqual(1, reopened.ListEvents(generationId).Count);
+    }
+
+    [TestMethod]
+    public void Schema_UnexpectedViewOrIndex_IsRejectedAndPreservesData()
+    {
+        var logPath = LogPath("job_ledger_extra_objects.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "extra-object-1") + "\n",
+            new UTF8Encoding(false));
+
+        long committedOffset;
+        long generationId;
+        using (var ledger = CreateLedger())
+        {
+            var ingest = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+            committedOffset = ingest.CommittedOffset;
+            generationId = ingest.GenerationId!.Value;
+        }
+
+        using (var raw = OpenRawConnection())
+        using (var view = raw.CreateCommand())
+        {
+            view.CommandText = "CREATE VIEW sqliteXview AS SELECT 1 AS value;";
+            view.ExecuteNonQuery();
+        }
+
+        try
+        {
+            using var ignored = CreateLedger();
+            Assert.Fail("An unexpected view must reject the ledger schema.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
+        }
+
+        using (var raw = OpenRawConnection())
+        using (var view = raw.CreateCommand())
+        {
+            view.CommandText = "DROP VIEW sqliteXview;";
+            view.ExecuteNonQuery();
+        }
+
+        using (var raw = OpenRawConnection())
+        using (var index = raw.CreateCommand())
+        {
+            index.CommandText = "CREATE INDEX sqliteXextra_index ON jobs(created_utc);";
+            index.ExecuteNonQuery();
+        }
+
+        try
+        {
+            using var ignored = CreateLedger();
+            Assert.Fail("An unexpected index must reject the ledger schema.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.IncompatibleSchema, ex.Failure);
+        }
+
+        using (var raw = OpenRawConnection())
+        using (var index = raw.CreateCommand())
+        {
+            index.CommandText = "DROP INDEX sqliteXextra_index;";
+            index.ExecuteNonQuery();
+        }
+
+        AssertPersistedState(generationId, committedOffset, 1, 1);
+        using var reopened = CreateLedger();
+        Assert.AreEqual(1, reopened.ListRecords(generationId).Count);
+    }
+
+    [TestMethod]
+    public void Postconditions_AfterTriggerEventDeletion_AreDetectedAndRolledBack()
+    {
+        var logPath = LogPath("job_ledger_postcondition.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "postcondition-1") + "\n",
+            new UTF8Encoding(false));
+
+        long generationId;
+        long committedOffset;
+        long cursorVersion;
+        using (var ledger = CreateLedger())
+        {
+            var ingest = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+            Assert.AreEqual(LedgerIngestStatus.Committed, ingest.Status);
+            generationId = ingest.GenerationId!.Value;
+            var generation = ledger.ListGenerations(JobId).Single();
+            committedOffset = generation.CommittedOffset;
+            cursorVersion = generation.CursorVersion;
+        }
+
+        using var raw = OpenRawConnection();
+        using var transaction = raw.BeginTransaction(IsolationLevel.Serializable, deferred: false);
+
+        using (var trigger = raw.CreateCommand())
+        {
+            trigger.Transaction = transaction;
+            trigger.CommandText =
+                """
+                CREATE TRIGGER sqliteXdrop_events
+                AFTER INSERT ON source_events
+                BEGIN
+                    DELETE FROM source_events WHERE event_id = NEW.event_id;
+                END;
+                """;
+            trigger.ExecuteNonQuery();
+        }
+
+        using (var insertRecord = raw.CreateCommand())
+        {
+            insertRecord.Transaction = transaction;
+            insertRecord.CommandText =
+                """
+                INSERT INTO source_records(
+                    generation_id, start_byte, end_byte, payload_length,
+                    disposition, content_sha256, committed_utc)
+                VALUES ($generation, 100, 102, 1, 'Accepted', 'test', '2026-11-09T00:00:00.0000000+00:00');
+                """;
+            insertRecord.Parameters.AddWithValue("$generation", generationId);
+            Assert.AreEqual(1, insertRecord.ExecuteNonQuery());
+        }
+
+        long recordId;
+        using (var lastId = raw.CreateCommand())
+        {
+            lastId.Transaction = transaction;
+            lastId.CommandText = "SELECT last_insert_rowid();";
+            recordId = Convert.ToInt64(lastId.ExecuteScalar());
+        }
+
+        using (var insertEvent = raw.CreateCommand())
+        {
+            insertEvent.Transaction = transaction;
+            insertEvent.CommandText =
+                """
+                INSERT INTO source_events(
+                    record_id, job_id, event_key, session_id, event_timestamp_utc,
+                    observed_at_utc, category, severity, summary)
+                VALUES (
+                    $record, $job, 'postcondition-key', NULL, NULL,
+                    '2026-11-09T00:00:00.0000000+00:00', 'Unknown', 'Info', 'summary');
+                """;
+            insertEvent.Parameters.AddWithValue("$record", recordId);
+            insertEvent.Parameters.AddWithValue("$job", JobId);
+            Assert.AreEqual(1, insertEvent.ExecuteNonQuery());
+        }
+
+        using (var eventCount = raw.CreateCommand())
+        {
+            eventCount.Transaction = transaction;
+            eventCount.CommandText =
+                "SELECT COUNT(*) FROM source_events WHERE record_id = $record;";
+            eventCount.Parameters.AddWithValue("$record", recordId);
+            Assert.AreEqual(0L, Convert.ToInt64(eventCount.ExecuteScalar()));
+        }
+
+        var exception = Assert.ThrowsException<LedgerException>(
+            () => EventLedger.ValidateCommittedState(
+                raw,
+                transaction,
+                JobId,
+                generationId,
+                committedOffset,
+                cursorVersion,
+                rangeStart: 100,
+                rangeEnd: 102,
+                expectedRecords: 1,
+                expectedEvents: 1));
+        Assert.AreEqual(LedgerStorageFailure.ConstraintViolation, exception.Failure);
+
+        transaction.Rollback();
+
+        using var verify = OpenRawConnection();
+        using var verifyRecords = verify.CreateCommand();
+        verifyRecords.CommandText =
+            "SELECT COUNT(*) FROM source_records WHERE generation_id = $generation;";
+        verifyRecords.Parameters.AddWithValue("$generation", generationId);
+        Assert.AreEqual(1L, Convert.ToInt64(verifyRecords.ExecuteScalar()));
+    }
+
+    [TestMethod]
+    public void Storage_AncestorJunctionAboveApprovedRoot_IsRejectedBeforeCreation()
+    {
+        var outsideTarget = Path.Combine(_workspace.Root, "ancestor-target");
+        Directory.CreateDirectory(outsideTarget);
+        var junction = Path.Combine(_workspace.Root, "ancestor-junction");
+        _workspace.CreateJunction(junction, outsideTarget);
+
+        var approvedRoot = Path.Combine(junction, "approved");
+        var redirectedDatabase = Path.Combine(approvedRoot, "data", "events.db");
+        try
+        {
+            using var ignored = new EventLedger(redirectedDatabase, approvedRoot);
+            Assert.Fail("An ancestor junction above the approved root must not be followed.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.Unavailable, ex.Failure);
+        }
+
+        Assert.IsFalse(Directory.Exists(Path.Combine(outsideTarget, "approved")));
+        Assert.IsFalse(File.Exists(Path.Combine(outsideTarget, "approved", "data", "events.db")));
+    }
+
+    [TestMethod]
+    public void Storage_ApprovedRootJunction_IsRejectedBeforeDatabaseCreation()
+    {
+        var outsideTarget = Path.Combine(_workspace.Root, "root-target");
+        Directory.CreateDirectory(outsideTarget);
+        var rootJunction = Path.Combine(_workspace.Root, "root-junction");
+        _workspace.CreateJunction(rootJunction, outsideTarget);
+
+        var redirectedDatabase = Path.Combine(rootJunction, "events.db");
+        try
+        {
+            using var ignored = new EventLedger(redirectedDatabase, rootJunction);
+            Assert.Fail("A reparse-point approved root must not be followed.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.Unavailable, ex.Failure);
+        }
+
+        Assert.IsFalse(File.Exists(Path.Combine(outsideTarget, "events.db")));
+    }
+
+    [TestMethod]
+    public void Storage_OrphanSidecarWithoutDatabase_IsRejectedWithoutModification()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_databasePath)!);
+        var walPath = _databasePath + "-wal";
+        var bytes = Encoding.UTF8.GetBytes("orphan sidecar fixture");
+        File.WriteAllBytes(walPath, bytes);
+
+        try
+        {
+            using var ignored = CreateLedger();
+            Assert.Fail("A sidecar without its database must not be trusted.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.Unavailable, ex.Failure);
+        }
+
+        CollectionAssert.AreEqual(bytes, File.ReadAllBytes(walPath));
+        Assert.IsFalse(File.Exists(_databasePath));
+    }
+
+    [TestMethod]
+    public void Storage_HardLinkedDatabase_IsRejectedWithoutModifyingEitherName()
+    {
+        var logPath = LogPath("job_ledger_hardlink_db.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "hardlink-db-1") + "\n",
+            new UTF8Encoding(false));
+
+        using (var ledger = CreateLedger())
+        {
+            Assert.AreEqual(
+                LedgerIngestStatus.Committed,
+                ledger.Ingest(JobId, logPath, _workspace.RunsRoot).Status);
+        }
+
+        var before = File.ReadAllBytes(_databasePath);
+        var hardLink = Path.Combine(_workspace.Root, "events-hardlink.db");
+        Assert.IsTrue(
+            ReparsePointFixture.TryCreateHardLink(hardLink, _databasePath),
+            "The test environment could not create a hard link.");
+
+        try
+        {
+            using var ignored = CreateLedger();
+            Assert.Fail("A multiply-linked database must be rejected.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.Unavailable, ex.Failure);
+        }
+
+        CollectionAssert.AreEqual(before, File.ReadAllBytes(_databasePath));
+        CollectionAssert.AreEqual(before, File.ReadAllBytes(hardLink));
+
+        File.Delete(hardLink);
+        using var reopened = CreateLedger();
+        Assert.IsTrue(File.Exists(reopened.DatabasePath));
+    }
+
+    [TestMethod]
+    public void Storage_HardLinkedWalAndShmSidecars_AreRejectedWithoutModification()
+    {
+        var logPath = LogPath("job_ledger_hardlink_sidecars.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "hardlink-sidecar-1") + "\n",
+            new UTF8Encoding(false));
+
+        using var ledger = CreateLedger();
+        Assert.AreEqual(
+            LedgerIngestStatus.Committed,
+            ledger.Ingest(JobId, logPath, _workspace.RunsRoot).Status);
+
+        var walPath = _databasePath + "-wal";
+        var shmPath = _databasePath + "-shm";
+        Assert.IsTrue(File.Exists(walPath), "A WAL sidecar was expected after a write.");
+        Assert.IsTrue(File.Exists(shmPath), "An SHM sidecar was expected after a write.");
+
+        foreach (var sidecar in new[] { walPath, shmPath })
+        {
+            var hardLink = sidecar + ".hardlink";
+            Assert.IsTrue(
+                ReparsePointFixture.TryCreateHardLink(hardLink, sidecar),
+                "The test environment could not create a sidecar hard link.");
+
+            var before = ReadAllBytesShared(sidecar);
+            try
+            {
+                using var ignored = CreateLedger();
+                Assert.Fail("A multiply-linked SQLite sidecar must be rejected.");
+            }
+            catch (LedgerException ex)
+            {
+                Assert.AreEqual(LedgerStorageFailure.Unavailable, ex.Failure);
+            }
+
+            CollectionAssert.AreEqual(before, ReadAllBytesShared(sidecar));
+            File.Delete(hardLink);
+        }
+
+        File.AppendAllText(
+            logPath,
+            TestWorkspace.Text(1_800_000_001_000, "after link", part: "hardlink-sidecar-2") + "\n",
+            new UTF8Encoding(false));
+        var appended = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+        Assert.AreEqual(LedgerIngestStatus.Committed, appended.Status);
+        Assert.AreEqual(2, ledger.ListRecords(appended.GenerationId!.Value).Count);
+    }
+
+    [TestMethod]
+    public void Storage_HardLinkedRollbackJournal_IsRejectedWithoutModification()
+    {
+        using (var ledger = CreateLedger())
+        {
+            Assert.IsNotNull(ledger.DatabasePath);
+        }
+
+        var journalPath = _databasePath + "-journal";
+        var journalBytes = Encoding.UTF8.GetBytes("synthetic hot-journal test fixture");
+        File.WriteAllBytes(journalPath, journalBytes);
+
+        var hardLink = Path.Combine(_workspace.Root, "events-journal-hardlink");
+        Assert.IsTrue(
+            ReparsePointFixture.TryCreateHardLink(hardLink, journalPath),
+            "The test environment could not create a journal hard link.");
+
+        try
+        {
+            using var ignored = CreateLedger();
+            Assert.Fail("A multiply-linked rollback journal must be rejected.");
+        }
+        catch (LedgerException ex)
+        {
+            Assert.AreEqual(LedgerStorageFailure.Unavailable, ex.Failure);
+        }
+
+        CollectionAssert.AreEqual(journalBytes, File.ReadAllBytes(journalPath));
+        CollectionAssert.AreEqual(journalBytes, File.ReadAllBytes(hardLink));
+
+        File.Delete(hardLink);
+        File.Delete(journalPath);
+        using var reopened = CreateLedger();
+        Assert.IsTrue(File.Exists(reopened.DatabasePath));
+    }
+
+    [TestMethod]
+    public void Storage_MissingSidecars_AreSupportedOnReopen()
+    {
+        var logPath = LogPath("job_ledger_missing_sidecars.log");
+        File.WriteAllText(
+            logPath,
+            TestWorkspace.StepStart(1_800_000_000_000, part: "missing-sidecar-1") + "\n",
+            new UTF8Encoding(false));
+
+        long generationId;
+        using (var ledger = CreateLedger())
+        {
+            var ingest = ledger.Ingest(JobId, logPath, _workspace.RunsRoot);
+            generationId = ingest.GenerationId!.Value;
+        }
+
+        foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+        {
+            var sidecar = _databasePath + suffix;
+            if (File.Exists(sidecar))
+            {
+                File.Delete(sidecar);
+            }
+        }
+
+        File.AppendAllText(
+            logPath,
+            TestWorkspace.Text(1_800_000_001_000, "reopen", part: "missing-sidecar-2") + "\n",
+            new UTF8Encoding(false));
+
+        using var reopened = CreateLedger();
+        var next = reopened.Ingest(JobId, logPath, _workspace.RunsRoot);
+        Assert.AreEqual(LedgerIngestStatus.Committed, next.Status);
+        Assert.AreEqual(generationId, next.GenerationId);
+        Assert.AreEqual(2, reopened.ListRecords(generationId).Count);
+        Assert.AreEqual(2, reopened.ListEvents(generationId).Count);
+    }
+
+    private static byte[] ReadAllBytesShared(string path)
+    {
+        using var handle = File.OpenHandle(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var stream = new FileStream(handle, FileAccess.Read, 4096, isAsync: false);
+        using var buffer = new MemoryStream();
+        stream.CopyTo(buffer);
+        return buffer.ToArray();
+    }
+
+    private void AssertPersistedState(
+        long generationId,
+        long expectedOffset,
+        long expectedRecords,
+        long expectedEvents)
+    {
+        using var raw = OpenRawConnection();
+        using (var records = raw.CreateCommand())
+        {
+            records.CommandText =
+                "SELECT COUNT(*) FROM source_records WHERE generation_id = $generation;";
+            records.Parameters.AddWithValue("$generation", generationId);
+            Assert.AreEqual(expectedRecords, Convert.ToInt64(records.ExecuteScalar()));
+        }
+
+        using (var events = raw.CreateCommand())
+        {
+            events.CommandText =
+                """
+                SELECT COUNT(*)
+                FROM source_events e
+                JOIN source_records r ON r.record_id = e.record_id
+                WHERE r.generation_id = $generation;
+                """;
+            events.Parameters.AddWithValue("$generation", generationId);
+            Assert.AreEqual(expectedEvents, Convert.ToInt64(events.ExecuteScalar()));
+        }
+
+        using var cursor = raw.CreateCommand();
+        cursor.CommandText =
+            "SELECT committed_offset FROM source_cursors WHERE generation_id = $generation;";
+        cursor.Parameters.AddWithValue("$generation", generationId);
+        Assert.AreEqual(expectedOffset, Convert.ToInt64(cursor.ExecuteScalar()));
     }
 
     private EventLedger CreateLedger(

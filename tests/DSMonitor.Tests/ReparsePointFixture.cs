@@ -153,6 +153,19 @@ internal static class ReparsePointFixture
         }
     }
 
+    public static bool TryCreateHardLink(string linkPath, string existingPath)
+    {
+        var fullLink = Path.GetFullPath(linkPath);
+        var fullExisting = Path.GetFullPath(existingPath);
+        if (File.Exists(fullLink) || Directory.Exists(fullLink))
+        {
+            throw new IOException("The hard-link fixture path already exists.");
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(fullLink)!);
+        return CreateHardLinkW(fullLink, fullExisting, IntPtr.Zero);
+    }
+
     public static void DeleteLink(string path)
     {
         try
@@ -235,4 +248,11 @@ internal static class ReparsePointFixture
         string symbolicLink,
         string targetFileName,
         uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateHardLinkW(
+        string fileName,
+        string existingFileName,
+        IntPtr securityAttributes);
 }
