@@ -6,6 +6,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
     <UseWPF>true</UseWPF>
+    <!-- The test assembly doubles as the minimal test-only crash host so the
+         recovery tests can launch a retained child without a new project or
+         extra package restore. MSTest still discovers the test classes. -->
+    <OutputType>Exe</OutputType>
+    <StartupObject>DSMonitor.Tests.EventLedgerCrashRecoveryHost</StartupObject>
   </PropertyGroup>
 
   <ItemGroup>
