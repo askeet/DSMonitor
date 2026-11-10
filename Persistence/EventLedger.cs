@@ -1926,13 +1926,38 @@ public sealed class EventLedger : IDisposable
                 END
                 """
             ),
+            // REPLACE retains referenced keys without firing UPDATE guards.
+            // Check actual inserted rows (after conflict handling), and guard
+            // identity-changing UPDATE OR REPLACE against the destination owner.
             (
                 "trigger",
                 "trg_jobs_project_primary_consistency",
                 "jobs",
                 """
                 CREATE TRIGGER trg_jobs_project_primary_consistency
-                BEFORE UPDATE OF project_id ON jobs
+                BEFORE UPDATE OF job_id, project_id ON jobs
+                WHEN NEW.project_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'primary task/job project conflict')
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM task_runs r
+                        JOIN tasks t ON t.task_id = r.task_id
+                        WHERE r.job_id = NEW.job_id
+                          AND r.association_role = 'primary'
+                          AND r.is_active = 1
+                          AND t.project_id <> NEW.project_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_jobs_project_primary_consistency_insert",
+                "jobs",
+                """
+                CREATE TRIGGER trg_jobs_project_primary_consistency_insert
+                AFTER INSERT ON jobs
                 WHEN NEW.project_id IS NOT NULL
                 BEGIN
                     SELECT RAISE(ABORT, 'primary task/job project conflict')
@@ -1954,7 +1979,30 @@ public sealed class EventLedger : IDisposable
                 "tasks",
                 """
                 CREATE TRIGGER trg_tasks_project_primary_consistency
-                BEFORE UPDATE OF project_id ON tasks
+                BEFORE UPDATE OF task_id, project_id ON tasks
+                WHEN NEW.project_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'primary task/job project conflict')
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM task_runs r
+                        JOIN jobs j ON j.job_id = r.job_id
+                        WHERE r.task_id = NEW.task_id
+                          AND r.association_role = 'primary'
+                          AND r.is_active = 1
+                          AND j.project_id IS NOT NULL
+                          AND j.project_id <> NEW.project_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_tasks_project_primary_consistency_insert",
+                "tasks",
+                """
+                CREATE TRIGGER trg_tasks_project_primary_consistency_insert
+                AFTER INSERT ON tasks
                 WHEN NEW.project_id IS NOT NULL
                 BEGIN
                     SELECT RAISE(ABORT, 'primary task/job project conflict')
@@ -2641,7 +2689,7 @@ public sealed class EventLedger : IDisposable
                 "validations",
                 """
                 CREATE TRIGGER trg_validations_reviewer_provenance_update
-                BEFORE UPDATE OF reviewer_provenance_id, result_id, result_run_id, run_id ON validations
+                BEFORE UPDATE OF reviewer_provenance_id, result_id, result_run_id, run_id, is_verified ON validations
                 WHEN NEW.reviewer_provenance_id IS NOT NULL
                 BEGIN
                     SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
@@ -2869,6 +2917,137 @@ public sealed class EventLedger : IDisposable
                 ON provenance
                 BEGIN
                     SELECT RAISE(ABORT, 'provenance subject immutable');
+                END
+                """
+            ),
+            // Guard both INSERT and UPDATE on the mutable parents: REPLACE can
+            // retain a referenced identity while replacing its ownership, without
+            // firing UPDATE (or, by default, DELETE) triggers on that parent.
+            // AFTER INSERT allows conflict no-ops and ownership-preserving UPSERTs;
+            // ABORT still rolls back an incompatible replacement in its entirety.
+            (
+                "trigger",
+                "trg_task_runs_validation_reviewer_insert",
+                "task_runs",
+                """
+                CREATE TRIGGER trg_task_runs_validation_reviewer_insert
+                AFTER INSERT ON task_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE EXISTS (
+                        SELECT 1 FROM validations v
+                        JOIN provenance p ON p.provenance_id = v.reviewer_provenance_id
+                        WHERE v.is_verified = 1 AND p.entity_type = 'job'
+                          AND COALESCE(v.run_id, v.result_run_id) IS NEW.run_id
+                          AND p.job_id IS NOT NEW.job_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_task_runs_validation_reviewer_update",
+                "task_runs",
+                """
+                CREATE TRIGGER trg_task_runs_validation_reviewer_update
+                BEFORE UPDATE OF run_id, job_id ON task_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE EXISTS (
+                        SELECT 1 FROM validations v
+                        JOIN provenance p ON p.provenance_id = v.reviewer_provenance_id
+                        WHERE v.is_verified = 1 AND p.entity_type = 'job'
+                          AND COALESCE(v.run_id, v.result_run_id) IS NEW.run_id
+                          AND p.job_id IS NOT NEW.job_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_invocations_validation_reviewer_insert",
+                "delegation_invocations",
+                """
+                CREATE TRIGGER trg_invocations_validation_reviewer_insert
+                AFTER INSERT ON delegation_invocations
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE EXISTS (
+                        SELECT 1 FROM validations v
+                        JOIN provenance p ON p.provenance_id = v.reviewer_provenance_id
+                        WHERE v.is_verified = 1 AND p.entity_type = 'invocation'
+                          AND p.invocation_id IS NEW.invocation_id
+                          AND COALESCE(v.run_id, v.result_run_id) IS NOT NEW.run_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_invocations_validation_reviewer_update",
+                "delegation_invocations",
+                """
+                CREATE TRIGGER trg_invocations_validation_reviewer_update
+                BEFORE UPDATE OF invocation_id, run_id ON delegation_invocations
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE EXISTS (
+                        SELECT 1 FROM validations v
+                        JOIN provenance p ON p.provenance_id = v.reviewer_provenance_id
+                        WHERE v.is_verified = 1 AND p.entity_type = 'invocation'
+                          AND p.invocation_id IS NEW.invocation_id
+                          AND COALESCE(v.run_id, v.result_run_id) IS NOT NEW.run_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_provenance_validation_reviewer_insert",
+                "provenance",
+                """
+                CREATE TRIGGER trg_provenance_validation_reviewer_insert
+                AFTER INSERT ON provenance
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE EXISTS (
+                        SELECT 1 FROM validations v
+                        WHERE v.is_verified = 1 AND v.reviewer_provenance_id = NEW.provenance_id
+                          AND NOT (
+                            (NEW.entity_type = 'result' AND NEW.result_id IS NOT NULL AND NEW.result_id IS v.result_id)
+                            OR (NEW.entity_type = 'run' AND NEW.run_id IS NOT NULL AND NEW.run_id IS COALESCE(v.run_id, v.result_run_id))
+                            OR (NEW.entity_type = 'job' AND NEW.job_id IS NOT NULL AND NEW.job_id IS (
+                                SELECT r.job_id FROM task_runs r WHERE r.run_id IS COALESCE(v.run_id, v.result_run_id)))
+                            OR (NEW.entity_type = 'invocation' AND NEW.invocation_id IS NOT NULL AND EXISTS (
+                                SELECT 1 FROM delegation_invocations di
+                                WHERE di.invocation_id IS NEW.invocation_id AND di.run_id IS COALESCE(v.run_id, v.result_run_id)))
+                          )
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_provenance_validation_reviewer_update",
+                "provenance",
+                """
+                CREATE TRIGGER trg_provenance_validation_reviewer_update
+                BEFORE UPDATE OF provenance_id ON provenance
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE EXISTS (
+                        SELECT 1 FROM validations v
+                        WHERE v.is_verified = 1 AND v.reviewer_provenance_id = NEW.provenance_id
+                          AND NOT (
+                            (NEW.entity_type = 'result' AND NEW.result_id IS NOT NULL AND NEW.result_id IS v.result_id)
+                            OR (NEW.entity_type = 'run' AND NEW.run_id IS NOT NULL AND NEW.run_id IS COALESCE(v.run_id, v.result_run_id))
+                            OR (NEW.entity_type = 'job' AND NEW.job_id IS NOT NULL AND NEW.job_id IS (
+                                SELECT r.job_id FROM task_runs r WHERE r.run_id IS COALESCE(v.run_id, v.result_run_id)))
+                            OR (NEW.entity_type = 'invocation' AND NEW.invocation_id IS NOT NULL AND EXISTS (
+                                SELECT 1 FROM delegation_invocations di
+                                WHERE di.invocation_id IS NEW.invocation_id AND di.run_id IS COALESCE(v.run_id, v.result_run_id)))
+                          )
+                    );
                 END
                 """
             ),

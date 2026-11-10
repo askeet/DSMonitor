@@ -417,6 +417,22 @@ Reuse historical B1 and unchanged-check evidence where applicable; repeat checks
 
 ---
 
+### 1.14 V3-1 — Fresh SQLite Foundation
+
+**Status: ACCEPTED — final independent acceptance, 2026-11-10.** The focused review of the completed V3-1 foundation and final REPLACE ownership correction found no remaining mandatory acceptance blocker. This accepts the fresh V3 schema foundation only. Phase 1 remains **IN PROGRESS / NOT ACCEPTED**; V3-2 remains **NOT STARTED**; B3/B4 and their existing gates are unchanged.
+
+**Final acceptance evidence:**
+
+- Independently inspected the actual `Persistence/EventLedger.cs` ownership-guard diff and additive regression tests. Replacement inserts validate the resulting row, identity-changing updates validate destination ownership, and verified reviewer ownership is rechecked on parent mutation and promotion. Existing test assertions were not removed, disabled, or weakened.
+- Read the user's latest standard MSTest artifact, `tests/DSMonitor.Tests/TestResults/v3-final-replace.trx`: **266 passed / 0 failed / 0 skipped**, completed on 2026-11-10 at 05:28:14 +04:00. All 266 individual results passed, including **68 V3 cases**, all **10 new parent-mutation cases**, and every test result from the earlier 256-case run. The earlier 256-pass artifact is not final regression evidence. The latest run also includes 43 existing ledger, 21 B2 projection, and 2 crash-recovery cases.
+- Independently invoked **28 focused existing cases: 28 passed / 0 failed / 0 inconclusive**. These cover ownership replacement, reviewer replacement/promotion, harmless conflict actions, exact manifest inventory, reopening, version rejection, transactional ingest rollback, decimal cost, and preservation of B1/B2 databases and sidecars. These are supplemental in-process results, not another standard MSTest run.
+- Independently executed **86 targeted synthetic SQL probes: 86 passed / 0 failed** using the existing production SQLite provider with foreign keys enabled and recursive triggers disabled. The matrix covers `INSERT OR REPLACE`, `REPLACE INTO`, `UPDATE`, `UPDATE OR REPLACE`, and UPSERT for both jobs and tasks; incompatible and compatible ownership; unknown job ownership and nonexistent projects; historical and secondary associations; statement rejection and explicit transaction rollback; and discarded conflicting UPSERT inputs.
+- Probes started from a real synthetic V3 ingest and compared persisted physical generations, cursors, records/events, logical identities/keys, aggregates, coverage and source associations across mutations and rollback. Dependent run identity and foreign-key integrity remained intact; reopening retained the accepted logical event and exact cost.
+- All **11 new or modified triggers** were independently tested both missing and replaced by a same-name no-op (**22 manifest probes**). Reopening rejected every alteration and preserved the database; restoring the exact manifest allowed reopening. Source review confirmed manifest validation also occurs inside the write transaction.
+- Tracked-file fingerprints remained unchanged throughout QA before this acceptance-only documentation edit. No production/test changes, restores, installations, delegation, real user database access, V3-2 work, or commit were performed. A redundant full-suite execution was avoided because valid post-fix standard-runner evidence was available.
+
+**Preserved limits.** The accepted B1/B2 identity, recovery, path-security and bounded-read contracts remain supported by the unchanged shared schema and current regression evidence. Producer ID stability, arbitrary semantic exactly-once processing, undetected source rewrites, race-free pathname confinement, power-loss durability and crash-safe external-log delivery remain outside the established guarantees. V3-2 integration and B3/B4 acceptance are not implied.
+
 ## Phase 2 - OpenCode Live Monitoring
 
 **Status: NOT STARTED**

@@ -228,19 +228,27 @@ public sealed class V3LedgerProfileTests
         CollectionAssert.AreEqual(
             new[]
             {
+                "trg_invocations_validation_reviewer_insert",
+                "trg_invocations_validation_reviewer_update",
                 "trg_jobs_project_primary_consistency",
+                "trg_jobs_project_primary_consistency_insert",
                 "trg_jobs_provenance_subject_insert",
                 "trg_jobs_provenance_subject_update",
                 "trg_messages_parent_no_cycle_insert",
                 "trg_messages_parent_no_cycle_update",
                 "trg_provenance_subject_immutable",
+                "trg_provenance_validation_reviewer_insert",
+                "trg_provenance_validation_reviewer_update",
                 "trg_sessions_parent_no_cycle_insert",
                 "trg_sessions_parent_no_cycle_update",
                 "trg_source_delivery_cuts_capture_immutable_update",
                 "trg_source_delivery_cuts_capture_insert",
                 "trg_task_runs_primary_project_insert",
                 "trg_task_runs_primary_project_update",
+                "trg_task_runs_validation_reviewer_insert",
+                "trg_task_runs_validation_reviewer_update",
                 "trg_tasks_project_primary_consistency",
+                "trg_tasks_project_primary_consistency_insert",
                 "trg_usage_provenance_subject_insert",
                 "trg_usage_provenance_subject_update",
                 "trg_validations_reviewer_provenance_insert",
@@ -1856,6 +1864,74 @@ public sealed class V3LedgerProfileTests
                 "SELECT COUNT(*) FROM task_runs WHERE job_id = 'job_owner_a' AND association_role = 'primary' AND is_active = 1;")));
     }
 
+    [DataTestMethod]
+    [DataRow("jobs", "INSERT OR REPLACE")]
+    [DataRow("jobs", "REPLACE")]
+    [DataRow("jobs", "UPDATE")]
+    [DataRow("jobs", "UPSERT")]
+    [DataRow("jobs", "UPDATE OR REPLACE")]
+    [DataRow("tasks", "INSERT OR REPLACE")]
+    [DataRow("tasks", "REPLACE")]
+    [DataRow("tasks", "UPDATE")]
+    [DataRow("tasks", "UPSERT")]
+    [DataRow("tasks", "UPDATE OR REPLACE")]
+    public void PrimaryOwnership_ParentMutationsPreserveOwnershipAndDependents(string table, string mutation)
+    {
+        using (var ledger = CreateLedger()) { }
+        using (var raw = OpenRawConnection(_databasePath))
+        {
+            Execute(raw, "PRAGMA recursive_triggers = OFF;");
+            InsertProject(raw, "owner_a");
+            InsertProject(raw, "owner_b");
+            InsertTask(raw, "owner_task", "owner_a");
+            InsertTask(raw, "spare_task", "owner_b");
+            Execute(raw, $"INSERT INTO jobs(job_id, project_id, created_utc) VALUES ('owner_job', 'owner_a', '{Now}'), ('spare_job', 'owner_b', '{Now}');");
+            Execute(raw, $"INSERT INTO task_runs(run_id,task_id,job_id,status,started_utc) VALUES ('owner_run','owner_task','owner_job','running','{Now}');");
+            Execute(raw, $"INSERT INTO source_generations(generation_id,job_id,source_path,volume_serial,file_index,creation_utc_ticks,first_seen_utc,last_seen_utc) VALUES (1,'owner_job','synthetic.log',1,'1',1,'{Now}','{Now}');");
+            Execute(raw, "INSERT INTO source_cursors(generation_id,committed_offset,version) VALUES (1,10,1);");
+            var idColumn = table == "jobs" ? "job_id" : "task_id";
+            var id = table == "jobs" ? "owner_job" : "owner_task";
+            var spare = table == "jobs" ? "spare_job" : "spare_task";
+            string Insert(string verb, string project) => table == "jobs"
+                ? $"{verb} INTO jobs(job_id,project_id,created_utc) VALUES ('{id}',{project},'{Now}')"
+                : $"{verb} INTO tasks(task_id,project_id,status,created_utc,updated_utc) VALUES ('{id}',{project},'active','{Now}','{Now}')";
+            var invalid = mutation switch
+            {
+                "UPDATE" => $"UPDATE {table} SET project_id='owner_b' WHERE {idColumn}='{id}';",
+                "UPDATE OR REPLACE" => $"UPDATE OR REPLACE {table} SET {idColumn}='{id}' WHERE {idColumn}='{spare}';",
+                "UPSERT" => Insert("INSERT", "'owner_a'") + $" ON CONFLICT({idColumn}) DO UPDATE SET project_id='owner_b';",
+                _ => Insert(mutation, "'owner_b'") + ";"
+            };
+            Execute(raw, "BEGIN IMMEDIATE;");
+            Execute(raw, "UPDATE task_runs SET status='failed' WHERE run_id='owner_run';");
+            AssertSqliteFailureContaining(() => Execute(raw, invalid), "primary task/job project conflict");
+            Assert.AreEqual("owner_a", Scalar(raw, $"SELECT project_id FROM {table} WHERE {idColumn}='{id}';"));
+            Execute(raw, "ROLLBACK;");
+            Assert.AreEqual("running", Scalar(raw, "SELECT status FROM task_runs WHERE run_id='owner_run';"));
+            Assert.AreEqual("owner_job", Scalar(raw, "SELECT job_id FROM source_generations WHERE generation_id=1;"));
+            Assert.AreEqual(10L, Convert.ToInt64(Scalar(raw, "SELECT committed_offset FROM source_cursors WHERE generation_id=1;")));
+            Execute(raw, Insert("INSERT OR REPLACE", "'owner_a'") + ";");
+            Execute(raw, Insert("REPLACE", "'owner_a'") + ";");
+            Execute(raw, $"UPDATE {table} SET project_id=project_id WHERE {idColumn}='{id}';");
+            // Discarded conflicting insert values must not reject a harmless conflict action.
+            Execute(raw, Insert("INSERT", "'owner_b'") + $" ON CONFLICT({idColumn}) DO NOTHING;");
+            Execute(raw, Insert("INSERT", "'owner_b'") + $" ON CONFLICT({idColumn}) DO UPDATE SET project_id='owner_a';");
+            Execute(raw, "UPDATE jobs SET project_id=NULL WHERE job_id='owner_job';");
+            Execute(raw, Insert("INSERT OR REPLACE", table == "jobs" ? "NULL" : "'owner_b'") + ";");
+            Execute(raw, "UPDATE task_runs SET association_role='secondary' WHERE run_id='owner_run';");
+            Execute(raw, "UPDATE jobs SET project_id='owner_a' WHERE job_id='owner_job';");
+            Execute(raw, Insert("REPLACE", "'owner_b'") + ";");
+            Execute(raw, "UPDATE task_runs SET association_role='primary',is_active=0 WHERE run_id='owner_run';");
+            Execute(raw, Insert("REPLACE", "'owner_a'") + ";");
+            Assert.AreEqual(1L, Convert.ToInt64(Scalar(raw, "SELECT COUNT(*) FROM task_runs;")));
+            Assert.AreEqual(1L, Convert.ToInt64(Scalar(raw, "SELECT COUNT(*) FROM source_generations;")));
+            Assert.AreEqual(10L, Convert.ToInt64(Scalar(raw, "SELECT committed_offset FROM source_cursors WHERE generation_id=1;")));
+            Assert.AreEqual(0, QueryStrings(raw, "PRAGMA foreign_key_check;").Count);
+        }
+        using var reopened = CreateLedger();
+        Assert.IsNotNull(reopened.DatabasePath);
+    }
+
     [TestMethod]
     public void DisplayOverrides_RequireTypedScopedTargets()
     {
@@ -2308,6 +2384,254 @@ public sealed class V3LedgerProfileTests
                 $"VALUES ('validation_no_target', 'test', 'worker', 'passed', '{Now}');"),
             "CHECK");
     }
+
+    [TestMethod]
+    public void Validation_VerifiedJobReviewerRejectsRunJobChanges()
+    {
+        using var raw = CreateValidationOwnershipFixture();
+        InsertOwnershipValidation(raw, "verified", "job", verified: true);
+        foreach (var job in new[] { "'job_validation_c'", "NULL" })
+        {
+            AssertSqliteFailureContaining(
+                () => Execute(raw, $"UPDATE task_runs SET job_id = {job} WHERE run_id = 'run_validation_a';"),
+                "validation reviewer provenance mismatch");
+            Assert.AreEqual("job_validation_a", Scalar(raw, "SELECT job_id FROM task_runs WHERE run_id = 'run_validation_a';"));
+        }
+    }
+
+    [TestMethod]
+    public void Validation_VerifiedInvocationReviewerRejectsInvocationMove()
+    {
+        using var raw = CreateValidationOwnershipFixture();
+        InsertOwnershipValidation(raw, "verified", "invocation", verified: true);
+        AssertSqliteFailureContaining(
+            () => Execute(raw, "UPDATE delegation_invocations SET run_id = 'run_validation_b' WHERE invocation_id = 'inv_validation';"),
+            "validation reviewer provenance mismatch");
+        Assert.AreEqual("run_validation_a", Scalar(raw, "SELECT run_id FROM delegation_invocations WHERE invocation_id = 'inv_validation';"));
+    }
+
+    [DataTestMethod]
+    [DataRow("job")]
+    [DataRow("invocation")]
+    public void Validation_PromotionRechecksCurrentReviewerOwnership(string reviewer)
+    {
+        using var raw = CreateValidationOwnershipFixture();
+        InsertOwnershipValidation(raw, "claim", reviewer, verified: false);
+        Execute(raw, reviewer == "job"
+            ? "UPDATE task_runs SET job_id = NULL WHERE run_id = 'run_validation_a';"
+            : "UPDATE delegation_invocations SET run_id = 'run_validation_b' WHERE invocation_id = 'inv_validation';");
+        AssertSqliteFailureContaining(
+            () => Execute(raw, "UPDATE validations SET is_verified = 1 WHERE validation_id = 'claim';"),
+            "validation reviewer provenance mismatch");
+        Assert.AreEqual(0L, Convert.ToInt64(Scalar(raw, "SELECT is_verified FROM validations WHERE validation_id = 'claim';")));
+        Execute(raw, reviewer == "job"
+            ? "UPDATE task_runs SET job_id = 'job_validation_a' WHERE run_id = 'run_validation_a';"
+            : "UPDATE delegation_invocations SET run_id = 'run_validation_a' WHERE invocation_id = 'inv_validation';");
+        Execute(raw, "UPDATE validations SET is_verified = 1 WHERE validation_id = 'claim';");
+        Assert.AreEqual(1L, Convert.ToInt64(Scalar(raw, "SELECT is_verified FROM validations WHERE validation_id = 'claim';")));
+    }
+
+    [DataTestMethod]
+    [DataRow("job")]
+    [DataRow("invocation")]
+    [DataRow("provenance")]
+    [DataRow("provenance_update")]
+    [DataRow("run_update")]
+    [DataRow("invocation_update")]
+    public void Validation_ReplacementCannotBypassReviewerOwnership(string parent)
+    {
+        using var raw = CreateValidationOwnershipFixture();
+        InsertOwnershipValidation(raw, "verified", parent.StartsWith("invocation", StringComparison.Ordinal) ? "invocation" : "job", verified: true);
+        Execute(raw, "INSERT INTO task_runs(run_id, task_id, status, started_utc) " +
+            $"VALUES ('run_validation_spare', 'tsk_validation', 'running', '{Now}');");
+        Execute(raw, "INSERT INTO delegation_invocations(invocation_id, run_id, invocation_index, status, started_utc) " +
+            $"VALUES ('inv_validation_spare', 'run_validation_b', 1, 'running', '{Now}');");
+        var sql = parent switch
+        {
+            "job" => "INSERT OR REPLACE INTO task_runs(run_id, task_id, job_id, status, started_utc) " +
+                $"VALUES ('run_validation_a', 'tsk_validation', NULL, 'running', '{Now}');",
+            "invocation" => "INSERT OR REPLACE INTO delegation_invocations(invocation_id, run_id, invocation_index, status, started_utc) " +
+                $"VALUES ('inv_validation', 'run_validation_b', 0, 'running', '{Now}');",
+            "provenance" => "INSERT OR REPLACE INTO provenance(provenance_id, entity_type, entity_id, job_id, source_kind, observed_utc) " +
+                $"VALUES (1, 'job', 'job_validation_b', 'job_validation_b', 'replacement', '{Now}');",
+            "run_update" => "UPDATE OR REPLACE task_runs SET run_id = 'run_validation_a', job_id = NULL WHERE run_id = 'run_validation_spare';",
+            "invocation_update" => "UPDATE OR REPLACE delegation_invocations SET invocation_id = 'inv_validation' WHERE invocation_id = 'inv_validation_spare';",
+            _ => "UPDATE OR REPLACE provenance SET provenance_id = 1 WHERE provenance_id = 4;"
+        };
+        AssertSqliteFailureContaining(() => Execute(raw, sql), "validation reviewer provenance mismatch");
+        Assert.AreEqual("job_validation_a", Scalar(raw, "SELECT job_id FROM task_runs WHERE run_id = 'run_validation_a';"));
+        Assert.AreEqual("run_validation_a", Scalar(raw, "SELECT run_id FROM delegation_invocations WHERE invocation_id = 'inv_validation';"));
+        Assert.AreEqual("job_validation_a", Scalar(raw, "SELECT job_id FROM provenance WHERE provenance_id = 1;"));
+        Assert.AreEqual(0, QueryStrings(raw, "PRAGMA foreign_key_check;").Count);
+    }
+
+    [TestMethod]
+    public void Validation_CompatibleParentReplacementsAndOwnershipChangesRemainValid()
+    {
+        using var raw = CreateValidationOwnershipFixture();
+        InsertOwnershipValidation(raw, "job_verified", "job", verified: true);
+        InsertOwnershipValidation(raw, "inv_verified", "invocation", verified: true);
+        Execute(raw, "INSERT OR REPLACE INTO task_runs(run_id, task_id, job_id, status, started_utc) " +
+            $"VALUES ('run_validation_a', 'tsk_validation', 'job_validation_a', 'completed', '{Now}');");
+        Execute(raw, "INSERT OR REPLACE INTO delegation_invocations(invocation_id, run_id, invocation_index, status, started_utc) " +
+            $"VALUES ('inv_validation', 'run_validation_a', 0, 'completed', '{Now}');");
+        Execute(raw, "INSERT OR REPLACE INTO provenance(provenance_id, entity_type, entity_id, job_id, source_kind, observed_utc) " +
+            $"VALUES (1, 'job', 'job_validation_a', 'job_validation_a', 'replacement', '{Now}');");
+        Execute(raw, "UPDATE validations SET reviewer_provenance_id = 3 WHERE validation_id = 'job_verified';");
+        Execute(raw, "UPDATE task_runs SET job_id = 'job_validation_c' WHERE run_id = 'run_validation_a';");
+        Execute(raw, "UPDATE task_runs SET job_id = NULL WHERE run_id = 'run_validation_a';");
+        Assert.AreEqual(2L, Convert.ToInt64(Scalar(raw, "SELECT COUNT(*) FROM validations WHERE is_verified = 1;")));
+        Assert.AreEqual(0, QueryStrings(raw, "PRAGMA foreign_key_check;").Count);
+    }
+
+    [DataTestMethod]
+    [DataRow("run")]
+    [DataRow("invocation")]
+    [DataRow("provenance")]
+    public void Validation_ConflictNoOpsAndCompatibleUpsertsRemainValid(string parent)
+    {
+        using var raw = CreateValidationOwnershipFixture();
+        InsertOwnershipValidation(raw, "job_verified", "job", verified: true);
+        InsertOwnershipValidation(raw, "inv_verified", "invocation", verified: true);
+        // The proposed INSERT ownership is discarded on conflict. Validate only
+        // the row that is actually inserted or updated, not the discarded values.
+        var insert = parent switch
+        {
+            "run" => "INSERT INTO task_runs(run_id, task_id, status, started_utc) " +
+                $"VALUES ('run_validation_a', 'tsk_validation', 'completed', '{Now}')",
+            "invocation" => "INSERT INTO delegation_invocations(invocation_id, run_id, invocation_index, status, started_utc) " +
+                $"VALUES ('inv_validation', 'run_validation_b', 0, 'completed', '{Now}')",
+            _ => "INSERT INTO provenance(provenance_id, entity_type, entity_id, job_id, source_kind, observed_utc) " +
+                $"VALUES (1, 'job', 'job_validation_b', 'job_validation_b', 'replacement', '{Now}')"
+        };
+        var key = parent switch { "run" => "run_id", "invocation" => "invocation_id", _ => "provenance_id" };
+        var update = parent == "provenance" ? "source_ref = 'safe-upsert'" : "status = 'completed'";
+        Execute(raw, insert + $" ON CONFLICT({key}) DO NOTHING;");
+        Execute(raw, insert + $" ON CONFLICT({key}) DO UPDATE SET {update};");
+        Assert.AreEqual("job_validation_a", Scalar(raw, "SELECT job_id FROM task_runs WHERE run_id = 'run_validation_a';"));
+        Assert.AreEqual("run_validation_a", Scalar(raw, "SELECT run_id FROM delegation_invocations WHERE invocation_id = 'inv_validation';"));
+        Assert.AreEqual("job_validation_a", Scalar(raw, "SELECT job_id FROM provenance WHERE provenance_id = 1;"));
+        Assert.AreEqual(2L, Convert.ToInt64(Scalar(raw, "SELECT COUNT(*) FROM validations WHERE is_verified = 1;")));
+    }
+
+    [TestMethod]
+    public void Validation_ReferencedEvidenceAndOwnershipChainRejectInvalidMutation()
+    {
+        using var raw = CreateValidationOwnershipFixture();
+        InsertOwnershipValidation(raw, "job_verified", "job", verified: true);
+        InsertOwnershipValidation(raw, "inv_verified", "invocation", verified: true);
+        foreach (var sql in new[]
+                 {
+                     "UPDATE results SET run_id = 'run_validation_b' WHERE result_id = 'result_validation_a';",
+                     "UPDATE execution_evidence SET result_id = 'result_validation_b' WHERE evidence_id = 'evidence_validation_a';",
+                     "DELETE FROM results WHERE result_id = 'result_validation_a';",
+                     "DELETE FROM execution_evidence WHERE evidence_id = 'evidence_validation_a';",
+                     "DELETE FROM task_runs WHERE run_id = 'run_validation_a';",
+                     "DELETE FROM jobs WHERE job_id = 'job_validation_a';",
+                     "DELETE FROM delegation_invocations WHERE invocation_id = 'inv_validation';",
+                     "DELETE FROM provenance WHERE provenance_id = 1;",
+                     "UPDATE task_runs SET run_id = 'renamed' WHERE run_id = 'run_validation_a';",
+                     "UPDATE delegation_invocations SET invocation_id = 'renamed' WHERE invocation_id = 'inv_validation';",
+                     "UPDATE provenance SET provenance_id = 99 WHERE provenance_id = 1;"
+                 })
+        {
+            AssertSqliteFailureContaining(() => Execute(raw, sql), "FOREIGN KEY");
+        }
+        AssertSqliteFailureContaining(
+            () => Execute(raw, "UPDATE provenance SET entity_id = 'job_validation_b', job_id = 'job_validation_b' WHERE provenance_id = 1;"),
+            "provenance subject immutable");
+        AssertSqliteFailureContaining(
+            () => Execute(raw, "UPDATE validations SET evidence_id = NULL, evidence_result_id = NULL WHERE validation_id = 'job_verified';"),
+            "CHECK");
+        AssertSqliteFailureContaining(
+            () => Execute(raw, "UPDATE validations SET evidence_id = 'evidence_validation_b', evidence_result_id = 'result_validation_b' WHERE validation_id = 'job_verified';"),
+            "CHECK");
+        Assert.AreEqual(2L, Convert.ToInt64(Scalar(raw, "SELECT COUNT(*) FROM validations WHERE is_verified = 1;")));
+        Assert.AreEqual(0, QueryStrings(raw, "PRAGMA foreign_key_check;").Count);
+    }
+
+    [TestMethod]
+    public void Validation_CompatibleUpdatesAndExplicitTransactionalReassignmentSurviveReopen()
+    {
+        using (var raw = CreateValidationOwnershipFixture())
+        {
+            InsertOwnershipValidation(raw, "job_verified", "job", verified: true);
+            InsertOwnershipValidation(raw, "inv_verified", "invocation", verified: true);
+            Execute(raw, "UPDATE task_runs SET status = 'completed', job_id = job_id WHERE run_id = 'run_validation_a';");
+            Execute(raw, "UPDATE delegation_invocations SET model = 'synthetic', run_id = run_id WHERE invocation_id = 'inv_validation';");
+            Execute(raw, "UPDATE provenance SET source_ref = 'reviewed-local-evidence' WHERE provenance_id = 1;");
+            Execute(raw, "UPDATE execution_evidence SET summary = 'recorded test output' WHERE evidence_id = 'evidence_validation_a';");
+            Execute(raw, "UPDATE results SET status = 'partial' WHERE result_id = 'result_validation_a';");
+            Execute(raw, "UPDATE validations SET reviewer_provenance_id = 3 WHERE validation_id = 'job_verified';");
+            Execute(raw, "UPDATE validations SET reviewer_provenance_id = 1 WHERE validation_id = 'job_verified';");
+
+            // Immediate constraints require dependent validations to be explicitly retired
+            // before parent reassignment. A failed statement does not roll back a transaction.
+            Execute(raw, "BEGIN;");
+            Execute(raw, "UPDATE task_runs SET status = 'failed' WHERE run_id = 'run_validation_a';");
+            AssertSqliteFailureContaining(
+                () => Execute(raw, "UPDATE task_runs SET job_id = NULL WHERE run_id = 'run_validation_a';"),
+                "validation reviewer provenance mismatch");
+            Execute(raw, "ROLLBACK;");
+            Assert.AreEqual("completed", Scalar(raw, "SELECT status FROM task_runs WHERE run_id = 'run_validation_a';"));
+
+            Execute(raw, "BEGIN;");
+            Execute(raw, "DELETE FROM validations;");
+            Execute(raw, "UPDATE task_runs SET job_id = NULL WHERE run_id = 'run_validation_a';");
+            Execute(raw, "UPDATE delegation_invocations SET run_id = 'run_validation_b' WHERE invocation_id = 'inv_validation';");
+            Execute(raw, "ROLLBACK;");
+            Assert.AreEqual(2L, Convert.ToInt64(Scalar(raw, "SELECT COUNT(*) FROM validations WHERE is_verified = 1;")));
+
+            Execute(raw, "BEGIN;");
+            Execute(raw, "DELETE FROM validations;");
+            Execute(raw, "UPDATE task_runs SET job_id = NULL WHERE run_id = 'run_validation_a';");
+            Execute(raw, "UPDATE delegation_invocations SET run_id = 'run_validation_b' WHERE invocation_id = 'inv_validation';");
+            InsertOwnershipValidation(raw, "moved_invocation", "invocation", verified: true, target: "b");
+            Execute(raw, "COMMIT;");
+            Execute(raw, $"INSERT INTO validations(validation_id, run_id, validation_kind, validation_authority, status, created_utc) VALUES ('worker_claim', 'run_validation_a', 'review', 'worker', 'unknown', '{Now}');");
+        }
+        using var reopened = CreateLedger();
+        using var check = OpenRawConnection(_databasePath);
+        Assert.AreEqual("run_validation_b", Scalar(check, "SELECT result_run_id FROM validations WHERE validation_id = 'moved_invocation';"));
+        Assert.AreEqual(0L, Convert.ToInt64(Scalar(check, "SELECT is_verified FROM validations WHERE validation_id = 'worker_claim';")));
+        Assert.AreEqual(0, QueryStrings(check, "PRAGMA foreign_key_check;").Count);
+    }
+
+    private SqliteConnection CreateValidationOwnershipFixture()
+    {
+        using (var ledger = CreateLedger()) { }
+        var raw = OpenRawConnection(_databasePath);
+        Assert.AreEqual(1L, Convert.ToInt64(Scalar(raw, "PRAGMA foreign_keys;")));
+        InsertProject(raw, "prj_validation");
+        InsertTask(raw, "tsk_validation", "prj_validation");
+        Execute(raw, $"INSERT INTO jobs(job_id, created_utc) VALUES ('job_validation_c', '{Now}');");
+        foreach (var suffix in new[] { "a", "b" })
+        {
+            Execute(raw, $"INSERT INTO jobs(job_id, created_utc) VALUES ('job_validation_{suffix}', '{Now}');");
+            Execute(raw, "INSERT INTO task_runs(run_id, task_id, job_id, status, started_utc) " +
+                $"VALUES ('run_validation_{suffix}', 'tsk_validation', 'job_validation_{suffix}', 'running', '{Now}');");
+            Execute(raw, "INSERT INTO results(result_id, run_id, status, created_utc) " +
+                $"VALUES ('result_validation_{suffix}', 'run_validation_{suffix}', 'passed', '{Now}');");
+            Execute(raw, "INSERT INTO execution_evidence(evidence_id, result_id, evidence_kind, observed_utc) " +
+                $"VALUES ('evidence_validation_{suffix}', 'result_validation_{suffix}', 'test', '{Now}');");
+        }
+        Execute(raw, "INSERT INTO delegation_invocations(invocation_id, run_id, invocation_index, status, started_utc) " +
+            $"VALUES ('inv_validation', 'run_validation_a', 0, 'completed', '{Now}');");
+        Execute(raw, "INSERT INTO provenance(entity_type, entity_id, job_id, source_kind, observed_utc) " +
+            $"VALUES ('job', 'job_validation_a', 'job_validation_a', 'forge', '{Now}');");
+        Execute(raw, "INSERT INTO provenance(entity_type, entity_id, invocation_id, source_kind, observed_utc) " +
+            $"VALUES ('invocation', 'inv_validation', 'inv_validation', 'manual', '{Now}');");
+        Execute(raw, "INSERT INTO provenance(entity_type, entity_id, run_id, source_kind, observed_utc) " +
+            $"VALUES ('run', 'run_validation_a', 'run_validation_a', 'manual', '{Now}');");
+        Execute(raw, "INSERT INTO provenance(entity_type, entity_id, job_id, source_kind, observed_utc) " +
+            $"VALUES ('job', 'job_validation_b', 'job_validation_b', 'forge', '{Now}');");
+        return raw;
+    }
+
+    private static void InsertOwnershipValidation(
+        SqliteConnection raw, string id, string reviewer, bool verified, string target = "a") =>
+        Execute(raw, "INSERT INTO validations(validation_id, result_id, result_run_id, evidence_id, evidence_result_id, reviewer_provenance_id, validation_kind, validation_authority, status, is_verified, created_utc) " +
+            $"VALUES ('{id}', 'result_validation_{target}', 'run_validation_{target}', 'evidence_validation_{target}', 'result_validation_{target}', {(reviewer == "job" ? 1 : 2)}, 'review', 'independent', 'passed', {(verified ? 1 : 0)}, '{Now}');");
 
     private static void InsertAppliedLogicalEvent(
         SqliteConnection connection,
