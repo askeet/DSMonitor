@@ -16,6 +16,13 @@ public static class EventLedgerSchema
 
     /// <summary>B2 projection schema in the separate fresh database.</summary>
     public const int ProjectionVersion = 2;
+
+    /// <summary>
+    /// V3 foundational schema in its own fresh database. The B1 and B2
+    /// databases remain separate and continue to open only at their own
+    /// versions; no migration or runtime cutover is performed here.
+    /// </summary>
+    public const int V3Version = 3;
 }
 
 /// <summary>
@@ -294,6 +301,14 @@ public static class LedgerStoragePaths
     /// <summary>Fixed B2 fresh projection database path.</summary>
     public static string DefaultProjectionDatabasePath =>
         Path.Combine(DefaultDataDirectory, "events-v2.db");
+
+    /// <summary>
+    /// Fixed V3 fresh database path. It is intentionally distinct from the B1
+    /// and B2 paths so those databases and their sidecars are never migrated,
+    /// rewritten, or deleted by this profile.
+    /// </summary>
+    public static string DefaultV3DatabasePath =>
+        Path.Combine(DefaultDataDirectory, "events-v3.db");
 
     public static string FormatTimestamp(DateTimeOffset value) =>
         value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);

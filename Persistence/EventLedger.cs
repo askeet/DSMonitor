@@ -78,6 +78,23 @@ public sealed class EventLedger : IDisposable
             identityReader,
             EventLedgerSchemaProfile.Projection);
 
+    /// <summary>
+    /// Opens the V3 foundational schema in its own fresh database. Existing B1,
+    /// B2, and V3 databases are version-checked and never migrated. This is a
+    /// persistence profile only; the live monitoring pipeline is not cut over.
+    /// </summary>
+    public static EventLedger OpenV3Projection(
+        string databasePath,
+        string? allowedRoot = null,
+        EventLedgerOptions? options = null,
+        LedgerSourceIdentityReader? identityReader = null) =>
+        new(
+            databasePath,
+            allowedRoot,
+            options,
+            identityReader,
+            EventLedgerSchemaProfile.V3);
+
     private EventLedger(
         string databasePath,
         string? allowedRoot,
@@ -1581,6 +1598,1795 @@ public sealed class EventLedger : IDisposable
             )
         };
 
+    // V3 keeps the complete B2 physical, projection, coverage, and aggregate
+    // contract unchanged and adds the foundational tables for projects, tasks,
+    // delegations, OpenCode sessions/messages, evidence, enrichment, usage and
+    // cost attribution, monitoring starts, delivery cuts, and observation
+    // context. Jobs gain a nullable project and bounded safe metadata only.
+    // Every value is stored as bounded text/integers; no raw message, tool,
+    // model, credential, or source content is part of this schema.
+    private static readonly (string Type, string Name, string Table, string Sql)[]
+        V3RequiredSchemaObjects = BuildV3RequiredSchemaObjects();
+
+    private static (string Type, string Name, string Table, string Sql)[]
+        BuildV3RequiredSchemaObjects()
+    {
+        var b2 = ProjectionRequiredSchemaObjects.ToDictionary(
+            item => item.Name,
+            StringComparer.Ordinal);
+
+        return new (string Type, string Name, string Table, string Sql)[]
+        {
+            b2["ledger_meta"],
+            (
+                "table",
+                "projects",
+                "projects",
+                """
+                CREATE TABLE projects (
+                    project_id TEXT NOT NULL PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    description TEXT NULL,
+                    created_utc TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL,
+                    CHECK (typeof(project_id) = 'text' AND length(project_id) BETWEEN 1 AND 200 AND instr(project_id, char(0)) = 0),
+                    CHECK (typeof(display_name) = 'text' AND length(display_name) BETWEEN 1 AND 500 AND instr(display_name, char(0)) = 0),
+                    CHECK (description IS NULL OR (typeof(description) = 'text' AND length(description) <= 4096 AND instr(description, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "table",
+                "project_paths",
+                "project_paths",
+                """
+                CREATE TABLE project_paths (
+                    project_path_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id),
+                    original_path TEXT NOT NULL,
+                    normalized_path TEXT NULL,
+                    path_kind TEXT NOT NULL CHECK (path_kind IN ('root', 'worktree', 'other')),
+                    case_policy TEXT NOT NULL CHECK (case_policy IN ('sensitive', 'insensitive')),
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+                    confirmed_utc TEXT NULL,
+                    alias_of_project_path_id INTEGER NULL,
+                    first_seen_utc TEXT NOT NULL,
+                    last_seen_utc TEXT NOT NULL,
+                    UNIQUE (project_id, original_path),
+                    UNIQUE (project_path_id, project_id),
+                    FOREIGN KEY (alias_of_project_path_id, project_id)
+                        REFERENCES project_paths(project_path_id, project_id),
+                    CHECK (typeof(project_id) = 'text' AND length(project_id) BETWEEN 1 AND 200 AND instr(project_id, char(0)) = 0),
+                    CHECK (typeof(original_path) = 'text' AND length(original_path) BETWEEN 1 AND 4096 AND instr(original_path, char(0)) = 0),
+                    CHECK (normalized_path IS NULL OR (typeof(normalized_path) = 'text' AND length(normalized_path) BETWEEN 1 AND 4096 AND instr(normalized_path, char(0)) = 0)),
+                    CHECK (is_active = 0 OR confirmed_utc IS NOT NULL),
+                    CHECK (confirmed_utc IS NOT NULL OR normalized_path IS NULL),
+                    CHECK (alias_of_project_path_id IS NULL OR alias_of_project_path_id <> project_path_id),
+                    CHECK (confirmed_utc IS NULL OR (
+                        case_policy = 'insensitive'
+                        AND normalized_path IS NOT NULL
+                        AND original_path NOT GLOB '*[^ -~]*'
+                        AND substr(replace(original_path, '/', '\'), 1, 1) GLOB '[A-Za-z]'
+                        AND substr(replace(original_path, '/', '\'), 2, 2) = ':\'
+                        AND normalized_path = lower(replace(original_path, '/', '\'))
+                        AND normalized_path NOT GLOB '*[^ -~]*'
+                        AND (length(normalized_path) = 3 OR normalized_path NOT GLOB '*\')
+                        AND normalized_path NOT GLOB '*\.\*'
+                        AND normalized_path NOT GLOB '*\..\*'
+                        AND normalized_path NOT GLOB '*\.'
+                        AND normalized_path NOT GLOB '*\..'
+                        AND instr(normalized_path, '\\') = 0
+                    ))
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_project_paths_active_owner",
+                "project_paths",
+                """
+                CREATE UNIQUE INDEX ux_project_paths_active_owner
+                    ON project_paths(normalized_path)
+                    WHERE confirmed_utc IS NOT NULL AND alias_of_project_path_id IS NULL
+                """
+            ),
+            (
+                "index",
+                "ix_project_paths_project",
+                "project_paths",
+                """
+                CREATE INDEX ix_project_paths_project ON project_paths(project_id)
+                """
+            ),
+            (
+                "index",
+                "ix_project_paths_normalized",
+                "project_paths",
+                """
+                CREATE INDEX ix_project_paths_normalized ON project_paths(normalized_path)
+                """
+            ),
+            (
+                "index",
+                "ix_project_paths_alias",
+                "project_paths",
+                """
+                CREATE INDEX ix_project_paths_alias ON project_paths(alias_of_project_path_id)
+                """
+            ),
+            (
+                "table",
+                "tasks",
+                "tasks",
+                """
+                CREATE TABLE tasks (
+                    task_id TEXT NOT NULL PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id),
+                    title TEXT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('open', 'active', 'blocked', 'completed', 'failed', 'cancelled', 'unknown')),
+                    created_utc TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL,
+                    CHECK (typeof(task_id) = 'text' AND length(task_id) BETWEEN 1 AND 200 AND instr(task_id, char(0)) = 0),
+                    CHECK (title IS NULL OR (typeof(title) = 'text' AND length(title) <= 1000 AND instr(title, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_tasks_project",
+                "tasks",
+                """
+                CREATE INDEX ix_tasks_project ON tasks(project_id, updated_utc)
+                """
+            ),
+            (
+                "table",
+                "jobs",
+                "jobs",
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT NOT NULL PRIMARY KEY,
+                    created_utc TEXT NOT NULL,
+                    runs_root TEXT NULL,
+                    metadata_path TEXT NULL,
+                    last_seen_utc TEXT NULL,
+                    conflict_detail TEXT NULL,
+                    provisional INTEGER NOT NULL DEFAULT 0,
+                    uncovered_detail TEXT NULL,
+                    project_id TEXT NULL REFERENCES projects(project_id),
+                    display_name TEXT NULL,
+                    metadata_summary TEXT NULL,
+                    reported_directory TEXT NULL,
+                    model TEXT NULL,
+                    started_utc TEXT NULL,
+                    deadline_utc TEXT NULL,
+                    status TEXT NULL,
+                    provenance_id INTEGER NULL REFERENCES provenance(provenance_id),
+                    CHECK (typeof(job_id) = 'text' AND length(job_id) BETWEEN 1 AND 200 AND instr(job_id, char(0)) = 0),
+                    CHECK (provisional IN (0, 1)),
+                    CHECK (display_name IS NULL OR (typeof(display_name) = 'text' AND length(display_name) BETWEEN 1 AND 500 AND instr(display_name, char(0)) = 0)),
+                    CHECK (metadata_summary IS NULL OR (typeof(metadata_summary) = 'text' AND length(metadata_summary) <= 4096 AND instr(metadata_summary, char(0)) = 0)),
+                    CHECK (reported_directory IS NULL OR (typeof(reported_directory) = 'text' AND length(reported_directory) <= 4096 AND instr(reported_directory, char(0)) = 0)),
+                    CHECK (model IS NULL OR length(model) <= 500),
+                    CHECK (status IS NULL OR length(status) <= 100),
+                    CHECK (deadline_utc IS NULL OR started_utc IS NULL OR deadline_utc >= started_utc)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_jobs_project",
+                "jobs",
+                """
+                CREATE INDEX ix_jobs_project ON jobs(project_id)
+                """
+            ),
+            (
+                "index",
+                "ix_jobs_provenance",
+                "jobs",
+                """
+                CREATE INDEX ix_jobs_provenance ON jobs(provenance_id)
+                """
+            ),
+            b2["source_generations"],
+            b2["ix_source_generations_identity"],
+            (
+                "index",
+                "ux_source_generations_id_job",
+                "source_generations",
+                """
+                CREATE UNIQUE INDEX ux_source_generations_id_job
+                    ON source_generations(generation_id, job_id)
+                """
+            ),
+            b2["source_cursors"],
+            (
+                "index",
+                "ux_source_cursors_generation_offset",
+                "source_cursors",
+                """
+                CREATE UNIQUE INDEX ux_source_cursors_generation_offset
+                    ON source_cursors(generation_id, committed_offset)
+                """
+            ),
+            b2["source_records"],
+            b2["ix_source_records_generation"],
+            b2["source_events"],
+            b2["ix_source_events_job"],
+            b2["job_sources"],
+            b2["bootstrap_sources"],
+            b2["ix_bootstrap_sources_job"],
+            b2["source_coverage"],
+            b2["ix_source_coverage_job"],
+            b2["logical_events"],
+            b2["ix_logical_events_job"],
+            b2["ix_logical_events_key"],
+            (
+                "index",
+                "ux_logical_events_id_decision_cost",
+                "logical_events",
+                """
+                CREATE UNIQUE INDEX ux_logical_events_id_decision_cost
+                    ON logical_events(logical_event_id, decision, cost_text)
+                """
+            ),
+            b2["job_logical_keys"],
+            b2["job_aggregates"],
+            b2["job_coverage"],
+            b2["discovery_state"],
+            (
+                "table",
+                "task_runs",
+                "task_runs",
+                """
+                CREATE TABLE task_runs (
+                    run_id TEXT NOT NULL PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                    job_id TEXT NULL REFERENCES jobs(job_id),
+                    association_role TEXT NOT NULL DEFAULT 'primary' CHECK (association_role IN ('primary', 'secondary')),
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+                    retired_utc TEXT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'unknown')),
+                    started_utc TEXT NOT NULL,
+                    ended_utc TEXT NULL,
+                    UNIQUE (run_id, association_role),
+                    CHECK (typeof(run_id) = 'text' AND length(run_id) BETWEEN 1 AND 200 AND instr(run_id, char(0)) = 0),
+                    CHECK (ended_utc IS NULL OR ended_utc >= started_utc),
+                    CHECK (retired_utc IS NULL OR retired_utc >= started_utc),
+                    CHECK (is_active = 0 OR retired_utc IS NULL)
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_task_runs_active_primary",
+                "task_runs",
+                """
+                CREATE UNIQUE INDEX ux_task_runs_active_primary
+                    ON task_runs(job_id)
+                    WHERE job_id IS NOT NULL AND is_active = 1 AND association_role = 'primary'
+                """
+            ),
+            (
+                "index",
+                "ix_task_runs_task",
+                "task_runs",
+                """
+                CREATE INDEX ix_task_runs_task ON task_runs(task_id, started_utc)
+                """
+            ),
+            (
+                "index",
+                "ix_task_runs_job",
+                "task_runs",
+                """
+                CREATE INDEX ix_task_runs_job ON task_runs(job_id, association_role, is_active)
+                """
+            ),
+            (
+                "trigger",
+                "trg_task_runs_primary_project_insert",
+                "task_runs",
+                """
+                CREATE TRIGGER trg_task_runs_primary_project_insert
+                BEFORE INSERT ON task_runs
+                WHEN NEW.association_role = 'primary' AND NEW.is_active = 1 AND NEW.job_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'primary task/job project conflict')
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM tasks t
+                        JOIN jobs j ON j.job_id = NEW.job_id
+                        WHERE t.task_id = NEW.task_id
+                          AND j.project_id IS NOT NULL
+                          AND t.project_id <> j.project_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_task_runs_primary_project_update",
+                "task_runs",
+                """
+                CREATE TRIGGER trg_task_runs_primary_project_update
+                BEFORE UPDATE ON task_runs
+                WHEN NEW.association_role = 'primary' AND NEW.is_active = 1 AND NEW.job_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'primary task/job project conflict')
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM tasks t
+                        JOIN jobs j ON j.job_id = NEW.job_id
+                        WHERE t.task_id = NEW.task_id
+                          AND j.project_id IS NOT NULL
+                          AND t.project_id <> j.project_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_jobs_project_primary_consistency",
+                "jobs",
+                """
+                CREATE TRIGGER trg_jobs_project_primary_consistency
+                BEFORE UPDATE OF project_id ON jobs
+                WHEN NEW.project_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'primary task/job project conflict')
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM task_runs r
+                        JOIN tasks t ON t.task_id = r.task_id
+                        WHERE r.job_id = NEW.job_id
+                          AND r.association_role = 'primary'
+                          AND r.is_active = 1
+                          AND t.project_id <> NEW.project_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_tasks_project_primary_consistency",
+                "tasks",
+                """
+                CREATE TRIGGER trg_tasks_project_primary_consistency
+                BEFORE UPDATE OF project_id ON tasks
+                WHEN NEW.project_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'primary task/job project conflict')
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM task_runs r
+                        JOIN jobs j ON j.job_id = r.job_id
+                        WHERE r.task_id = NEW.task_id
+                          AND r.association_role = 'primary'
+                          AND r.is_active = 1
+                          AND j.project_id IS NOT NULL
+                          AND j.project_id <> NEW.project_id
+                    );
+                END
+                """
+            ),
+            (
+                "table",
+                "delegation_invocations",
+                "delegation_invocations",
+                """
+                CREATE TABLE delegation_invocations (
+                    invocation_id TEXT NOT NULL PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES task_runs(run_id),
+                    invocation_index INTEGER NOT NULL CHECK (invocation_index >= 0),
+                    provider TEXT NULL,
+                    model TEXT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'unknown')),
+                    started_utc TEXT NOT NULL,
+                    completed_utc TEXT NULL,
+                    UNIQUE (run_id, invocation_index),
+                    CHECK (typeof(invocation_id) = 'text' AND length(invocation_id) BETWEEN 1 AND 200 AND instr(invocation_id, char(0)) = 0),
+                    CHECK (completed_utc IS NULL OR completed_utc >= started_utc)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_delegation_invocations_run",
+                "delegation_invocations",
+                """
+                CREATE INDEX ix_delegation_invocations_run
+                    ON delegation_invocations(run_id, invocation_index)
+                """
+            ),
+            (
+                "index",
+                "ux_delegation_invocations_id_run",
+                "delegation_invocations",
+                """
+                CREATE UNIQUE INDEX ux_delegation_invocations_id_run
+                    ON delegation_invocations(invocation_id, run_id)
+                """
+            ),
+            (
+                "table",
+                "invocation_jobs",
+                "invocation_jobs",
+                """
+                CREATE TABLE invocation_jobs (
+                    invocation_id TEXT NOT NULL REFERENCES delegation_invocations(invocation_id),
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    role TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary', 'secondary', 'retry')),
+                    PRIMARY KEY (invocation_id, job_id)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_invocation_jobs_job",
+                "invocation_jobs",
+                """
+                CREATE INDEX ix_invocation_jobs_job ON invocation_jobs(job_id)
+                """
+            ),
+            (
+                "table",
+                "external_references",
+                "external_references",
+                """
+                CREATE TABLE external_references (
+                    reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NULL REFERENCES task_runs(run_id),
+                    invocation_id TEXT NULL,
+                    invocation_run_id TEXT NULL,
+                    reference_kind TEXT NOT NULL CHECK (reference_kind IN ('issue', 'pull_request', 'commit', 'document', 'other')),
+                    source_system TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    url TEXT NULL,
+                    created_utc TEXT NOT NULL,
+                    FOREIGN KEY (invocation_id, invocation_run_id)
+                        REFERENCES delegation_invocations(invocation_id, run_id),
+                    CHECK (run_id IS NOT NULL OR invocation_id IS NOT NULL),
+                    CHECK ((invocation_id IS NULL AND invocation_run_id IS NULL)
+                        OR (invocation_id IS NOT NULL AND invocation_run_id IS NOT NULL)),
+                    CHECK (invocation_id IS NULL OR run_id IS NULL OR run_id = invocation_run_id),
+                    CHECK (typeof(source_system) = 'text' AND length(source_system) BETWEEN 1 AND 100 AND instr(source_system, char(0)) = 0),
+                    CHECK (typeof(external_id) = 'text' AND length(external_id) BETWEEN 1 AND 2048 AND instr(external_id, char(0)) = 0),
+                    CHECK (url IS NULL OR (typeof(url) = 'text' AND length(url) <= 4096 AND instr(url, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_external_references_namespace",
+                "external_references",
+                """
+                CREATE UNIQUE INDEX ux_external_references_namespace
+                    ON external_references(
+                        source_system,
+                        reference_kind,
+                        external_id,
+                        COALESCE(run_id, ''),
+                        COALESCE(invocation_id, ''))
+                """
+            ),
+            (
+                "index",
+                "ix_external_references_run",
+                "external_references",
+                """
+                CREATE INDEX ix_external_references_run ON external_references(run_id)
+                """
+            ),
+            (
+                "index",
+                "ix_external_references_invocation",
+                "external_references",
+                """
+                CREATE INDEX ix_external_references_invocation ON external_references(invocation_id)
+                """
+            ),
+            (
+                "table",
+                "opencode_sessions",
+                "opencode_sessions",
+                """
+                CREATE TABLE opencode_sessions (
+                    source_instance_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    project_id TEXT NULL REFERENCES projects(project_id),
+                    parent_session_id TEXT NULL,
+                    title TEXT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('active', 'idle', 'completed', 'failed', 'unknown')),
+                    started_utc TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL,
+                    ended_utc TEXT NULL,
+                    PRIMARY KEY (source_instance_id, session_id),
+                    FOREIGN KEY (source_instance_id, parent_session_id)
+                        REFERENCES opencode_sessions(source_instance_id, session_id),
+                    CHECK (length(source_instance_id) BETWEEN 1 AND 200),
+                    CHECK (length(session_id) BETWEEN 1 AND 200),
+                    CHECK (title IS NULL OR length(title) <= 1000),
+                    CHECK (ended_utc IS NULL OR ended_utc >= started_utc),
+                    CHECK (parent_session_id IS NULL OR parent_session_id <> session_id)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_opencode_sessions_project",
+                "opencode_sessions",
+                """
+                CREATE INDEX ix_opencode_sessions_project
+                    ON opencode_sessions(project_id, updated_utc)
+                """
+            ),
+            (
+                "index",
+                "ix_opencode_sessions_parent",
+                "opencode_sessions",
+                """
+                CREATE INDEX ix_opencode_sessions_parent
+                    ON opencode_sessions(source_instance_id, parent_session_id)
+                """
+            ),
+            (
+                "table",
+                "messages",
+                "messages",
+                """
+                CREATE TABLE messages (
+                    source_instance_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'idle', 'agent-switched')),
+                    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                    parent_message_id TEXT NULL,
+                    created_utc TEXT NOT NULL,
+                    summary TEXT NULL,
+                    PRIMARY KEY (source_instance_id, session_id, message_id),
+                    FOREIGN KEY (source_instance_id, session_id)
+                        REFERENCES opencode_sessions(source_instance_id, session_id),
+                    FOREIGN KEY (source_instance_id, session_id, parent_message_id)
+                        REFERENCES messages(source_instance_id, session_id, message_id),
+                    UNIQUE (source_instance_id, session_id, sequence),
+                    CHECK (parent_message_id IS NULL OR parent_message_id <> message_id),
+                    CHECK (length(message_id) BETWEEN 1 AND 200),
+                    CHECK (summary IS NULL OR length(summary) <= 4096)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_messages_parent",
+                "messages",
+                """
+                CREATE INDEX ix_messages_parent
+                    ON messages(source_instance_id, session_id, parent_message_id)
+                """
+            ),
+            (
+                "index",
+                "ix_messages_session",
+                "messages",
+                """
+                CREATE INDEX ix_messages_session
+                    ON messages(source_instance_id, session_id, sequence)
+                """
+            ),
+            (
+                "trigger",
+                "trg_messages_parent_no_cycle_insert",
+                "messages",
+                """
+                CREATE TRIGGER trg_messages_parent_no_cycle_insert
+                BEFORE INSERT ON messages
+                WHEN NEW.parent_message_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'message parent cycle')
+                    WHERE EXISTS (
+                        WITH RECURSIVE ancestors(source_instance_id, session_id, message_id, parent_message_id) AS (
+                            SELECT source_instance_id, session_id, message_id, parent_message_id
+                            FROM messages
+                            WHERE source_instance_id = NEW.source_instance_id
+                              AND session_id = NEW.session_id
+                              AND message_id = NEW.parent_message_id
+                            UNION
+                            SELECT m.source_instance_id, m.session_id, m.message_id, m.parent_message_id
+                            FROM messages m
+                            JOIN ancestors a
+                              ON m.source_instance_id = a.source_instance_id
+                             AND m.session_id = a.session_id
+                             AND m.message_id = a.parent_message_id
+                        )
+                        SELECT 1 FROM ancestors WHERE message_id = NEW.message_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_messages_parent_no_cycle_update",
+                "messages",
+                """
+                CREATE TRIGGER trg_messages_parent_no_cycle_update
+                BEFORE UPDATE OF parent_message_id ON messages
+                WHEN NEW.parent_message_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'message parent cycle')
+                    WHERE EXISTS (
+                        WITH RECURSIVE ancestors(source_instance_id, session_id, message_id, parent_message_id) AS (
+                            SELECT source_instance_id, session_id, message_id, parent_message_id
+                            FROM messages
+                            WHERE source_instance_id = NEW.source_instance_id
+                              AND session_id = NEW.session_id
+                              AND message_id = NEW.parent_message_id
+                            UNION
+                            SELECT m.source_instance_id, m.session_id, m.message_id, m.parent_message_id
+                            FROM messages m
+                            JOIN ancestors a
+                              ON m.source_instance_id = a.source_instance_id
+                             AND m.session_id = a.session_id
+                             AND m.message_id = a.parent_message_id
+                        )
+                        SELECT 1 FROM ancestors WHERE message_id = NEW.message_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_sessions_parent_no_cycle_insert",
+                "opencode_sessions",
+                """
+                CREATE TRIGGER trg_sessions_parent_no_cycle_insert
+                BEFORE INSERT ON opencode_sessions
+                WHEN NEW.parent_session_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'session parent cycle')
+                    WHERE EXISTS (
+                        WITH RECURSIVE ancestors(source_instance_id, session_id, parent_session_id) AS (
+                            SELECT source_instance_id, session_id, parent_session_id
+                            FROM opencode_sessions
+                            WHERE source_instance_id = NEW.source_instance_id
+                              AND session_id = NEW.parent_session_id
+                            UNION
+                            SELECT s.source_instance_id, s.session_id, s.parent_session_id
+                            FROM opencode_sessions s
+                            JOIN ancestors a
+                              ON s.source_instance_id = a.source_instance_id
+                             AND s.session_id = a.parent_session_id
+                        )
+                        SELECT 1 FROM ancestors WHERE session_id = NEW.session_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_sessions_parent_no_cycle_update",
+                "opencode_sessions",
+                """
+                CREATE TRIGGER trg_sessions_parent_no_cycle_update
+                BEFORE UPDATE OF parent_session_id ON opencode_sessions
+                WHEN NEW.parent_session_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'session parent cycle')
+                    WHERE EXISTS (
+                        WITH RECURSIVE ancestors(source_instance_id, session_id, parent_session_id) AS (
+                            SELECT source_instance_id, session_id, parent_session_id
+                            FROM opencode_sessions
+                            WHERE source_instance_id = NEW.source_instance_id
+                              AND session_id = NEW.parent_session_id
+                            UNION
+                            SELECT s.source_instance_id, s.session_id, s.parent_session_id
+                            FROM opencode_sessions s
+                            JOIN ancestors a
+                              ON s.source_instance_id = a.source_instance_id
+                             AND s.session_id = a.parent_session_id
+                        )
+                        SELECT 1 FROM ancestors WHERE session_id = NEW.session_id
+                    );
+                END
+                """
+            ),
+            (
+                "table",
+                "execution_segments",
+                "execution_segments",
+                """
+                CREATE TABLE execution_segments (
+                    source_instance_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NULL REFERENCES task_runs(run_id),
+                    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'cancelled', 'unknown')),
+                    started_utc TEXT NOT NULL,
+                    ended_utc TEXT NULL,
+                    PRIMARY KEY (source_instance_id, segment_id),
+                    FOREIGN KEY (source_instance_id, session_id)
+                        REFERENCES opencode_sessions(source_instance_id, session_id),
+                    UNIQUE (source_instance_id, segment_id, session_id),
+                    UNIQUE (source_instance_id, segment_id, run_id),
+                    CHECK (length(segment_id) BETWEEN 1 AND 200),
+                    CHECK (ended_utc IS NULL OR ended_utc >= started_utc)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_execution_segments_session",
+                "execution_segments",
+                """
+                CREATE INDEX ix_execution_segments_session
+                    ON execution_segments(source_instance_id, session_id, started_utc)
+                """
+            ),
+            (
+                "index",
+                "ix_execution_segments_run",
+                "execution_segments",
+                """
+                CREATE INDEX ix_execution_segments_run ON execution_segments(run_id)
+                """
+            ),
+            (
+                "table",
+                "segment_messages",
+                "segment_messages",
+                """
+                CREATE TABLE segment_messages (
+                    source_instance_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    position INTEGER NOT NULL CHECK (position >= 0),
+                    PRIMARY KEY (source_instance_id, segment_id, position),
+                    UNIQUE (source_instance_id, segment_id, message_id),
+                    FOREIGN KEY (source_instance_id, segment_id, session_id)
+                        REFERENCES execution_segments(source_instance_id, segment_id, session_id),
+                    FOREIGN KEY (source_instance_id, session_id, message_id)
+                        REFERENCES messages(source_instance_id, session_id, message_id)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_segment_messages_message",
+                "segment_messages",
+                """
+                CREATE INDEX ix_segment_messages_message
+                    ON segment_messages(source_instance_id, session_id, message_id)
+                """
+            ),
+            (
+                "index",
+                "ix_segment_messages_session",
+                "segment_messages",
+                """
+                CREATE INDEX ix_segment_messages_session
+                    ON segment_messages(source_instance_id, session_id)
+                """
+            ),
+            (
+                "table",
+                "run_segments",
+                "run_segments",
+                """
+                CREATE TABLE run_segments (
+                    run_id TEXT NOT NULL REFERENCES task_runs(run_id),
+                    source_instance_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    position INTEGER NOT NULL CHECK (position >= 0),
+                    PRIMARY KEY (run_id, source_instance_id, segment_id),
+                    UNIQUE (run_id, position),
+                    FOREIGN KEY (source_instance_id, segment_id, run_id)
+                        REFERENCES execution_segments(source_instance_id, segment_id, run_id)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_run_segments_segment",
+                "run_segments",
+                """
+                CREATE INDEX ix_run_segments_segment
+                    ON run_segments(source_instance_id, segment_id)
+                """
+            ),
+            (
+                "table",
+                "content_items",
+                "content_items",
+                """
+                CREATE TABLE content_items (
+                    content_id TEXT NOT NULL PRIMARY KEY,
+                    source_instance_id TEXT NOT NULL,
+                    message_id TEXT NULL,
+                    session_id TEXT NULL,
+                    segment_id TEXT NULL,
+                    content_kind TEXT NOT NULL CHECK (content_kind IN ('text', 'reasoning', 'tool_call', 'tool_result', 'file', 'image', 'other')),
+                    summary TEXT NULL,
+                    content_sha256 TEXT NULL,
+                    byte_length INTEGER NULL CHECK (byte_length >= 0),
+                    created_utc TEXT NOT NULL,
+                    FOREIGN KEY (source_instance_id, session_id, message_id)
+                        REFERENCES messages(source_instance_id, session_id, message_id),
+                    FOREIGN KEY (source_instance_id, segment_id, session_id)
+                        REFERENCES execution_segments(source_instance_id, segment_id, session_id),
+                    FOREIGN KEY (source_instance_id, segment_id, message_id)
+                        REFERENCES segment_messages(source_instance_id, segment_id, message_id),
+                    CHECK (message_id IS NULL OR session_id IS NOT NULL),
+                    CHECK (segment_id IS NULL OR session_id IS NOT NULL),
+                    CHECK (message_id IS NOT NULL OR segment_id IS NOT NULL),
+                    CHECK (typeof(content_id) = 'text' AND length(content_id) BETWEEN 1 AND 200 AND instr(content_id, char(0)) = 0),
+                    CHECK (typeof(source_instance_id) = 'text' AND length(source_instance_id) BETWEEN 1 AND 200 AND instr(source_instance_id, char(0)) = 0),
+                    CHECK (summary IS NULL OR (typeof(summary) = 'text' AND length(summary) <= 8192 AND instr(summary, char(0)) = 0)),
+                    CHECK (content_sha256 IS NULL OR (typeof(content_sha256) = 'text' AND length(content_sha256) = 64 AND content_sha256 GLOB '[0-9a-fA-F]*' AND instr(content_sha256, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_content_items_message",
+                "content_items",
+                """
+                CREATE INDEX ix_content_items_message
+                    ON content_items(source_instance_id, session_id, message_id)
+                """
+            ),
+            (
+                "index",
+                "ix_content_items_segment",
+                "content_items",
+                """
+                CREATE INDEX ix_content_items_segment
+                    ON content_items(source_instance_id, segment_id)
+                """
+            ),
+            (
+                "index",
+                "ix_content_items_kind",
+                "content_items",
+                """
+                CREATE INDEX ix_content_items_kind ON content_items(content_kind)
+                """
+            ),
+            (
+                "table",
+                "results",
+                "results",
+                """
+                CREATE TABLE results (
+                    result_id TEXT NOT NULL PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES task_runs(run_id),
+                    invocation_id TEXT NULL,
+                    invocation_run_id TEXT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('passed', 'failed', 'partial', 'skipped', 'unknown')),
+                    summary TEXT NULL,
+                    created_utc TEXT NOT NULL,
+                    FOREIGN KEY (invocation_id, invocation_run_id)
+                        REFERENCES delegation_invocations(invocation_id, run_id),
+                    CHECK ((invocation_id IS NULL AND invocation_run_id IS NULL)
+                        OR (invocation_id IS NOT NULL AND invocation_run_id IS NOT NULL)),
+                    CHECK (invocation_id IS NULL OR invocation_run_id = run_id),
+                    CHECK (typeof(result_id) = 'text' AND length(result_id) BETWEEN 1 AND 200 AND instr(result_id, char(0)) = 0),
+                    CHECK (summary IS NULL OR (typeof(summary) = 'text' AND length(summary) <= 8192 AND instr(summary, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_results_id_run",
+                "results",
+                """
+                CREATE UNIQUE INDEX ux_results_id_run ON results(result_id, run_id)
+                """
+            ),
+            (
+                "index",
+                "ix_results_run",
+                "results",
+                """
+                CREATE INDEX ix_results_run ON results(run_id)
+                """
+            ),
+            (
+                "index",
+                "ix_results_invocation",
+                "results",
+                """
+                CREATE INDEX ix_results_invocation ON results(invocation_id)
+                """
+            ),
+            (
+                "table",
+                "execution_evidence",
+                "execution_evidence",
+                """
+                CREATE TABLE execution_evidence (
+                    evidence_id TEXT NOT NULL PRIMARY KEY,
+                    result_id TEXT NOT NULL REFERENCES results(result_id),
+                    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN ('log', 'test', 'file', 'command', 'url', 'other')),
+                    summary TEXT NULL,
+                    uri TEXT NULL,
+                    observed_utc TEXT NOT NULL,
+                    CHECK (typeof(evidence_id) = 'text' AND length(evidence_id) BETWEEN 1 AND 200 AND instr(evidence_id, char(0)) = 0),
+                    CHECK (summary IS NULL OR (typeof(summary) = 'text' AND length(summary) <= 8192 AND instr(summary, char(0)) = 0)),
+                    CHECK (uri IS NULL OR length(uri) <= 4096)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_execution_evidence_result",
+                "execution_evidence",
+                """
+                CREATE INDEX ix_execution_evidence_result ON execution_evidence(result_id)
+                """
+            ),
+            (
+                "index",
+                "ix_execution_evidence_kind",
+                "execution_evidence",
+                """
+                CREATE INDEX ix_execution_evidence_kind ON execution_evidence(evidence_kind)
+                """
+            ),
+            (
+                "index",
+                "ux_execution_evidence_id_result",
+                "execution_evidence",
+                """
+                CREATE UNIQUE INDEX ux_execution_evidence_id_result
+                    ON execution_evidence(evidence_id, result_id)
+                """
+            ),
+            (
+                "table",
+                "validations",
+                "validations",
+                """
+                CREATE TABLE validations (
+                    validation_id TEXT NOT NULL PRIMARY KEY,
+                    result_id TEXT NULL,
+                    result_run_id TEXT NULL,
+                    run_id TEXT NULL REFERENCES task_runs(run_id),
+                    validation_kind TEXT NOT NULL CHECK (validation_kind IN ('test', 'build', 'lint', 'review', 'other')),
+                    validation_authority TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK (validation_authority IN ('worker', 'independent', 'user_acceptance', 'unknown')),
+                    status TEXT NOT NULL CHECK (status IN ('passed', 'failed', 'skipped', 'error', 'unknown')),
+                    evidence_id TEXT NULL,
+                    evidence_result_id TEXT NULL,
+                    reviewer_provenance_id INTEGER NULL REFERENCES provenance(provenance_id),
+                    is_verified INTEGER NOT NULL DEFAULT 0 CHECK (is_verified IN (0, 1)),
+                    detail TEXT NULL,
+                    executed_utc TEXT NULL,
+                    created_utc TEXT NOT NULL,
+                    FOREIGN KEY (result_id, result_run_id)
+                        REFERENCES results(result_id, run_id),
+                    FOREIGN KEY (evidence_id, evidence_result_id)
+                        REFERENCES execution_evidence(evidence_id, result_id),
+                    CHECK (result_id IS NOT NULL OR run_id IS NOT NULL),
+                    CHECK ((result_id IS NULL AND result_run_id IS NULL)
+                        OR (result_id IS NOT NULL AND result_run_id IS NOT NULL)),
+                    CHECK (result_id IS NULL OR run_id IS NULL OR run_id = result_run_id),
+                    CHECK ((evidence_id IS NULL AND evidence_result_id IS NULL)
+                        OR (evidence_id IS NOT NULL AND evidence_result_id IS NOT NULL)),
+                    CHECK (evidence_id IS NULL OR result_id IS NOT NULL),
+                    CHECK (evidence_result_id IS NULL OR result_id IS NULL OR evidence_result_id = result_id),
+                    CHECK (is_verified = 0 OR evidence_id IS NOT NULL),
+                    CHECK (is_verified = 0 OR validation_authority IN ('independent', 'user_acceptance')),
+                    CHECK (typeof(validation_id) = 'text' AND length(validation_id) BETWEEN 1 AND 200 AND instr(validation_id, char(0)) = 0),
+                    CHECK (detail IS NULL OR (typeof(detail) = 'text' AND length(detail) <= 8192 AND instr(detail, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_validations_result",
+                "validations",
+                """
+                CREATE INDEX ix_validations_result ON validations(result_id)
+                """
+            ),
+            (
+                "index",
+                "ix_validations_run",
+                "validations",
+                """
+                CREATE INDEX ix_validations_run ON validations(run_id, created_utc)
+                """
+            ),
+            (
+                "index",
+                "ix_validations_status",
+                "validations",
+                """
+                CREATE INDEX ix_validations_status ON validations(status)
+                """
+            ),
+            (
+                "trigger",
+                "trg_validations_reviewer_provenance_insert",
+                "validations",
+                """
+                CREATE TRIGGER trg_validations_reviewer_provenance_insert
+                BEFORE INSERT ON validations
+                WHEN NEW.reviewer_provenance_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM provenance p
+                        WHERE p.provenance_id = NEW.reviewer_provenance_id
+                          AND (
+                            (p.entity_type = 'result' AND p.result_id IS NOT NULL AND p.result_id IS NEW.result_id)
+                            OR (p.entity_type = 'run' AND p.run_id IS NOT NULL AND p.run_id IS COALESCE(NEW.run_id, NEW.result_run_id))
+                            OR (p.entity_type = 'job' AND p.job_id IS NOT NULL AND p.job_id IS (
+                                SELECT r.job_id FROM task_runs r
+                                WHERE r.run_id IS COALESCE(NEW.run_id, NEW.result_run_id)))
+                            OR (p.entity_type = 'invocation' AND p.invocation_id IS NOT NULL AND EXISTS (
+                                SELECT 1 FROM delegation_invocations di
+                                WHERE di.invocation_id IS p.invocation_id
+                                  AND di.run_id IS COALESCE(NEW.run_id, NEW.result_run_id)))
+                          )
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_validations_reviewer_provenance_update",
+                "validations",
+                """
+                CREATE TRIGGER trg_validations_reviewer_provenance_update
+                BEFORE UPDATE OF reviewer_provenance_id, result_id, result_run_id, run_id ON validations
+                WHEN NEW.reviewer_provenance_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation reviewer provenance mismatch')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM provenance p
+                        WHERE p.provenance_id = NEW.reviewer_provenance_id
+                          AND (
+                            (p.entity_type = 'result' AND p.result_id IS NOT NULL AND p.result_id IS NEW.result_id)
+                            OR (p.entity_type = 'run' AND p.run_id IS NOT NULL AND p.run_id IS COALESCE(NEW.run_id, NEW.result_run_id))
+                            OR (p.entity_type = 'job' AND p.job_id IS NOT NULL AND p.job_id IS (
+                                SELECT r.job_id FROM task_runs r
+                                WHERE r.run_id IS COALESCE(NEW.run_id, NEW.result_run_id)))
+                            OR (p.entity_type = 'invocation' AND p.invocation_id IS NOT NULL AND EXISTS (
+                                SELECT 1 FROM delegation_invocations di
+                                WHERE di.invocation_id IS p.invocation_id
+                                  AND di.run_id IS COALESCE(NEW.run_id, NEW.result_run_id)))
+                          )
+                    );
+                END
+                """
+            ),
+            (
+                "table",
+                "display_overrides",
+                "display_overrides",
+                """
+                CREATE TABLE display_overrides (
+                    override_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NULL REFERENCES projects(project_id),
+                    task_id TEXT NULL REFERENCES tasks(task_id),
+                    run_id TEXT NULL REFERENCES task_runs(run_id),
+                    invocation_id TEXT NULL REFERENCES delegation_invocations(invocation_id),
+                    source_instance_id TEXT NULL,
+                    session_id TEXT NULL,
+                    display_name TEXT NULL,
+                    hidden INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1)),
+                    updated_utc TEXT NOT NULL,
+                    FOREIGN KEY (source_instance_id, session_id)
+                        REFERENCES opencode_sessions(source_instance_id, session_id),
+                    CHECK (
+                        (project_id IS NOT NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL)
+                        OR (project_id IS NULL AND task_id IS NOT NULL AND run_id IS NULL AND invocation_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL)
+                        OR (project_id IS NULL AND task_id IS NULL AND run_id IS NOT NULL AND invocation_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL)
+                        OR (project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NOT NULL AND source_instance_id IS NULL AND session_id IS NULL)
+                        OR (project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND source_instance_id IS NOT NULL AND session_id IS NOT NULL)),
+                    CHECK (display_name IS NULL OR (typeof(display_name) = 'text' AND length(display_name) BETWEEN 1 AND 500 AND instr(display_name, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_display_overrides_project",
+                "display_overrides",
+                """
+                CREATE UNIQUE INDEX ux_display_overrides_project
+                    ON display_overrides(project_id)
+                    WHERE project_id IS NOT NULL
+                """
+            ),
+            (
+                "index",
+                "ux_display_overrides_task",
+                "display_overrides",
+                """
+                CREATE UNIQUE INDEX ux_display_overrides_task
+                    ON display_overrides(task_id)
+                    WHERE task_id IS NOT NULL
+                """
+            ),
+            (
+                "index",
+                "ux_display_overrides_run",
+                "display_overrides",
+                """
+                CREATE UNIQUE INDEX ux_display_overrides_run
+                    ON display_overrides(run_id)
+                    WHERE run_id IS NOT NULL
+                """
+            ),
+            (
+                "index",
+                "ux_display_overrides_invocation",
+                "display_overrides",
+                """
+                CREATE UNIQUE INDEX ux_display_overrides_invocation
+                    ON display_overrides(invocation_id)
+                    WHERE invocation_id IS NOT NULL
+                """
+            ),
+            (
+                "index",
+                "ux_display_overrides_session",
+                "display_overrides",
+                """
+                CREATE UNIQUE INDEX ux_display_overrides_session
+                    ON display_overrides(source_instance_id, session_id)
+                    WHERE session_id IS NOT NULL
+                """
+            ),
+            (
+                "table",
+                "enrichment_imports",
+                "enrichment_imports",
+                """
+                CREATE TABLE enrichment_imports (
+                    import_id TEXT NOT NULL PRIMARY KEY,
+                    source_kind TEXT NOT NULL CHECK (source_kind IN ('forge', 'opencode', 'manual', 'other')),
+                    source_path TEXT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    imported_utc TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'applied', 'failed', 'unknown')),
+                    UNIQUE (source_kind, content_sha256),
+                    CHECK (typeof(import_id) = 'text' AND length(import_id) BETWEEN 1 AND 200 AND instr(import_id, char(0)) = 0),
+                    CHECK (typeof(content_sha256) = 'text' AND length(content_sha256) = 64 AND content_sha256 GLOB '[0-9a-fA-F]*' AND instr(content_sha256, char(0)) = 0),
+                    CHECK (source_path IS NULL OR length(source_path) <= 4096)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_enrichment_imports_imported",
+                "enrichment_imports",
+                """
+                CREATE INDEX ix_enrichment_imports_imported ON enrichment_imports(imported_utc)
+                """
+            ),
+            (
+                "index",
+                "ux_enrichment_imports_id_status",
+                "enrichment_imports",
+                """
+                CREATE UNIQUE INDEX ux_enrichment_imports_id_status
+                    ON enrichment_imports(import_id, status)
+                """
+            ),
+            (
+                "table",
+                "provenance",
+                "provenance",
+                """
+                CREATE TABLE provenance (
+                    provenance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_type TEXT NOT NULL CHECK (entity_type IN ('project', 'task', 'run', 'invocation', 'session', 'message', 'result', 'job', 'usage', 'logical_event')),
+                    entity_id TEXT NOT NULL,
+                    project_id TEXT NULL REFERENCES projects(project_id),
+                    task_id TEXT NULL REFERENCES tasks(task_id),
+                    run_id TEXT NULL REFERENCES task_runs(run_id),
+                    invocation_id TEXT NULL REFERENCES delegation_invocations(invocation_id),
+                    job_id TEXT NULL REFERENCES jobs(job_id),
+                    usage_id TEXT NULL REFERENCES usage_observations(usage_id),
+                    logical_event_id INTEGER NULL REFERENCES logical_events(logical_event_id),
+                    result_id TEXT NULL REFERENCES results(result_id),
+                    source_instance_id TEXT NULL,
+                    session_id TEXT NULL,
+                    message_id TEXT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_ref TEXT NULL,
+                    import_id TEXT NULL REFERENCES enrichment_imports(import_id),
+                    observed_utc TEXT NOT NULL,
+                    FOREIGN KEY (source_instance_id, session_id)
+                        REFERENCES opencode_sessions(source_instance_id, session_id),
+                    FOREIGN KEY (source_instance_id, session_id, message_id)
+                        REFERENCES messages(source_instance_id, session_id, message_id),
+                    CHECK (typeof(entity_id) = 'text' AND length(entity_id) BETWEEN 1 AND 200 AND instr(entity_id, char(0)) = 0),
+                    CHECK (typeof(source_kind) = 'text' AND length(source_kind) BETWEEN 1 AND 100 AND instr(source_kind, char(0)) = 0),
+                    CHECK (source_ref IS NULL OR (typeof(source_ref) = 'text' AND length(source_ref) <= 2048 AND instr(source_ref, char(0)) = 0)),
+                    CHECK (
+                        (entity_type = 'project' AND project_id IS NOT NULL AND project_id IS entity_id AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'task' AND task_id IS NOT NULL AND task_id IS entity_id AND project_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'run' AND run_id IS NOT NULL AND run_id IS entity_id AND project_id IS NULL AND task_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'invocation' AND invocation_id IS NOT NULL AND invocation_id IS entity_id AND project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'job' AND job_id IS NOT NULL AND job_id IS entity_id AND project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'usage' AND usage_id IS NOT NULL AND usage_id IS entity_id AND project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'logical_event' AND logical_event_id IS NOT NULL AND entity_id GLOB '[0-9]*' AND entity_id NOT GLOB '*[^0-9]*' AND logical_event_id IS CAST(entity_id AS INTEGER) AND entity_id = CAST(logical_event_id AS TEXT) AND project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND result_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'result' AND result_id IS NOT NULL AND result_id IS entity_id AND project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND source_instance_id IS NULL AND session_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'session' AND source_instance_id IS NOT NULL AND session_id IS NOT NULL AND session_id IS entity_id AND project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL AND message_id IS NULL)
+                        OR (entity_type = 'message' AND source_instance_id IS NOT NULL AND session_id IS NOT NULL AND message_id IS NOT NULL AND message_id IS entity_id AND project_id IS NULL AND task_id IS NULL AND run_id IS NULL AND invocation_id IS NULL AND job_id IS NULL AND usage_id IS NULL AND logical_event_id IS NULL AND result_id IS NULL)),
+                    CHECK (source_instance_id IS NULL OR (typeof(source_instance_id) = 'text' AND length(source_instance_id) BETWEEN 1 AND 200 AND instr(source_instance_id, char(0)) = 0)),
+                    CHECK (session_id IS NULL OR (typeof(session_id) = 'text' AND length(session_id) BETWEEN 1 AND 200 AND instr(session_id, char(0)) = 0)),
+                    CHECK (message_id IS NULL OR (typeof(message_id) = 'text' AND length(message_id) BETWEEN 1 AND 200 AND instr(message_id, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_provenance_identity",
+                "provenance",
+                """
+                CREATE UNIQUE INDEX ux_provenance_identity
+                    ON provenance(
+                        entity_type,
+                        entity_id,
+                        COALESCE(source_instance_id, ''),
+                        COALESCE(session_id, ''),
+                        source_kind,
+                        COALESCE(import_id, -1))
+                """
+            ),
+            (
+                "index",
+                "ix_provenance_entity",
+                "provenance",
+                """
+                CREATE INDEX ix_provenance_entity ON provenance(entity_type, entity_id)
+                """
+            ),
+            (
+                "index",
+                "ix_provenance_import",
+                "provenance",
+                """
+                CREATE INDEX ix_provenance_import ON provenance(import_id)
+                """
+            ),
+            (
+                "trigger",
+                "trg_provenance_subject_immutable",
+                "provenance",
+                """
+                CREATE TRIGGER trg_provenance_subject_immutable
+                BEFORE UPDATE OF
+                    entity_type, entity_id, project_id, task_id, run_id,
+                    invocation_id, job_id, usage_id, logical_event_id, result_id,
+                    source_instance_id, session_id, message_id
+                ON provenance
+                BEGIN
+                    SELECT RAISE(ABORT, 'provenance subject immutable');
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_jobs_provenance_subject_insert",
+                "jobs",
+                """
+                CREATE TRIGGER trg_jobs_provenance_subject_insert
+                BEFORE INSERT ON jobs
+                WHEN NEW.provenance_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'provenance subject mismatch')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM provenance p
+                        WHERE p.provenance_id = NEW.provenance_id
+                          AND p.entity_type = 'job'
+                          AND p.job_id = NEW.job_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_jobs_provenance_subject_update",
+                "jobs",
+                """
+                CREATE TRIGGER trg_jobs_provenance_subject_update
+                BEFORE UPDATE OF provenance_id ON jobs
+                WHEN NEW.provenance_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'provenance subject mismatch')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM provenance p
+                        WHERE p.provenance_id = NEW.provenance_id
+                          AND p.entity_type = 'job'
+                          AND p.job_id = NEW.job_id
+                    );
+                END
+                """
+            ),
+            (
+                "table",
+                "run_enrichment",
+                "run_enrichment",
+                """
+                CREATE TABLE run_enrichment (
+                    run_id TEXT NOT NULL REFERENCES task_runs(run_id),
+                    import_id TEXT NOT NULL,
+                    import_status TEXT NOT NULL CHECK (import_status = 'applied'),
+                    enrichment_kind TEXT NOT NULL CHECK (enrichment_kind IN ('metadata', 'usage', 'cost', 'result', 'other')),
+                    applied_utc TEXT NOT NULL,
+                    PRIMARY KEY (run_id, import_id, enrichment_kind),
+                    FOREIGN KEY (import_id, import_status)
+                        REFERENCES enrichment_imports(import_id, status)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_run_enrichment_import",
+                "run_enrichment",
+                """
+                CREATE INDEX ix_run_enrichment_import ON run_enrichment(import_id)
+                """
+            ),
+            (
+                "table",
+                "usage_observations",
+                "usage_observations",
+                """
+                CREATE TABLE usage_observations (
+                    usage_id TEXT NOT NULL PRIMARY KEY,
+                    source_instance_id TEXT NOT NULL,
+                    source_usage_id TEXT NOT NULL,
+                    usage_scope TEXT NOT NULL CHECK (usage_scope IN ('message', 'session', 'invocation', 'run')),
+                    authority TEXT NOT NULL CHECK (authority IN ('reported', 'derived', 'estimated')),
+                    provenance_id INTEGER NULL REFERENCES provenance(provenance_id),
+                    logical_event_id INTEGER NULL,
+                    logical_event_decision TEXT NULL,
+                    logical_event_cost_text TEXT NULL,
+                    run_id TEXT NULL,
+                    run_association_role TEXT NULL,
+                    invocation_id TEXT NULL,
+                    invocation_run_id TEXT NULL,
+                    invocation_run_association_role TEXT NULL,
+                    session_id TEXT NULL,
+                    message_id TEXT NULL,
+                    observed_utc TEXT NOT NULL,
+                    input_tokens INTEGER NULL CHECK (input_tokens IS NULL OR (typeof(input_tokens) = 'integer' AND input_tokens >= 0)),
+                    output_tokens INTEGER NULL CHECK (output_tokens IS NULL OR (typeof(output_tokens) = 'integer' AND output_tokens >= 0)),
+                    cache_read_tokens INTEGER NULL CHECK (cache_read_tokens IS NULL OR (typeof(cache_read_tokens) = 'integer' AND cache_read_tokens >= 0)),
+                    cache_write_tokens INTEGER NULL CHECK (cache_write_tokens IS NULL OR (typeof(cache_write_tokens) = 'integer' AND cache_write_tokens >= 0)),
+                    cost_text TEXT NULL,
+                    cost_currency TEXT NULL,
+                    is_estimated INTEGER NOT NULL DEFAULT 0 CHECK (is_estimated IN (0, 1)),
+                    UNIQUE (source_instance_id, source_usage_id),
+                    FOREIGN KEY (source_instance_id, session_id)
+                        REFERENCES opencode_sessions(source_instance_id, session_id),
+                    FOREIGN KEY (source_instance_id, session_id, message_id)
+                        REFERENCES messages(source_instance_id, session_id, message_id),
+                    FOREIGN KEY (logical_event_id, logical_event_decision, logical_event_cost_text)
+                        REFERENCES logical_events(logical_event_id, decision, cost_text),
+                    FOREIGN KEY (run_id, run_association_role)
+                        REFERENCES task_runs(run_id, association_role),
+                    FOREIGN KEY (invocation_id, invocation_run_id)
+                        REFERENCES delegation_invocations(invocation_id, run_id),
+                    FOREIGN KEY (invocation_run_id, invocation_run_association_role)
+                        REFERENCES task_runs(run_id, association_role),
+                    CHECK (typeof(usage_id) = 'text' AND length(usage_id) BETWEEN 1 AND 200 AND instr(usage_id, char(0)) = 0),
+                    CHECK (typeof(source_instance_id) = 'text' AND length(source_instance_id) BETWEEN 1 AND 200 AND instr(source_instance_id, char(0)) = 0),
+                    CHECK (typeof(source_usage_id) = 'text' AND length(source_usage_id) BETWEEN 1 AND 200 AND instr(source_usage_id, char(0)) = 0),
+                    CHECK ((logical_event_id IS NULL AND logical_event_decision IS NULL AND logical_event_cost_text IS NULL)
+                        OR (logical_event_id IS NOT NULL AND logical_event_decision IS NOT NULL AND logical_event_cost_text IS NOT NULL)),
+                    CHECK (logical_event_decision IS NULL OR logical_event_decision = 'Applied'),
+                    CHECK (logical_event_cost_text IS NULL OR (length(logical_event_cost_text) BETWEEN 1 AND 64 AND logical_event_cost_text GLOB '[0-9]*' AND logical_event_cost_text NOT GLOB '*[^0-9.]*' AND logical_event_cost_text NOT GLOB '*.*.*' AND logical_event_cost_text NOT GLOB '.*' AND logical_event_cost_text NOT GLOB '*.')),
+                    CHECK ((run_id IS NULL AND run_association_role IS NULL)
+                        OR (run_id IS NOT NULL AND run_association_role IS NOT NULL)),
+                    CHECK ((invocation_id IS NULL AND invocation_run_id IS NULL AND invocation_run_association_role IS NULL)
+                        OR (invocation_id IS NOT NULL AND invocation_run_id IS NOT NULL AND invocation_run_association_role IS NOT NULL)),
+                    CHECK (
+                        (usage_scope = 'message' AND message_id IS NOT NULL AND session_id IS NOT NULL AND run_id IS NULL AND invocation_id IS NULL)
+                        OR (usage_scope = 'session' AND session_id IS NOT NULL AND message_id IS NULL AND run_id IS NULL AND invocation_id IS NULL)
+                        OR (usage_scope = 'run' AND run_id IS NOT NULL AND message_id IS NULL AND session_id IS NULL AND invocation_id IS NULL)
+                        OR (usage_scope = 'invocation' AND invocation_id IS NOT NULL AND message_id IS NULL AND session_id IS NULL AND run_id IS NULL)),
+                    CHECK (message_id IS NULL OR session_id IS NOT NULL),
+                    CHECK (cost_text IS NULL OR (typeof(cost_text) = 'text' AND instr(cost_text, char(0)) = 0 AND length(cost_text) BETWEEN 1 AND 64 AND cost_text GLOB '[0-9]*' AND cost_text NOT GLOB '*[^0-9.]*' AND cost_text NOT GLOB '*.*.*' AND cost_text NOT GLOB '.*' AND cost_text NOT GLOB '*.'
+                        AND length(replace(cost_text, '.', '')) <= 29
+                        AND (instr(cost_text, '.') = 0 OR length(cost_text) - instr(cost_text, '.') <= 28))),
+                    CHECK (cost_currency IS NULL OR (typeof(cost_currency) = 'text' AND cost_currency GLOB '[A-Z][A-Z][A-Z]' AND instr(cost_currency, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_usage_observations_source",
+                "usage_observations",
+                """
+                CREATE INDEX ix_usage_observations_source
+                    ON usage_observations(source_instance_id, source_usage_id)
+                """
+            ),
+            (
+                "index",
+                "ix_usage_observations_provenance",
+                "usage_observations",
+                """
+                CREATE INDEX ix_usage_observations_provenance
+                    ON usage_observations(provenance_id)
+                """
+            ),
+            (
+                "index",
+                "ix_usage_observations_logical_event",
+                "usage_observations",
+                """
+                CREATE INDEX ix_usage_observations_logical_event
+                    ON usage_observations(logical_event_id)
+                """
+            ),
+            (
+                "index",
+                "ix_usage_observations_run",
+                "usage_observations",
+                """
+                CREATE INDEX ix_usage_observations_run
+                    ON usage_observations(run_id, observed_utc)
+                """
+            ),
+            (
+                "index",
+                "ix_usage_observations_invocation",
+                "usage_observations",
+                """
+                CREATE INDEX ix_usage_observations_invocation
+                    ON usage_observations(invocation_id)
+                """
+            ),
+            (
+                "index",
+                "ix_usage_observations_session",
+                "usage_observations",
+                """
+                CREATE INDEX ix_usage_observations_session
+                    ON usage_observations(source_instance_id, session_id, observed_utc)
+                """
+            ),
+            (
+                "index",
+                "ix_usage_observations_message",
+                "usage_observations",
+                """
+                CREATE INDEX ix_usage_observations_message
+                    ON usage_observations(source_instance_id, session_id, message_id)
+                """
+            ),
+            (
+                "trigger",
+                "trg_usage_provenance_subject_insert",
+                "usage_observations",
+                """
+                CREATE TRIGGER trg_usage_provenance_subject_insert
+                BEFORE INSERT ON usage_observations
+                WHEN NEW.provenance_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'provenance subject mismatch')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM provenance p
+                        WHERE p.provenance_id = NEW.provenance_id
+                          AND p.entity_type = 'usage'
+                          AND p.usage_id = NEW.usage_id
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_usage_provenance_subject_update",
+                "usage_observations",
+                """
+                CREATE TRIGGER trg_usage_provenance_subject_update
+                BEFORE UPDATE OF provenance_id ON usage_observations
+                WHEN NEW.provenance_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'provenance subject mismatch')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM provenance p
+                        WHERE p.provenance_id = NEW.provenance_id
+                          AND p.entity_type = 'usage'
+                          AND p.usage_id = NEW.usage_id
+                    );
+                END
+                """
+            ),
+            (
+                "table",
+                "cost_attributions",
+                "cost_attributions",
+                """
+                CREATE TABLE cost_attributions (
+                    attribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    usage_id TEXT NOT NULL REFERENCES usage_observations(usage_id),
+                    logical_event_id INTEGER NOT NULL,
+                    logical_event_decision TEXT NOT NULL CHECK (logical_event_decision = 'Applied'),
+                    logical_event_cost_text TEXT NOT NULL,
+                    attribution_role TEXT NOT NULL CHECK (attribution_role IN ('primary', 'secondary', 'overhead')),
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+                    allocated_utc TEXT NOT NULL,
+                    FOREIGN KEY (logical_event_id, logical_event_decision, logical_event_cost_text)
+                        REFERENCES logical_events(logical_event_id, decision, cost_text),
+                    CHECK (length(usage_id) BETWEEN 1 AND 200 AND instr(usage_id, char(0)) = 0),
+                    CHECK (logical_event_cost_text GLOB '[0-9]*'
+                        AND logical_event_cost_text NOT GLOB '*[^0-9.]*'
+                        AND logical_event_cost_text NOT GLOB '*.*.*'
+                        AND logical_event_cost_text NOT GLOB '.*'
+                        AND logical_event_cost_text NOT GLOB '*.'
+                        AND length(replace(logical_event_cost_text, '.', '')) <= 29
+                        AND (instr(logical_event_cost_text, '.') = 0
+                            OR length(logical_event_cost_text) - instr(logical_event_cost_text, '.') <= 28))
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_cost_attributions_active_usage",
+                "cost_attributions",
+                """
+                CREATE UNIQUE INDEX ux_cost_attributions_active_usage
+                    ON cost_attributions(usage_id)
+                    WHERE is_active = 1
+                """
+            ),
+            (
+                "index",
+                "ux_cost_attributions_active_event",
+                "cost_attributions",
+                """
+                CREATE UNIQUE INDEX ux_cost_attributions_active_event
+                    ON cost_attributions(logical_event_id)
+                    WHERE is_active = 1
+                """
+            ),
+            (
+                "index",
+                "ix_cost_attributions_usage",
+                "cost_attributions",
+                """
+                CREATE INDEX ix_cost_attributions_usage ON cost_attributions(usage_id)
+                """
+            ),
+            (
+                "index",
+                "ix_cost_attributions_logical_event",
+                "cost_attributions",
+                """
+                CREATE INDEX ix_cost_attributions_logical_event
+                    ON cost_attributions(logical_event_id)
+                """
+            ),
+            (
+                "table",
+                "monitoring_starts",
+                "monitoring_starts",
+                """
+                CREATE TABLE monitoring_starts (
+                    start_id TEXT NOT NULL PRIMARY KEY,
+                    started_utc TEXT NOT NULL,
+                    ended_utc TEXT NULL,
+                    log_path TEXT NULL,
+                    jsonl_path TEXT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('running', 'stopped', 'failed')),
+                    UNIQUE (log_path),
+                    UNIQUE (jsonl_path),
+                    CHECK (typeof(start_id) = 'text' AND length(start_id) BETWEEN 1 AND 200 AND instr(start_id, char(0)) = 0),
+                    CHECK (ended_utc IS NULL OR ended_utc >= started_utc),
+                    CHECK (log_path IS NULL OR length(log_path) <= 4096),
+                    CHECK (jsonl_path IS NULL OR length(jsonl_path) <= 4096)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_monitoring_starts_started",
+                "monitoring_starts",
+                """
+                CREATE INDEX ix_monitoring_starts_started ON monitoring_starts(started_utc)
+                """
+            ),
+            (
+                "table",
+                "source_delivery_cuts",
+                "source_delivery_cuts",
+                """
+                CREATE TABLE source_delivery_cuts (
+                    cut_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_id TEXT NOT NULL REFERENCES monitoring_starts(start_id),
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+                    generation_id INTEGER NOT NULL,
+                    committed_offset INTEGER NOT NULL,
+                    delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('log', 'jsonl')),
+                    delivered_offset INTEGER NOT NULL CHECK (delivered_offset >= 0),
+                    cut_utc TEXT NOT NULL,
+                    UNIQUE (start_id, delivery_kind, generation_id),
+                    FOREIGN KEY (generation_id, job_id)
+                        REFERENCES source_generations(generation_id, job_id),
+                    CHECK (typeof(start_id) = 'text' AND length(start_id) BETWEEN 1 AND 200 AND instr(start_id, char(0)) = 0),
+                    CHECK (typeof(job_id) = 'text' AND length(job_id) BETWEEN 1 AND 200 AND instr(job_id, char(0)) = 0),
+                    CHECK (delivered_offset <= committed_offset)
+                )
+                """
+            ),
+            (
+                "index",
+                "ix_source_delivery_cuts_generation",
+                "source_delivery_cuts",
+                """
+                CREATE INDEX ix_source_delivery_cuts_generation
+                    ON source_delivery_cuts(generation_id)
+                """
+            ),
+            (
+                "index",
+                "ix_source_delivery_cuts_start",
+                "source_delivery_cuts",
+                """
+                CREATE INDEX ix_source_delivery_cuts_start
+                    ON source_delivery_cuts(start_id, delivery_kind)
+                """
+            ),
+            (
+                "trigger",
+                "trg_source_delivery_cuts_capture_insert",
+                "source_delivery_cuts",
+                """
+                CREATE TRIGGER trg_source_delivery_cuts_capture_insert
+                BEFORE INSERT ON source_delivery_cuts
+                BEGIN
+                    SELECT RAISE(ABORT, 'delivery cut capture does not match committed cursor')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM source_cursors c
+                        WHERE c.generation_id = NEW.generation_id
+                          AND c.committed_offset = NEW.committed_offset
+                    );
+                END
+                """
+            ),
+            (
+                "trigger",
+                "trg_source_delivery_cuts_capture_immutable_update",
+                "source_delivery_cuts",
+                """
+                CREATE TRIGGER trg_source_delivery_cuts_capture_immutable_update
+                BEFORE UPDATE OF start_id, job_id, generation_id, committed_offset, delivery_kind
+                ON source_delivery_cuts
+                BEGIN
+                    SELECT RAISE(ABORT, 'delivery cut snapshot immutable');
+                END
+                """
+            ),
+            (
+                "table",
+                "event_observation_context",
+                "event_observation_context",
+                """
+                CREATE TABLE event_observation_context (
+                    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    logical_event_id INTEGER NOT NULL REFERENCES logical_events(logical_event_id),
+                    start_id TEXT NULL REFERENCES monitoring_starts(start_id),
+                    project_id TEXT NULL REFERENCES projects(project_id),
+                    source_instance_id TEXT NULL,
+                    session_id TEXT NULL,
+                    observed_utc TEXT NOT NULL,
+                    context_kind TEXT NOT NULL CHECK (context_kind IN ('bootstrap', 'live', 'enrichment', 'manual')),
+                    detail TEXT NULL,
+                    FOREIGN KEY (source_instance_id, session_id)
+                        REFERENCES opencode_sessions(source_instance_id, session_id),
+                    CHECK (session_id IS NULL OR source_instance_id IS NOT NULL),
+                    CHECK (context_kind <> 'live' OR start_id IS NOT NULL),
+                    CHECK (detail IS NULL OR (typeof(detail) = 'text' AND length(detail) <= 4096 AND instr(detail, char(0)) = 0))
+                )
+                """
+            ),
+            (
+                "index",
+                "ux_event_observation_context_identity",
+                "event_observation_context",
+                """
+                CREATE UNIQUE INDEX ux_event_observation_context_identity
+                    ON event_observation_context(
+                        logical_event_id,
+                        COALESCE(start_id, ''),
+                        COALESCE(source_instance_id, ''),
+                        COALESCE(session_id, ''),
+                        context_kind)
+                """
+            ),
+            (
+                "index",
+                "ix_event_observation_context_event",
+                "event_observation_context",
+                """
+                CREATE INDEX ix_event_observation_context_event
+                    ON event_observation_context(logical_event_id)
+                """
+            ),
+            (
+                "index",
+                "ix_event_observation_context_start",
+                "event_observation_context",
+                """
+                CREATE INDEX ix_event_observation_context_start
+                    ON event_observation_context(start_id)
+                """
+            ),
+            (
+                "index",
+                "ix_event_observation_context_session",
+                "event_observation_context",
+                """
+                CREATE INDEX ix_event_observation_context_session
+                    ON event_observation_context(source_instance_id, session_id)
+                """
+            )
+        };
+    }
+
+    private static readonly (string Type, string Name, string Table, string? Sql)[]
+        V3InternalSchemaObjects =
+        {
+            (
+                "table",
+                "sqlite_sequence",
+                "sqlite_sequence",
+                "CREATE TABLE sqlite_sequence(name,seq)"
+            ),
+            ("index", "sqlite_autoindex_content_items_1", "content_items", null),
+            ("index", "sqlite_autoindex_delegation_invocations_1", "delegation_invocations", null),
+            ("index", "sqlite_autoindex_delegation_invocations_2", "delegation_invocations", null),
+            ("index", "sqlite_autoindex_enrichment_imports_1", "enrichment_imports", null),
+            ("index", "sqlite_autoindex_enrichment_imports_2", "enrichment_imports", null),
+            ("index", "sqlite_autoindex_execution_evidence_1", "execution_evidence", null),
+            ("index", "sqlite_autoindex_execution_segments_1", "execution_segments", null),
+            ("index", "sqlite_autoindex_execution_segments_2", "execution_segments", null),
+            ("index", "sqlite_autoindex_execution_segments_3", "execution_segments", null),
+            ("index", "sqlite_autoindex_invocation_jobs_1", "invocation_jobs", null),
+            ("index", "sqlite_autoindex_job_aggregates_1", "job_aggregates", null),
+            ("index", "sqlite_autoindex_job_coverage_1", "job_coverage", null),
+            ("index", "sqlite_autoindex_job_logical_keys_1", "job_logical_keys", null),
+            ("index", "sqlite_autoindex_job_sources_1", "job_sources", null),
+            ("index", "sqlite_autoindex_jobs_1", "jobs", null),
+            ("index", "sqlite_autoindex_ledger_meta_1", "ledger_meta", null),
+            ("index", "sqlite_autoindex_logical_events_1", "logical_events", null),
+            ("index", "sqlite_autoindex_messages_1", "messages", null),
+            ("index", "sqlite_autoindex_messages_2", "messages", null),
+            ("index", "sqlite_autoindex_monitoring_starts_1", "monitoring_starts", null),
+            ("index", "sqlite_autoindex_monitoring_starts_2", "monitoring_starts", null),
+            ("index", "sqlite_autoindex_monitoring_starts_3", "monitoring_starts", null),
+            ("index", "sqlite_autoindex_opencode_sessions_1", "opencode_sessions", null),
+            ("index", "sqlite_autoindex_project_paths_1", "project_paths", null),
+            ("index", "sqlite_autoindex_project_paths_2", "project_paths", null),
+            ("index", "sqlite_autoindex_projects_1", "projects", null),
+            ("index", "sqlite_autoindex_results_1", "results", null),
+            ("index", "sqlite_autoindex_run_enrichment_1", "run_enrichment", null),
+            ("index", "sqlite_autoindex_run_segments_1", "run_segments", null),
+            ("index", "sqlite_autoindex_run_segments_2", "run_segments", null),
+            ("index", "sqlite_autoindex_segment_messages_1", "segment_messages", null),
+            ("index", "sqlite_autoindex_segment_messages_2", "segment_messages", null),
+            ("index", "sqlite_autoindex_source_delivery_cuts_1", "source_delivery_cuts", null),
+            ("index", "sqlite_autoindex_source_events_1", "source_events", null),
+            ("index", "sqlite_autoindex_source_records_1", "source_records", null),
+            ("index", "sqlite_autoindex_task_runs_1", "task_runs", null),
+            ("index", "sqlite_autoindex_task_runs_2", "task_runs", null),
+            ("index", "sqlite_autoindex_tasks_1", "tasks", null),
+            ("index", "sqlite_autoindex_usage_observations_1", "usage_observations", null),
+            ("index", "sqlite_autoindex_usage_observations_2", "usage_observations", null),
+            ("index", "sqlite_autoindex_validations_1", "validations", null)
+        };
+
     private static readonly (string Type, string Name, string Table, string? Sql)[]
         ProjectionInternalSchemaObjects =
         {
@@ -1625,6 +3431,12 @@ public sealed class EventLedger : IDisposable
             EventLedgerSchema.ProjectionVersion,
             ProjectionRequiredSchemaObjects,
             ProjectionInternalSchemaObjects,
+            supportsProjection: true);
+
+        public static EventLedgerSchemaProfile V3 { get; } = new(
+            EventLedgerSchema.V3Version,
+            V3RequiredSchemaObjects,
+            V3InternalSchemaObjects,
             supportsProjection: true);
 
         public int Version { get; }
