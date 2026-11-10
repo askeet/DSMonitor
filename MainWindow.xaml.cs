@@ -1,8 +1,5 @@
 ﻿using System.ComponentModel;
-using System.IO;
 using System.Windows;
-using DSMonitor.Models;
-using DSMonitor.Persistence;
 using DSMonitor.Services;
 using DSMonitor.ViewModels;
 
@@ -15,32 +12,26 @@ public partial class MainWindow : Window
     private bool _closePending;
 
     public MainWindow()
+        : this(MonitoringComposition.CreateForStartup())
     {
+    }
+
+    public MainWindow(MonitoringComposition composition)
+    {
+        ArgumentNullException.ThrowIfNull(composition);
         InitializeComponent();
 
-        var runsRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".forge-delegate",
-            "runs");
-        var logsRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "DSMonitor",
-            "Logs");
-        var refreshInterval = TimeSpan.FromSeconds(5);
-
-        var projectionDatabasePath = LedgerStoragePaths.DefaultV3DatabasePath;
+        Composition = composition;
         _viewModel = new MainViewModel(
-            () => new ForgeMonitoringService(
-                runsRoot,
-                new MonitoringRunLoggerFactory(logsRoot),
-                new MonitoringOptions(refreshInterval),
-                ledgerFactory: () => EventLedger.OpenV3Projection(projectionDatabasePath)),
+            () => composition.CreateService(),
             Dispatcher,
-            runsRoot,
-            refreshInterval);
+            composition.Options.RunsRoot,
+            composition.Options.RefreshInterval);
 
         DataContext = _viewModel;
     }
+
+    public MonitoringComposition Composition { get; }
 
     protected override async void OnClosing(CancelEventArgs e)
     {
