@@ -33,6 +33,12 @@ public static class JobLiveActivityReader
 {
     public const int MaxReadBytes = 64 * 1024;
     public const int MaxExcerptLength = 600;
+    private const string AssistantTextKind = "Assistant-reported text";
+    private const string RolelessTextKind = "Observed roleless text — unverified";
+    private const string AssistantToolKind = "Observed tool activity";
+    private const string RolelessToolKind = "Observed roleless tool activity — unverified";
+    private const string AssistantResultKind = "Agent-reported result — unverified";
+    private const string RolelessResultKind = "Observed roleless result — unverified";
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly HashSet<string> SupportedRootTypes = new(StringComparer.Ordinal)
     {
@@ -232,7 +238,7 @@ public static class JobLiveActivityReader
 
             ActivityExcerpt? doing = null;
             ActivityExcerpt? done = null;
-            var texts = new Dictionary<(string Session, string Message), ActivityExcerpt>();
+            var texts = new Dictionary<(string Session, string Message), (ActivityExcerpt Excerpt, bool VerifiedAssistant)>();
             // Discard the first record when starting mid-file, even if it
             // happens to be complete. Never parse a possibly partial record.
             var lineStart = start == 0 ? 0 : Array.IndexOf(bytes, (byte)'\n', 0, read) + 1;
@@ -271,7 +277,7 @@ public static class JobLiveActivityReader
 
                     var message = Get(part, "messageID") ?? Get(part, "messageId");
                     if (!ValidId(session) || !ValidId(message)) continue;
-                    if (!TryGetAssistantRole(root, part)) continue;
+                    if (!TryGetRoleEvidence(root, part, out var verifiedAssistant)) continue;
                     if (!TryGetActivityKind(root, part, out var isText, out var isTool, out var isFinish))
                     {
                         continue;
@@ -301,20 +307,28 @@ public static class JobLiveActivityReader
                         Get(part, "text") is { } text &&
                         !string.IsNullOrWhiteSpace(text))
                     {
-                        doing = Excerpt(text, "Assistant-reported text");
-                        texts[key] = doing;
+                        doing = Excerpt(
+                            text,
+                            verifiedAssistant ? AssistantTextKind : RolelessTextKind);
+                        texts[key] = (doing, verifiedAssistant);
                     }
                     else if (isTool)
                     {
                         // The existing parser emits safe tool names/states,
                         // excluding command arguments, output and secrets.
-                        doing = Excerpt(parsed.Event.Summary, "Observed tool activity");
+                        doing = Excerpt(
+                            parsed.Event.Summary,
+                            verifiedAssistant ? AssistantToolKind : RolelessToolKind);
                     }
                     else if (isFinish &&
                              Get(part, "reason") is "stop" or "end-turn" &&
                              texts.TryGetValue(key, out var result))
                     {
-                        done = result with { Kind = "Agent-reported result — unverified" };
+                        var verifiedResult = verifiedAssistant && result.VerifiedAssistant;
+                        done = result.Excerpt with
+                        {
+                            Kind = verifiedResult ? AssistantResultKind : RolelessResultKind
+                        };
                     }
                 }
                 catch (JsonException) { /* Malformed/overlong/partial records are unavailable. */ }
@@ -403,6 +417,31 @@ public static class JobLiveActivityReader
         var effective = partRole ?? rootRole;
         return string.Equals(effective, "assistant", StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// Preserve the strict assistant classification and add only the authorized
+    /// roleless-observation path. Any explicit, malformed, duplicate,
+    /// unsupported or conflicting role remains rejected.
+    /// </summary>
+    private static bool TryGetRoleEvidence(
+        JsonElement root,
+        JsonElement part,
+        out bool verifiedAssistant)
+    {
+        verifiedAssistant = TryGetAssistantRole(root, part);
+        if (verifiedAssistant)
+        {
+            return true;
+        }
+
+        return IsRolelessOnly(root, part);
+    }
+
+    private static bool IsRolelessOnly(JsonElement root, JsonElement part) =>
+        TryGetSingleRole(root, out var rootRole) &&
+        TryGetSingleRole(part, out var partRole) &&
+        rootRole is null &&
+        partRole is null;
 
     private static bool TryGetSingleRole(JsonElement value, out string? role)
     {

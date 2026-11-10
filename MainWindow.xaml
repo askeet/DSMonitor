@@ -921,7 +921,7 @@
                                                 <TextBlock Text="DOING · MOST RECENT OBSERVED ACTIVITY" Style="{StaticResource CardLabel}" />
                                                 <TextBlock Text="{Binding DoingText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
                                                 <TextBlock Text="{Binding DoingProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
-                                                <TextBlock Text="DONE · AGENT-REPORTED RESULT, UNVERIFIED" Style="{StaticResource CardLabel}" Margin="0,14,0,0" />
+                                                <TextBlock Text="DONE · OBSERVED RESULT, UNVERIFIED" Style="{StaticResource CardLabel}" Margin="0,14,0,0" />
                                                 <TextBlock Text="{Binding DoneText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
                                                 <TextBlock Text="{Binding DoneProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
                                                 <TextBlock Text="{Binding StatusProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" Margin="0,12,0,0" />

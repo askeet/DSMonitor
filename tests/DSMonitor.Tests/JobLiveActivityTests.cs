@@ -40,6 +40,61 @@ public sealed class JobLiveActivityTests
     }
 
     [TestMethod]
+    public void RolelessToolActivity_IsObservedUnverified()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", ToolUse(
+            1_800_000_001_000,
+            "shell",
+            "completed",
+            1_800_000_000_000,
+            1_800_000_001_000,
+            role: null));
+        var activity = Read(workspace);
+        Assert.IsNotNull(activity.Doing);
+        StringAssert.Contains(activity.Doing!.Text, "completed");
+        StringAssert.Contains(activity.Doing.Kind, "Observed");
+        StringAssert.Contains(activity.Doing.Kind, "unverified");
+        Assert.IsFalse(activity.Doing.Kind.Contains("Assistant", StringComparison.Ordinal));
+        Assert.IsNull(activity.Done);
+    }
+
+    [TestMethod]
+    public void RolelessActivity_DoesNotBypassAmbiguousSourceOwnership()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteMetadata("other", logPath: workspace.LogPath("job"));
+        workspace.WriteLog("job", Text("roleless but ambiguous", "m", role: null));
+        Assert.IsNull(Read(workspace).Doing);
+    }
+
+    [TestMethod]
+    public void RolelessSharedSessionJobs_KeepDistinctMessagesAndUnverifiedLabels()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job0");
+        workspace.WriteMetadata("job1");
+        workspace.WriteLog("job0", Text("alpha roleless", "msg-0", role: null), Finish("msg-0", role: null));
+        workspace.WriteLog("job1", Text("bravo roleless", "msg-1", role: null), Finish("msg-1", role: null));
+
+        foreach (var jobId in new[] { "job0", "job1" })
+        {
+            var activity = Read(workspace, jobId);
+            var expected = jobId == "job0" ? "alpha roleless" : "bravo roleless";
+            var message = jobId == "job0" ? "msg-0" : "msg-1";
+            Assert.AreEqual(expected, activity.Doing?.Text, jobId);
+            Assert.AreEqual(expected, activity.Done?.Text, jobId);
+            Assert.AreEqual(message, activity.Done?.MessageId, jobId);
+            Assert.AreEqual("shared-session", activity.Done?.SessionId, jobId);
+            Assert.AreEqual(jobId, activity.Done?.JobId, jobId);
+            StringAssert.Contains(activity.Done!.Kind, "unverified");
+            Assert.IsFalse(activity.Done.Kind.Contains("Assistant", StringComparison.Ordinal), jobId);
+        }
+    }
+
+    [TestMethod]
     public void Done_RequiresSameMessageAndExplicitStop_NeverInfersFromStatusOrToolSuccess()
     {
         using var workspace = new TestWorkspace();
@@ -192,7 +247,7 @@ public sealed class JobLiveActivityTests
     }
 
     [TestMethod]
-    public void SyntheticUserMessageWithoutAssistantRole_IsNeverAttributedAsDoingOrDone()
+    public void RolelessSyntheticUserMessage_IsObservedOnlyAsUnverified()
     {
         using var workspace = new TestWorkspace();
         workspace.WriteMetadata("job");
@@ -200,17 +255,21 @@ public sealed class JobLiveActivityTests
             Text("user prompt", "user-1", role: null),
             Finish("user-1", role: null));
         var activity = Read(workspace);
-        Assert.IsNull(activity.Doing);
-        Assert.IsNull(activity.Done);
+        Assert.AreEqual("user prompt", activity.Doing?.Text);
+        Assert.AreEqual("user prompt", activity.Done?.Text);
+        StringAssert.Contains(activity.Doing!.Kind, "Observed");
+        StringAssert.Contains(activity.Doing.Kind, "unverified");
+        StringAssert.Contains(activity.Done!.Kind, "Observed");
+        StringAssert.Contains(activity.Done.Kind, "unverified");
+        Assert.IsFalse(activity.Doing.Kind.Contains("Assistant", StringComparison.Ordinal));
+        Assert.IsFalse(activity.Done.Kind.Contains("Agent-reported", StringComparison.Ordinal));
     }
 
     [TestMethod]
-    public void RoleEvidence_RequiresExplicitAssistantAndAgreement()
+    public void RoleEvidence_ClassifiesAssistantRolelessAndRejectsInvalid()
     {
         var negative = new (string Name, string[] RootRoles, string[] PartRoles)[]
         {
-            ("absent", Array.Empty<string>(), Array.Empty<string>()),
-            ("null-only", new[] { "null" }, new[] { "null" }),
             ("user", new[] { "\"user\"" }, Array.Empty<string>()),
             ("unknown", new[] { "\"system\"" }, Array.Empty<string>()),
             ("malformed", new[] { "123" }, Array.Empty<string>()),
@@ -231,6 +290,29 @@ public sealed class JobLiveActivityTests
             Assert.IsNull(activity.Done, scenario.Name);
         }
 
+        var roleless = new (string Name, string[] RootRoles, string[] PartRoles)[]
+        {
+            ("absent", Array.Empty<string>(), Array.Empty<string>()),
+            ("null-only", new[] { "null" }, new[] { "null" })
+        };
+        foreach (var scenario in roleless)
+        {
+            using var workspace = new TestWorkspace();
+            workspace.WriteMetadata("job");
+            workspace.WriteLog("job",
+                RoleRecord("text", "m", "payload", scenario.RootRoles, scenario.PartRoles),
+                RoleRecord("step_finish", "m", null, scenario.RootRoles, scenario.PartRoles));
+            var activity = Read(workspace);
+            Assert.AreEqual("payload", activity.Doing?.Text, scenario.Name);
+            Assert.AreEqual("payload", activity.Done?.Text, scenario.Name);
+            StringAssert.Contains(activity.Doing!.Kind, "Observed");
+            StringAssert.Contains(activity.Doing.Kind, "unverified");
+            StringAssert.Contains(activity.Done!.Kind, "Observed");
+            StringAssert.Contains(activity.Done.Kind, "unverified");
+            Assert.IsFalse(activity.Doing.Kind.Contains("Assistant", StringComparison.Ordinal));
+            Assert.IsFalse(activity.Done.Kind.Contains("Agent-reported", StringComparison.Ordinal));
+        }
+
         var positive = new (string Name, string[] RootRoles, string[] PartRoles)[]
         {
             ("part-assistant", Array.Empty<string>(), new[] { "\"assistant\"" }),
@@ -248,7 +330,63 @@ public sealed class JobLiveActivityTests
             var activity = Read(workspace);
             Assert.AreEqual("payload", activity.Doing?.Text, scenario.Name);
             Assert.AreEqual("payload", activity.Done?.Text, scenario.Name);
+            StringAssert.Contains(activity.Doing!.Kind, "Assistant", scenario.Name);
+            StringAssert.Contains(activity.Done!.Kind, "unverified", scenario.Name);
+            Assert.IsFalse(
+                activity.Done.Kind.Contains("roleless", StringComparison.OrdinalIgnoreCase),
+                scenario.Name);
         }
+    }
+
+    [TestMethod]
+    public void MixedAssistantAndRolelessTextFinish_IsNeverLaundered()
+    {
+        var scenarios = new (string Name, string[] TextRoles, string[] FinishRoles)[]
+        {
+            (
+                "assistant-text-roleless-finish",
+                new[] { "\"assistant\"" },
+                Array.Empty<string>()),
+            (
+                "roleless-text-assistant-finish",
+                Array.Empty<string>(),
+                new[] { "\"assistant\"" })
+        };
+        foreach (var scenario in scenarios)
+        {
+            using var workspace = new TestWorkspace();
+            workspace.WriteMetadata("job");
+            workspace.WriteLog("job",
+                RoleRecord("text", "m", "payload", scenario.TextRoles, Array.Empty<string>()),
+                RoleRecord("step_finish", "m", null, scenario.FinishRoles, Array.Empty<string>()));
+            var activity = Read(workspace);
+            Assert.AreEqual("payload", activity.Doing?.Text, scenario.Name);
+            Assert.AreEqual("payload", activity.Done?.Text, scenario.Name);
+            StringAssert.Contains(activity.Done!.Kind, "Observed", scenario.Name);
+            StringAssert.Contains(activity.Done.Kind, "unverified", scenario.Name);
+            Assert.IsFalse(
+                activity.Done.Kind.Contains("Agent-reported", StringComparison.Ordinal),
+                scenario.Name);
+        }
+    }
+
+    [TestMethod]
+    public void RolelessFinish_StillRequiresMatchingMessageAndStop()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job",
+            Text("candidate", "m", role: null),
+            Finish("other", role: null),
+            Finish("m", "tool-calls", role: null));
+        var activity = Read(workspace);
+        Assert.AreEqual("candidate", activity.Doing?.Text);
+        Assert.IsNull(activity.Done);
+        workspace.AppendLog("job", Finish("m", role: null));
+        var completed = Read(workspace);
+        Assert.AreEqual("candidate", completed.Done?.Text);
+        StringAssert.Contains(completed.Done!.Kind, "unverified");
+        Assert.IsFalse(completed.Done.Kind.Contains("Agent-reported", StringComparison.Ordinal));
     }
 
     [TestMethod]
@@ -696,9 +834,10 @@ public sealed class JobLiveActivityTests
         string status = "completed",
         long? start = null,
         long? end = null,
-        string message = "msg_1") => JsonSerializer.Serialize(new
+        string message = "msg_1",
+        string? role = "assistant") => JsonSerializer.Serialize(new
         {
-            type = "tool_use", sessionID = "shared-session", timestamp, role = "assistant",
+            type = "tool_use", sessionID = "shared-session", timestamp, role,
             part = new
             {
                 id = "tool-" + message, partID = "tool-" + message, sessionID = "shared-session",
