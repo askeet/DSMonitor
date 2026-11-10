@@ -52,6 +52,26 @@ public sealed class JobRowViewModel : ObservableObject
     public bool HasWarnings => _hasWarnings;
     public string RawLogText => _rawLogText;
     public bool HasRawLog => _hasRawLog;
+    public string ChatText => Snapshot.LiveActivity.Doing?.SessionId ?? Snapshot.SessionId ?? "N/A";
+    public string TaskText => "N/A — original request unavailable in the job capture";
+    public string DoingText => Snapshot.LiveActivity.Doing?.Text ?? "N/A";
+    public string DoneText => Snapshot.LiveActivity.Done?.Text ?? "N/A";
+    public string DoingProvenance => FormatProvenance(Snapshot.LiveActivity.Doing);
+    public string DoneProvenance => FormatProvenance(Snapshot.LiveActivity.Done);
+    public string LiveActivityNotice => Snapshot.LiveActivity.Availability + " " + LiveActivitySnapshot.RetentionNotice;
+    public string LiveUpdatedText => Snapshot.LiveActivity.Doing is { } activity
+        ? activity.SourceTimestamp is { } sourceTime
+            ? sourceTime.ToLocalTime().ToString("MMM dd HH:mm:ss")
+            : "Observed " + activity.ObservedAt.ToLocalTime().ToString("MMM dd HH:mm:ss")
+        : "N/A";
+    public string StatusProvenance => $"{ForgeStatusLabel}; Forge metadata {Snapshot.Metadata.MetadataPath}; observed {Snapshot.ObservedAt:O}";
+
+    private static string FormatProvenance(ActivityExcerpt? activity) => activity is null
+        ? "N/A — no safely attributed record in the bounded source window"
+        : $"{activity.Kind}; job {activity.JobId}; session {activity.SessionId}; message {activity.MessageId}; " +
+          $"part {activity.PartId ?? "N/A"}; source {activity.SourcePath} at byte {activity.ByteOffset}; " +
+          $"source time {activity.SourceTimestamp?.ToString("O") ?? "N/A"}; observed {activity.ObservedAt:O}. " +
+          "Captured observation; may be historical. No independent QA or user acceptance established.";
     public string ForgeStatusLabel => _status switch
     {
         ForgeJobStatus.Running => "Execution confirmed by metadata",
@@ -78,8 +98,8 @@ public sealed class JobRowViewModel : ObservableObject
         }
 
         SetText(snapshot.Metadata.Directory is { Length: > 0 } directory
-            ? LeafDirectory(directory)
-            : "—", ref _projectText, nameof(ProjectText));
+            ? directory
+            : "N/A", ref _projectText, nameof(ProjectText));
         SetText(snapshot.Metadata.Directory ?? string.Empty, ref _projectTooltip, nameof(ProjectTooltip));
         SetText(snapshot.Metadata.Model ?? "—", ref _modelText, nameof(ModelText));
         SetText(
@@ -111,6 +131,10 @@ public sealed class JobRowViewModel : ObservableObject
         MergeEvents(snapshot.Events);
         RefreshElapsed(now);
         OnPropertyChanged(nameof(Snapshot));
+        foreach (var property in new[] { nameof(ChatText), nameof(TaskText), nameof(DoingText),
+                     nameof(DoneText), nameof(DoingProvenance), nameof(DoneProvenance),
+                     nameof(LiveActivityNotice), nameof(LiveUpdatedText), nameof(StatusProvenance) })
+            OnPropertyChanged(property);
     }
 
     public void SetRawLog(string? text)

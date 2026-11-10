@@ -22,6 +22,7 @@ public sealed record ForgeJobSnapshot
     public IReadOnlyList<MonitoringEvent> Events { get; init; } = Array.Empty<MonitoringEvent>();
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
     public DateTimeOffset ObservedAt { get; init; }
+    public LiveActivitySnapshot LiveActivity { get; init; } = new();
 
     /// <summary>
     /// True when the durable source coverage is incomplete. An observed cost is

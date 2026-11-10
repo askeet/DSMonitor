@@ -28,13 +28,13 @@ public partial class MainWindow : Window
             "Logs");
         var refreshInterval = TimeSpan.FromSeconds(5);
 
-        var projectionDatabasePath = LedgerStoragePaths.DefaultProjectionDatabasePath;
+        var projectionDatabasePath = LedgerStoragePaths.DefaultV3DatabasePath;
         _viewModel = new MainViewModel(
             () => new ForgeMonitoringService(
                 runsRoot,
                 new MonitoringRunLoggerFactory(logsRoot),
                 new MonitoringOptions(refreshInterval),
-                ledgerFactory: () => EventLedger.OpenProjection(projectionDatabasePath)),
+                ledgerFactory: () => EventLedger.OpenV3Projection(projectionDatabasePath)),
             Dispatcher,
             runsRoot,
             refreshInterval);

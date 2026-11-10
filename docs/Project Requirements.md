@@ -5,7 +5,7 @@
 **Project:** DSMonitor (existing .NET 10 WPF solution, Windows 10/11)  
 **Sources:** `docs/Project Requirements.md`, `docs/Plan.md`, `docs/FormView.png`, installed forge-delegate 1.2.4, OpenCode 2.2.6, and delegated task instructions.
 
-> Phase status: **Phase 1 implementation is present and locally validated; independent Sol QA and visual QA are still pending.** The B1 durable SQLite event-ledger foundation is implemented and locally tested as an isolated persistence seam; the sole post-QA correction addressing schema-integrity, storage confinement, bounded retrieval, and real multibyte coverage is implemented and awaiting independent Sol revalidation. The live monitoring pipeline has not been cut over to it. Phase 2 has not started. This document organizes and clarifies the original requirements without silently removing or weakening them.
+> Current status: Phase 1 is **IN PROGRESS / NOT ACCEPTED**; B1 and B2 are accepted within documented limits, B3/B4 are NOT STARTED, and V3-1 is **ACCEPTED** as a schema foundation only. The live pipeline uses v2, not v3. V3-2 onward and the early Live Activity Dashboard are NOT STARTED; see [the current roadmap](Plan.md#v3-delivery-order--live-activity-first) and preserved acceptance evidence. Historical pending labels do not override later acceptance decisions.
 
 ---
 
@@ -30,7 +30,7 @@ DSMonitor is a **monitor, not an agent controller**.
 | PRJ-003 | Observe forge-delegate job metadata and logs without controlling forge, OpenCode, DeepSeek, or monitored projects. | 1 |
 | PRJ-004 | Distinguish forge job status, OpenCode session status, and DSMonitor monitoring state at all times. | 1 |
 | PRJ-005 | Prefer standard .NET/WPF APIs and minimal dependencies; keep parsing, monitoring, persistence, and UI responsibilities separate. | 1–4 |
-| PRJ-006 | Add OpenCode read-only API observation only in Phase 2, after Phase 1 is accepted. | 2 |
+| PRJ-006 | Add read-only job-scoped OpenCode observation as early P0 using verified identities; broader Phase 2 integration follows Phase 1 acceptance. | 2 |
 | PRJ-007 | Add reusable history, replay, search, filtering, and safe export in Phase 3. | 3 |
 | PRJ-008 | Add production hardening, settings, retention controls, accessibility, and complete regression checks in Phase 4. | 4 |
 
@@ -40,7 +40,7 @@ DSMonitor is a **monitor, not an agent controller**.
 - No process liveness polling used as proof that a model is working.
 - No fabricated sessions, progress percentages, milestones, costs, test results, or completion states.
 - No telemetry or external service calls in Phase 1.
-- No HTTP/OpenCode integration in Phase 1.
+- The original Phase 1 scope excludes OpenCode integration; the separately prioritized job-scoped P0 slice may precede Phase 1 acceptance.
 
 ---
 
@@ -52,13 +52,13 @@ DSMonitor is a **monitor, not an agent controller**.
 |---|---|---|
 | DSMonitor | .NET 10 (`net10.0-windows`), WPF, Visual Studio 2026 | Existing solution retained. |
 | forge-delegate | 1.2.4 | Metadata and JSONL logs are the Phase 1 data source. |
-| OpenCode | 2.2.6 | REST integration deferred to Phase 2; actual OpenAPI schema must be inspected first. |
+| OpenCode | 2.2.6 | Job-scoped P0 observation is authorized; verify the actual source and, before REST use, the installed OpenAPI schema. Broader integration remains Phase 2. |
 | Agent | `deepseek-bounded` | Displayed only when reported; no agent control. |
 | Model steps | 120 | Historical/status context only. |
 | Forge timeout | 90 minutes (5,400,000 ms) | Deadline is wrapper metadata only. |
 | Runs root | `%USERPROFILE%\.forge-delegate\runs\` | Read-only observation root. |
 | Monitoring logs | `%LOCALAPPDATA%\DSMonitor\Logs\` | DSMonitor-owned write location. |
-| Event ledger database | `%LOCALAPPDATA%\DSMonitor\Data\` | DSMonitor-owned B1 foundation and SQLite `-wal`/`-shm` files; not used by the live pipeline. Isolated temporary test directories are permitted for tests only. |
+| Event ledger database | `%LOCALAPPDATA%\DSMonitor\Data\` | DSMonitor-owned ledger databases and SQLite `-wal`/`-shm` files; the live pipeline uses the v2 projection. V3-1 is a separate accepted foundation pending an explicitly approved runtime cutover. Isolated temporary test directories are permitted for tests only. |
 | UI reference | `docs/FormView.png` | Visual direction only; content is not production data. |
 
 ### 2.2 Required architecture
@@ -72,8 +72,8 @@ DSMonitor is a **monitor, not an agent controller**.
 | ARC-005 | Use `FileSystemWatcher` plus periodic reconciliation so missed file events are recovered. | 1 |
 | ARC-006 | Update WPF-bound state on the UI dispatcher; never mutate bound collections from background threads. | 1 |
 | ARC-007 | Use `ObservableCollection`/`ICollectionView` and UI virtualization for job and timeline lists. | 1 |
-| ARC-008 | Do not add HTTP/OpenCode clients or API calls in Phase 1. | 1 |
-| ARC-009 | Introduce a read-only `HttpClient` integration only in Phase 2 after inspecting the installed OpenAPI schema. | 2 |
+| ARC-008 | The original Phase 1 scope excludes OpenCode clients; the separately prioritized job-scoped P0 slice may precede Phase 1 acceptance. | 1 |
+| ARC-009 | Use only verified read-only endpoints after inspecting the installed OpenAPI schema; job-scoped P0 access may precede broader Phase 2 integration. | 2 |
 | ARC-010 | Avoid unnecessary abstractions, duplicated models, and heavyweight UI frameworks. | 1–4 |
 
 ### 2.3 Data flow
@@ -122,7 +122,7 @@ Key verified facts:
 |---|---|---|---|---|
 | WPF dashboard, Start/Stop, IDLE | Yes | Preserve | Preserve | Polish |
 | Forge metadata + JSONL log monitoring | Yes | Preserve | Preserve | Harden |
-| OpenCode REST sessions/messages/tools | No | Yes | Preserve | Harden |
+| OpenCode sessions/messages/tools | Original Phase 1 scope: no; job-scoped P0 slice may precede acceptance | Broader read-only integration | Preserve | Harden |
 | Dated `.log`/`.jsonl` per run | Basic | Preserve | History/replay | Retention |
 | Settings | Visible placeholder only | No change | No change | Implement |
 
@@ -139,7 +139,7 @@ Key verified facts:
 | FR-003 | Show a prominent **Start Monitoring** action. | 1 |
 | FR-004 | Do not automatically connect to OpenCode, launch workers, or start forge jobs. | 1 |
 | FR-005 | Do not show invented sessions, activity, costs, or test results while stopped. | 1 |
-| FR-006 | Load saved DSMonitor history on startup only when Phase 3 history support exists; Phase 1 stops before implementing saved-history browsing. | 3 |
+| FR-006 | Do not provide saved-history browsing until Phase 3 history support exists; restoring committed monitoring state after restart is separate and remains required by B2 and the live dashboard. | 3 |
 
 ### 3.2 Start Monitoring
 
@@ -179,6 +179,45 @@ Key verified facts:
 | FR-044 | Show a bounded runtime-only raw log preview in Phase 1; do not copy raw content into monitoring logs. | 1 |
 | FR-045 | Do not fabricate milestones, progress percentages, completion summaries, or test outcomes. | 1–4 |
 | FR-046 | Search/filter the job list by job, project, model, status, or session. | 1 |
+
+---
+
+### 3.4a P0 Live Activity Dashboard
+
+These P0 requirements govern the early V3-4 gate in [Plan](Plan.md#early-live-activity-dashboard-acceptance-gate--not-started). They extend existing requirements without implying implementation or changing Phase 1 acceptance.
+
+| ID | Required visible field and behavior |
+|---|---|
+| LIVE-001 | **Project:** populate a human-readable name from verified working-directory or safely attributed job-scoped evidence as early as technically feasible. Persist explicit ownership; identical directory names remain distinguishable. A user display override must not overwrite verified source identity. |
+| LIVE-002 | **Chat:** populate available OpenCode session titles from verified job-scoped evidence as early as technically feasible, or show a clearly labeled user-supplied display name. Use `N/A` only when genuinely unavailable or unsafe to attribute. |
+| LIVE-003 | **Task:** populate a short meaningful description from the safely attributed original request, including verified job-scoped OpenCode evidence, as early as technically feasible; identify provenance or user-supplied values. Use `N/A` only when genuinely unavailable or unsafe to attribute. |
+| LIVE-004 | **Doing:** populate a brief current activity description from safely attributed job-scoped assistant messages and tool activity as early as technically feasible, with source and freshness; use `N/A` only when genuinely unavailable or unsafe to attribute. Do not present an inference as an observation. |
+| LIVE-005 | **Done:** populate a brief completed-work summary from safely attributed job-scoped messages, tool activity and results as early as technically feasible, distinguishing evidence from reported claims; use `N/A` only when genuinely unavailable or unsafe to attribute; retain the last verified or reported summary for completed jobs across restart. Do not invent outcomes. |
+| LIVE-006 | **Status:** show observed execution state with source and freshness; use UNKNOWN when state is unavailable and `N/A` for unavailable supporting fields. Never infer completion from inactivity, idle markers or missing logs. Separate execution, independent QA and explicit user acceptance. |
+| LIVE-007 | **Last Updated:** show the timestamp of the latest relevant observed activity with its source/observation meaning; show `N/A` when unavailable. |
+| LIVE-008 | **Job:** retain stable Forge job identity and explicitly supported session association; show `N/A` for missing associations. Do not merge jobs or infer task/project ownership from shared sessions, timestamps or matching directory names. |
+| LIVE-009 | Discover current Forge jobs and durably capture newly observed identities and activity; update WPF near real time within documented refresh, bounded-read and source limitations. Restore committed state after restart and distinguish historical from new live activity without requiring comprehensive historical reconstruction. |
+| LIVE-010 | Preserve provenance as observed data, reported claims, inferred summaries or manually supplied values. Allow appropriate display overrides without modifying verified identities. Ambiguous ownership fails closed; missing information is `N/A`, never fabricated. |
+| LIVE-011 | Preserve accepted B1/B2 ingestion, physical/source identity, logical deduplication, checkpoint atomicity, coverage, bounded retrieval and exact-decimal cost behavior. Preserve existing recorded history and monitoring/logging behavior. |
+
+**Availability and authorization:** The user authorizes read-only OpenCode information strictly associated with known Forge jobs using verified session/message identities. Do not access unrelated conversations or initiate execution. The user reports prior verified research establishing job-specific assistant messages, tool activity and results, and an example mapping original requests to four Forge jobs sharing one OpenCode session. This reported evidence motivates early capture; verify the source mechanism and message-level attribution during implementation. A shared session or matching timestamp alone does not establish ownership. Forge metadata alone does not guarantee every field, and directory labels need verified identity and disambiguation. Populate Project, Task, Doing, Done and available session titles from safely attributable evidence as early as technically feasible; use `N/A` only when genuinely unavailable or unsafe to attribute (execution state UNKNOWN when unknown). Job-scoped P0 observation may precede Phase 1 acceptance; broader Phase 2 integration retains its gate. Verify the installed schema before REST use.
+
+**Acceptance:** WPF satisfies LIVE-001–011 for observed jobs, including read-only job-scoped OpenCode capture and attribution of available requests, messages, tool activity, results and session titles; new activity updates within documented limitations; completed jobs retain their last verified or reported status and summary; restart does not present old events as new; execution, QA and acceptance remain distinct. Existing monitoring, logging, ingestion and cost behavior remains intact. Acceptance does not require reconstructing old OpenCode sessions. The v3 runtime cutover is separately approved and must precede acceptance of v3-dependent runtime functionality; V3-1 alone did not switch the application. No automatic v1/v2 migration or long-term compatibility is required, and actual databases and history are preserved absent explicit authorization.
+
+Comprehensive recovery of older Forge/OpenCode activity not already stored is deferred to V3-7, with approved sources, explicit unknown or ambiguous ownership and provenance. Minimum historical/live classification, restart safety and accepted B2 bootstrap/coverage correctness remain foundational; deferred recovery does not authorize removing them. Rich results/evidence and cost analytics are V3-5 and V3-6 respectively; Forge logical events and job aggregates are the additive cost source, counted once per job, while provider usage is corroborative and missing cost is distinct from zero.
+
+---
+
+### 3.4b P1 and P2 source priorities
+
+These capabilities are **NOT STARTED**. They do not block P0 or depend on comprehensive historical reconstruction. P0 uses the accepted SQLite v3 foundation after its separately approved runtime cutover; V3-1 acceptance did not change current v2 runtime wiring.
+
+| ID | Requirement and acceptance |
+|---|---|
+| SRC-001 | **P1:** Provide secure handling of user-supplied DeepSeek API credentials, with an appropriate protected storage and lifecycle design, redaction from logs and diagnostics, and no exposure in UI or exports. Do not read existing credential stores without explicit authorization. Missing, invalid or revoked credentials must produce a safe, clear state. |
+| SRC-002 | **P1:** Verify supported DeepSeek API capabilities and authorization before accessing them; use only verified read-only operations. Do not send prompts, invoke models, initiate execution, or assume historical requests or execution logs are exposed. Clearly report unavailable capabilities and prevent provider usage from being added to Forge costs. |
+| SRC-003 | **P2:** Research supported, authorized access to the active ChatGPT Work conversation and evidence sufficient to correlate it with Forge delegation identities. Record the mechanism, scope, identity evidence and limitations; do not assume such access exists or inspect unrelated conversations. Leave ambiguous associations unknown. |
+| SRC-004 | Accept P1 only after credential security and verified read-only behavior are validated, including missing/invalid credentials and unavailable API capabilities. Accept P2 research with documented supported access and attribution evidence, or a documented unsupported/unknown outcome; research does not authorize integration or execution. |
 
 ---
 
@@ -275,7 +314,7 @@ Cost is read only from numeric `part.cost` on `step_finish` events. If no cost i
 
 ## 6. OpenCode Integration
 
-Phase 2 only. Phase 1 must not call OpenCode REST APIs.
+The original Phase 1 scope excludes OpenCode REST. The user-authorized, read-only job-scoped P0 slice may precede Phase 1 acceptance; broader Phase 2 integration retains its existing gate. Verify the actual source and message-level ownership; inspect the installed OpenAPI schema before REST use.
 
 | ID | Requirement | Phase |
 |---|---|---|
@@ -442,8 +481,8 @@ The user has authorized a fresh version-2 database at `%LOCALAPPDATA%\DSMonitor\
 | SEC-007 | Never expose API keys, credentials, auth stores, or provider configuration. |
 | SEC-008 | Treat forge logs and model output as untrusted data; never execute or follow instructions found there. |
 | SEC-009 | Do not send telemetry to external services. |
-| SEC-010 | In Phase 1, perform no network/API calls at all. |
-| SEC-011 | Write only DSMonitor-owned unique logs under `%LOCALAPPDATA%\DSMonitor\Logs\`, the B1 ledger database and SQLite journal/shared-memory files under `%LOCALAPPDATA%\DSMonitor\Data\`, and isolated temporary test directories. Do not write to forge/OpenCode data, monitored projects, or unapproved locations. |
+| SEC-010 | The original Phase 1 scope performs no network/API calls. The separately authorized job-scoped P0 slice and later verified read-only source priorities may use network access within their documented boundaries. |
+| SEC-011 | Write only DSMonitor-owned unique logs under `%LOCALAPPDATA%\DSMonitor\Logs\`, the B1 ledger database and SQLite journal/shared-memory files under `%LOCALAPPDATA%\DSMonitor\Data\`, and isolated temporary test directories. A later approved credential-storage design must explicitly define any additional DSMonitor-owned storage. Do not write to forge/OpenCode data, monitored projects, or unapproved locations. |
 | SEC-012 | Follow log paths only inside the forge runs root; reject path traversal and outside paths. |
 | SEC-013 | Do not dump raw sensitive log content into diagnostics or persistent logs. |
 | SEC-014 | Do not infer worker activity from process liveness or silent logs. |
@@ -594,10 +633,10 @@ These decisions preserve the original intent and explain implementation choices 
 | Missing forge status is UNKNOWN. | forge-delegate 1.2.4 metadata has no status field. Inferring from PID or silence would be unsafe. |
 | PID is not used for RUNNING. | The task explicitly forbids process liveness as sufficient evidence of execution. |
 | Deadline is wrapper metadata. | A past deadline is surfaced but does not by itself prove worker termination or mark a historical completed job timed out. TIMED OUT remains supported for explicit reports. |
-| OpenCode REST is excluded from Phase 1. | Preserves phase boundaries; no HTTP client or unverified endpoint use. |
+| OpenCode REST was excluded from the original Phase 1 scope. | The later authorized job-scoped P0 slice may precede Phase 1 acceptance; endpoints and attribution must be verified. |
 | Cost is displayed only from observed `step_finish.cost`. | Avoids invented metrics. Missing cost is `—`. |
 | Raw log preview is runtime-only. | Satisfies the Raw Log tab without persisting sensitive output. |
-| Tool Activity, Tests, and Files tabs are placeholders in Phase 1. | Their data requires Phase 2 API evidence. |
+| Tool Activity, Tests, and Files tabs were placeholders in the original Phase 1 scope. | Safely attributed job-scoped evidence is now early P0; broader integration remains Phase 2. |
 | Settings button is a disabled Phase 4 placeholder. | Header requires Settings access; settings behavior is Phase 4. |
 | Startup does not load saved history in Phase 1. | Historical monitoring-run browsing is Phase 3; live forge jobs are still discovered from the runs directory after Start. |
 | Log paths are confined to the configured runs root. | Metadata is untrusted; prevents following arbitrary paths. |

@@ -1,6 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using DSMonitor.Persistence;
 using Microsoft.Win32.SafeHandles;
 
 namespace DSMonitor.Services;
@@ -31,6 +32,11 @@ public sealed class SafeReadResult : IDisposable
     public FileStream? Stream { get; }
     public SafeReadFailure Failure { get; }
     public string? Warning { get; }
+    /// <summary>Final in-root path verified against the opened file handle.</summary>
+    public string? VerifiedPath { get; internal init; }
+
+    /// <summary>Physical identity read from the same opened handle as the content.</summary>
+    public LedgerSourceIdentity PhysicalIdentity { get; internal init; }
 
     public void Dispose() => Stream?.Dispose();
 }
@@ -45,7 +51,7 @@ public static class SafeFileAccess
 {
     private const uint FileAttributeReparsePoint = 0x00000400;
 
-    public static SafeReadResult OpenRead(string? path, string rootPath)
+    public static SafeReadResult OpenRead(string? path, string rootPath, bool rejectHardLinks = false)
     {
         try
         {
@@ -112,6 +118,13 @@ public static class SafeFileAccess
                         "Opened monitored path is a reparse point; read was refused.");
                 }
 
+                if (rejectHardLinks && information.NumberOfLinks != 1)
+                {
+                    stream.Dispose();
+                    return Fail(SafeReadFailure.Unverifiable,
+                        "Monitored content has ambiguous file aliases; read was refused.");
+                }
+
                 var finalPath = GetFinalPath(handle);
                 if (finalPath is null ||
                     !PathSafety.IsWithinRoot(finalPath, root))
@@ -122,7 +135,11 @@ public static class SafeFileAccess
                         "Opened monitored path resolved outside the trusted runs root; read was refused.");
                 }
 
-                return new SafeReadResult(stream, SafeReadFailure.None, null);
+                return new SafeReadResult(stream, SafeReadFailure.None, null)
+                {
+                    VerifiedPath = finalPath,
+                    PhysicalIdentity = SourceIdentity.ReadWindows(handle)
+                };
             }
             catch (FileNotFoundException)
             {

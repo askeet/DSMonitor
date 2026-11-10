@@ -108,6 +108,32 @@ public sealed class LedgerException : Exception
     public LedgerStorageFailure Failure { get; }
 }
 
+/// <summary>
+/// Transient evidence produced only by a successful ingest. It binds the job
+/// and normalized source association to the exact physical identity used for
+/// the generation and the captured/committed byte positions. It is never
+/// persisted and is absent on every failed ingest path.
+/// </summary>
+public sealed record LedgerSourceObservation(
+    string JobId,
+    string SourcePath,
+    LedgerSourceIdentity Identity,
+    LedgerSourceIdentity PhysicalIdentity,
+    long GenerationId,
+    long CapturedLength,
+    long CommittedOffset,
+    bool PartialTrailingRecord)
+{
+    public bool IsConsistent =>
+        Identity.IsVerified &&
+        PhysicalIdentity.IsVerified &&
+        Identity.Equals(PhysicalIdentity) &&
+        GenerationId > 0 &&
+        CapturedLength >= 0 &&
+        CommittedOffset >= 0 &&
+        CommittedOffset <= CapturedLength;
+}
+
 public sealed record LedgerIngestResult(
     LedgerIngestStatus Status,
     long? GenerationId,
@@ -134,6 +160,13 @@ public sealed record LedgerIngestResult(
     public LedgerCoverage? Coverage { get; init; }
 
     public bool PartialTrailingRecord { get; init; }
+
+    /// <summary>
+    /// Present only for a successful <see cref="LedgerIngestStatus.Committed"/>
+    /// or <see cref="LedgerIngestStatus.NoData"/> result, including successful
+    /// partial-trailing observations. Failed ingests expose no evidence.
+    /// </summary>
+    public LedgerSourceObservation? SourceObservation { get; init; }
 }
 
 /// <summary>

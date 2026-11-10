@@ -73,6 +73,7 @@ public static class ForgeMetadataParser
 
         var rawLogPath = GetString(root, "logPath") ?? GetString(root, "log_path");
         string? logPath;
+        var hasExplicitLogPath = false;
         if (!string.IsNullOrWhiteSpace(rawLogPath))
         {
             var candidate = Path.IsPathRooted(rawLogPath)
@@ -82,6 +83,7 @@ public static class ForgeMetadataParser
             if (PathSafety.IsWithinRoot(candidate, runsRoot))
             {
                 logPath = Path.GetFullPath(candidate);
+                hasExplicitLogPath = true;
             }
             else
             {
@@ -113,6 +115,7 @@ public static class ForgeMetadataParser
             JobId = jobId,
             MetadataPath = metadataPath,
             LogPath = logPath,
+            HasExplicitLogPath = hasExplicitLogPath,
             Model = GetString(root, "model"),
             Directory = GetString(root, "directory"),
             Started = started,

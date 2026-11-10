@@ -12,6 +12,43 @@
 
 ---
 
+## V3 delivery order — Live Activity first
+
+This is delivery priority, not authorization to implement or change acceptance. Existing Phase 1–4 and B1–B4 acceptance statuses and gates remain unchanged. The user has authorized early read-only OpenCode observation strictly scoped to known Forge jobs through verified session/message identities; this P0 slice may precede Phase 1 acceptance and the broader Phase 2 integration. It must not access unrelated conversations or initiate execution. Verify the access mechanism and attribution before use; this roadmap does not authorize implementation during this documentation task. Comprehensive history remains deferred. B3 and B4 remain NOT STARTED with their existing dependencies.
+
+**Product priorities (all new work NOT STARTED):**
+
+- **P0 — Job-scoped OpenCode Live Activity:** deliver V3-2–V3-4 using the accepted SQLite v3 foundation, with the separately approved runtime cutover and the early dashboard gate below. The current runtime is v2; acceptance of V3-1 did not switch it.
+- **P1 — DeepSeek API access:** design secure user-provided credential handling and read-only access only to verified supported API capabilities. Verify capabilities and authorization before implementation; do not assume historical request or execution logs exist. No model execution or prompts. Record unavailable capabilities honestly.
+- **P2 — ChatGPT Work correlation research:** investigate supported, authorized access to the active conversation and reliable correlation with Forge delegation identities. This is research, not a promise of access or permission to inspect unrelated conversations; unverified or ambiguous associations remain unknown.
+
+Comprehensive historical reconstruction is not a prerequisite for P0, P1 or P2. These priorities are separate from the existing V3 package numbering and do not change B3/B4 or Phase acceptance statuses. Future implementation, credential-storage design, v3 cutover and any access beyond the authorized job-scoped OpenCode boundary remain subject to their applicable authorizations.
+The documents record V3-1 and mention V3-2 as not started, but do not define V3-2 through V3-7 packages. No old package scopes are evidenced to remap. The following assigns new IDs and maps existing work by scope, without inventing prior package definitions. All new packages and the early milestone are **NOT STARTED**; accepted B2 capabilities do not establish their completion.
+
+| New package / old reference | Priority and dependencies |
+|---|---|
+| V3-1 / existing V3-1 | **ACCEPTED** SQLite foundation; section 1.14 evidence unchanged. |
+| V3-2 / previously only named NOT STARTED | Live Monitoring Foundation: reuse accepted B1/B2 ingestion, identity, deduplication, atomic cursor/checkpoints, coverage and cost behavior; durably capture current jobs and activity, including verified job-scoped OpenCode messages, tool activity and results, with minimum historical/live separation and restart correctness. Requires V3-1 and a separately approved, implemented v3 runtime cutover before v3-dependent runtime acceptance. Current runtime remains v2. |
+| V3-3 / no documented old package | Projects, Chats & Tasks: durable explicit associations, distinguishable project identities, display names/overrides and N/A handling. Depends on V3-2; use verified job-scoped OpenCode evidence, including original requests and available session titles, as early as technically feasible. |
+| V3-4 / no documented old package | Early Live Activity UI: gate below, after V3-2 and minimum V3-3 associations and display handling. Remaining V3-3 enhancements can follow; unavailable fields are N/A. |
+| V3-5 / no documented old package | Enhanced Content, Results & Evidence: richer permitted summaries, outcomes and QA evidence; follows early UI and approved sources. |
+| V3-6 / no documented old package | Costs and Analytics: extend reporting after live identity/associations; use accepted Forge logical events and job aggregates once per job; provider/OpenCode usage corroborates, never adds another Forge charge; distinguish missing cost from zero. |
+| V3-7 / no documented old package | Historical Recovery: later reconstruct older activity not yet stored from specifically approved Forge/OpenCode sources; preserve unknown and ambiguous records, provenance and existing history. Depends on live identity and separation; never a prerequisite for V3-4. |
+| Integrated acceptance / no documented old V3 package | After capabilities included in the authorized release are completed, validate them together, including dependencies and remaining limits. Distinct from B4; does not itself accept Phase 1. |
+
+Cutover must be separately approved and planned against accepted B1/B2 guarantees. SQLite v3 is the sole intended runtime database after cutover; V3-1 did not perform it. No automatic v1/v2 migration or long-term compatibility is required. Preserve real databases, sidecars and recorded history unless explicitly authorized otherwise. Existing B2 bootstrap and coverage behavior remains a regression contract: prioritize newly observed activity fairly and classify initial records without treating old events as new; do not remove accepted correctness to avoid comprehensive recovery.
+
+### Early Live Activity Dashboard acceptance gate — NOT STARTED
+
+- Show observed Forge jobs in WPF with Project, Chat, Task, Doing, Done, Status, Last Updated and stable Job identity with relevant session association; populate labels and summaries from safely attributed Forge and job-scoped OpenCode evidence as early as technically feasible; use `N/A` only when genuinely unavailable or unsafe to attribute.
+- Update running jobs as activity is observed within documented refresh and bounded-read limitations; expose source and freshness of status. Retain the last verified or reported summary and status for completed jobs across restart, with provenance and no fabricated outcomes.
+- Preserve monitoring, logging, ingestion and cost behavior; restart must not relabel historical events as new live activity. Do not guess job/session/task/project associations from timestamps or matching directory names.
+- Distinguish execution completion, independent QA and explicit user acceptance. Accept this milestone without reconstructing all historical OpenCode sessions; comprehensive enrichment is V3-5 and V3-7 work.
+
+Source gaps and field-level contracts are specified in [Project Requirements](Project%20Requirements.md#34a-p0-live-activity-dashboard). Forge metadata alone does not establish all fields. The user reports prior verified research showing job-specific assistant messages, tool activity, results, and an example mapping original requests to four Forge jobs sharing one session. Preserve that evidence without treating a shared session as proof of ownership; verify the actual source mechanism and message-level associations when implementing. Available session titles and safely attributed requests and summaries are early P0 inputs, not V3-7 history work.
+
+---
+
 ## Phase 1 — WPF Dashboard and Forge Monitoring
 
 **Status: IN PROGRESS / NOT ACCEPTED** — B1 and B2 are accepted within their documented limitations (sections 1.10 and 1.11). B2 integrates durable aggregates, historical bootstrap and live monitoring; independent B2 QA approved the final implementation. B3 and B4 remain not started, and final Phase 1 acceptance remains pending.
@@ -439,7 +476,7 @@ Reuse historical B1 and unchanged-check evidence where applicable; repeat checks
 
 **Goal:** Add read-only observation of the existing OpenCode 2.2.6 service and correlate it with forge jobs, without controlling the worker.
 
-**Dependencies:** Phase 1 accepted; installed OpenCode service/OpenAPI schema; confirmed localhost endpoint; no changes to external configuration.
+**Dependencies:** Phase 1 accepted for the broader Phase 2 scope; installed OpenCode service/OpenAPI schema and confirmed localhost endpoint for any REST use; no changes to external configuration. The authorized job-scoped P0 slice in V3-2–V3-4 may precede Phase 1 acceptance, subject to verified source and message-level attribution.
 
 ### 2.1 Tasks
 

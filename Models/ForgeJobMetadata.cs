@@ -10,6 +10,8 @@ public sealed record ForgeJobMetadata
     public required string JobId { get; init; }
     public required string MetadataPath { get; init; }
     public string? LogPath { get; init; }
+    /// <summary>True only for an explicit in-root metadata log association.</summary>
+    public bool HasExplicitLogPath { get; init; }
     public string? Model { get; init; }
     public string? Directory { get; init; }
     public DateTimeOffset? Started { get; init; }

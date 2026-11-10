@@ -663,6 +663,11 @@
                                     </DataGridTemplateColumn.CellTemplate>
                                 </DataGridTemplateColumn>
 
+                                <DataGridTextColumn Header="DOING · OBSERVED" Width="220" Binding="{Binding DoingText}" IsReadOnly="True" />
+                                <DataGridTextColumn Header="DONE · REPORTED" Width="220" Binding="{Binding DoneText}" IsReadOnly="True" />
+                                <DataGridTextColumn Header="CHAT" Width="130" Binding="{Binding ChatText}" IsReadOnly="True" />
+                                <DataGridTextColumn Header="TASK" Width="120" Binding="{Binding TaskText}" IsReadOnly="True" />
+                                <DataGridTextColumn Header="LAST UPDATED · SOURCE" Width="140" Binding="{Binding LiveUpdatedText}" IsReadOnly="True" />
                                 <DataGridTemplateColumn Header="MODEL" Width="92">
                                     <DataGridTemplateColumn.HeaderTemplate>
                                         <DataTemplate>
@@ -909,26 +914,19 @@
                                                 CornerRadius="9"
                                                 Padding="12"
                                                 Margin="0,0,0,12">
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel>
-                                                    <TextBlock Text="COMPLETION RESULT" Style="{StaticResource CardLabel}" />
-                                                    <TextBlock Text="Not reported in Phase 1"
-                                                               Foreground="{StaticResource TextSecondary}"
-                                                               FontSize="11.5"
-                                                               Margin="0,4,0,0" />
-                                                </StackPanel>
-                                                <StackPanel Grid.Column="1">
-                                                    <TextBlock Text="WORKER STATE" Style="{StaticResource CardLabel}" />
-                                                    <TextBlock Text="Not monitored · Phase 2"
-                                                               Foreground="{StaticResource TextSecondary}"
-                                                               FontSize="11.5"
-                                                               Margin="0,4,0,0" />
-                                                </StackPanel>
-                                            </Grid>
+                                            <StackPanel>
+                                                <TextBlock Text="LIVE ACTIVITY · JOB CAPTURE" Style="{StaticResource CardLabel}" />
+                                                <TextBlock Text="TASK" Style="{StaticResource CardLabel}" Margin="0,12,0,4" />
+                                                <TextBlock Text="{Binding TaskText}" Style="{StaticResource DetailValue}" />
+                                                <TextBlock Text="DOING · MOST RECENT OBSERVED ACTIVITY" Style="{StaticResource CardLabel}" />
+                                                <TextBlock Text="{Binding DoingText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
+                                                <TextBlock Text="{Binding DoingProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
+                                                <TextBlock Text="DONE · AGENT-REPORTED RESULT, UNVERIFIED" Style="{StaticResource CardLabel}" Margin="0,14,0,0" />
+                                                <TextBlock Text="{Binding DoneText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
+                                                <TextBlock Text="{Binding DoneProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
+                                                <TextBlock Text="{Binding StatusProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" Margin="0,12,0,0" />
+                                                <TextBlock Text="{Binding LiveActivityNotice}" Foreground="{StaticResource TextSecondary}" FontSize="10.5" TextWrapping="Wrap" Margin="0,12,0,0" />
+                                            </StackPanel>
                                         </Border>
 
                                         <Border Background="#101A14"

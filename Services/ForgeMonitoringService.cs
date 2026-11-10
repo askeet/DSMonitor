@@ -438,6 +438,8 @@ public sealed class ForgeMonitoringService
         cancellationToken.ThrowIfCancellationRequested();
 
         var discovery = _discovery.Discover();
+        var activityPreflight = JobLiveActivityReader.Preflight(
+            discovery.Jobs, _runsRoot, cancellationToken);
         var jobs = new List<ForgeJobSnapshot>();
         var globalWarnings = new List<string>(state.StartupWarnings);
         globalWarnings.AddRange(discovery.Warnings);
@@ -562,6 +564,7 @@ public sealed class ForgeMonitoringService
                 state.Readers[metadata.JobId] = primaryReader;
             }
 
+            LedgerSourceObservation? primarySourceObservation = null;
             foreach (var sourcePath in distinctSources)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -648,6 +651,11 @@ public sealed class ForgeMonitoringService
                             coverageStatus,
                             observedAt);
                         continue;
+                    }
+
+                    if (isPrimary)
+                    {
+                        primarySourceObservation = result.SourceObservation;
                     }
 
                     if (result.AcceptedEvents.Count > 0)
@@ -779,6 +787,22 @@ public sealed class ForgeMonitoringService
                     : null,
                 HasIncompleteCoverage = coverage.State != LedgerCoverageState.Clean,
                 HasObservedAmbiguousTimestamps = committedAggregate.TimelineAmbiguous,
+                LiveActivity = !registrationConflict &&
+                               primarySourceObservation is { } primaryObservation &&
+                               coverage.State != LedgerCoverageState.Conflict &&
+                               activityPreflight.TryGetValue(metadata.JobId, out var activityEvidence)
+                    ? JobLiveActivityReader.Read(
+                        metadata,
+                        activityEvidence,
+                        primaryObservation,
+                        _runsRoot,
+                        observedAt,
+                        cancellationToken,
+                        _options.MaxBytesPerPoll)
+                    : new LiveActivitySnapshot
+                    {
+                        Availability = "N/A — durable source unavailable or conflicting; no cached excerpt is shown."
+                    },
                 Events = timeline.RetainSourceOrder(),
                 Warnings = jobWarnings.Distinct(StringComparer.Ordinal).ToArray(),
                 ObservedAt = observedAt

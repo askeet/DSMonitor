@@ -1,14 +1,12 @@
 using System.Data;
 using System.Globalization;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using DSMonitor.Models;
 using DSMonitor.Parsing;
 using DSMonitor.Services;
 using Microsoft.Data.Sqlite;
-using Microsoft.Win32.SafeHandles;
 
 namespace DSMonitor.Persistence;
 
@@ -81,7 +79,8 @@ public sealed class EventLedger : IDisposable
     /// <summary>
     /// Opens the V3 foundational schema in its own fresh database. Existing B1,
     /// B2, and V3 databases are version-checked and never migrated. This is a
-    /// persistence profile only; the live monitoring pipeline is not cut over.
+    /// persistence profile used by the live dashboard; schema creation does
+    /// not migrate or import either legacy profile.
     /// </summary>
     public static EventLedger OpenV3Projection(
         string databasePath,
@@ -245,6 +244,16 @@ public sealed class EventLedger : IDisposable
 
         var fullPath = Path.GetFullPath(sourcePath);
         var now = observedAt ?? DateTimeOffset.UtcNow;
+        LedgerSourceObservation Observation(long generationId, long committedOffset, bool partial) =>
+            new(
+                jobId,
+                fullPath,
+                identity,
+                opened.PhysicalIdentity,
+                generationId,
+                length,
+                committedOffset,
+                partial);
 
         lock (_gate)
         {
@@ -387,7 +396,8 @@ public sealed class EventLedger : IDisposable
                     {
                         Aggregate = noDataOutcome?.Aggregate,
                         Bootstrap = noDataOutcome?.Bootstrap,
-                        Coverage = noDataOutcome?.Coverage
+                        Coverage = noDataOutcome?.Coverage,
+                        SourceObservation = Observation(generationId, cursor, partial: false)
                     };
                 }
 
@@ -473,7 +483,11 @@ public sealed class EventLedger : IDisposable
                         Aggregate = partialOutcome?.Aggregate,
                         Bootstrap = partialOutcome?.Bootstrap,
                         Coverage = partialOutcome?.Coverage,
-                        PartialTrailingRecord = _schema.SupportsProjection
+                        PartialTrailingRecord = _schema.SupportsProjection,
+                        SourceObservation = Observation(
+                            generationId,
+                            cursor,
+                            partial: _schema.SupportsProjection)
                     };
                 }
 
@@ -651,7 +665,11 @@ public sealed class EventLedger : IDisposable
                     Aggregate = batchOutcome?.Aggregate,
                     Bootstrap = batchOutcome?.Bootstrap,
                     Coverage = batchOutcome?.Coverage,
-                    PartialTrailingRecord = _schema.SupportsProjection && hasPartialTrailing
+                    PartialTrailingRecord = _schema.SupportsProjection && hasPartialTrailing,
+                    SourceObservation = Observation(
+                        generationId,
+                        newCursor,
+                        partial: _schema.SupportsProjection && hasPartialTrailing)
                 };
             }
             catch (LedgerException)
@@ -5764,32 +5782,8 @@ public sealed class EventLedger : IDisposable
         return new LedgerException(failure, message, exception);
     }
 
-    private static LedgerSourceIdentity ReadWindowsIdentity(FileStream stream)
-    {
-        try
-        {
-            if (!GetFileInformationByHandle(stream.SafeFileHandle, out var information))
-            {
-                return default;
-            }
-
-            var fileIndex =
-                ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
-            var creationTicks =
-                ((long)information.CreationTime.dwHighDateTime << 32) |
-                (uint)information.CreationTime.dwLowDateTime;
-
-            return new LedgerSourceIdentity(
-                information.VolumeSerialNumber,
-                fileIndex,
-                creationTicks);
-        }
-        catch (Exception ex) when (
-            ex is DllNotFoundException or EntryPointNotFoundException or IOException)
-        {
-            return default;
-        }
-    }
+    private static LedgerSourceIdentity ReadWindowsIdentity(FileStream stream) =>
+        SourceIdentity.ReadWindows(stream);
 
     private void ThrowIfDisposed()
     {
@@ -5813,24 +5807,4 @@ public sealed class EventLedger : IDisposable
         }
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ByHandleFileInformation
-    {
-        public uint FileAttributes;
-        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
-        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
-        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
-        public uint VolumeSerialNumber;
-        public uint FileSizeHigh;
-        public uint FileSizeLow;
-        public uint NumberOfLinks;
-        public uint FileIndexHigh;
-        public uint FileIndexLow;
-    }
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandle(
-        SafeFileHandle handle,
-        out ByHandleFileInformation information);
 }
