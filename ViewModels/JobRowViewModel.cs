@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using DSMonitor.Models;
 using DSMonitor.Services;
@@ -10,10 +11,14 @@ public sealed class JobRowViewModel : ObservableObject
     public const int MaxTimelineEvents = TimelineOrdering.DefaultCapacity;
 
     private ForgeJobStatus _status = ForgeJobStatus.Unknown;
-    private string _projectText = "—";
+    private string _projectText = "N/A";
     private string _projectTooltip = string.Empty;
     private string _modelText = "—";
     private string _startedText = "—";
+    private string _durationText = "N/A";
+    private string _durationTooltip = "N/A — started or last activity is unavailable; duration is not inferred.";
+    private double _durationSortSeconds = double.PositiveInfinity;
+    private string _jobDisplayText = string.Empty;
     private string _elapsedText = "—";
     private string _lastActivityText = "—";
     private string _sessionText = "Not reported";
@@ -33,14 +38,29 @@ public sealed class JobRowViewModel : ObservableObject
 
     public ObservableCollection<MonitoringEvent> RecentEvents { get; } = new();
     public string JobId { get; private set; } = string.Empty;
+    public string JobDisplayText => _jobDisplayText;
     public ForgeJobSnapshot Snapshot { get; private set; } = null!;
     public DateTimeOffset StartedSort { get; private set; } = DateTimeOffset.MinValue;
     public string StatusText => _status.ToDisplay();
+
+    /// <summary>
+    /// V1 reported-status display. The value comes from one unambiguous
+    /// job-scoped agent text extraction and remains unverified; missing,
+    /// ambiguous, unavailable, or ineligible evidence renders N/A.
+    /// </summary>
+    public string ReportedStatusText => ReportedStatusPresentation.ToDisplay(Snapshot.ReportedStatus);
+
+    /// <summary>Unverified agent-reported text with the complete untruncated value.</summary>
+    public string ReportedStatusTooltip => ReportedStatusPresentation.ToTooltip(Snapshot.ReportedStatus);
+
     public bool IsActive => _status.IsActive();
     public string ProjectText => _projectText;
     public string ProjectTooltip => _projectTooltip;
     public string ModelText => _modelText;
     public string StartedText => _startedText;
+    public string DurationText => _durationText;
+    public string DurationTooltip => _durationTooltip;
+    public double DurationSortSeconds => _durationSortSeconds;
     public string ElapsedText => _elapsedText;
     public string LastActivityText => _lastActivityText;
     public string SessionText => _sessionText;
@@ -88,6 +108,7 @@ public sealed class JobRowViewModel : ObservableObject
         Snapshot = snapshot;
         JobId = snapshot.JobId;
         StartedSort = snapshot.Metadata.Started ?? DateTimeOffset.MinValue;
+        SetText(FormatJobDisplay(snapshot.JobId), ref _jobDisplayText, nameof(JobDisplayText));
 
         if (_status != snapshot.Status)
         {
@@ -97,10 +118,12 @@ public sealed class JobRowViewModel : ObservableObject
             OnPropertyChanged(nameof(ForgeStatusLabel));
         }
 
-        SetText(snapshot.Metadata.Directory is { Length: > 0 } directory
-            ? directory
-            : "N/A", ref _projectText, nameof(ProjectText));
-        SetText(snapshot.Metadata.Directory ?? string.Empty, ref _projectTooltip, nameof(ProjectTooltip));
+        var directory = snapshot.Metadata.Directory;
+        SetText(
+            TryGetProjectLeaf(directory, out var projectLeaf) ? projectLeaf : "N/A",
+            ref _projectText,
+            nameof(ProjectText));
+        SetText(directory ?? string.Empty, ref _projectTooltip, nameof(ProjectTooltip));
         SetText(snapshot.Metadata.Model ?? "—", ref _modelText, nameof(ModelText));
         SetText(
             snapshot.Metadata.Started is { } started
@@ -108,6 +131,7 @@ public sealed class JobRowViewModel : ObservableObject
                 : "—",
             ref _startedText,
             nameof(StartedText));
+        UpdateDuration(snapshot);
         SetText(snapshot.SessionId ?? "Not reported", ref _sessionText, nameof(SessionText));
         SetText(snapshot.ParsedEventCount.ToString(), ref _eventCountText, nameof(EventCountText));
         SetText(snapshot.CostText, ref _costText, nameof(CostText));
@@ -133,7 +157,8 @@ public sealed class JobRowViewModel : ObservableObject
         OnPropertyChanged(nameof(Snapshot));
         foreach (var property in new[] { nameof(ChatText), nameof(TaskText), nameof(DoingText),
                      nameof(DoneText), nameof(DoingProvenance), nameof(DoneProvenance),
-                     nameof(LiveActivityNotice), nameof(LiveUpdatedText), nameof(StatusProvenance) })
+                     nameof(LiveActivityNotice), nameof(LiveUpdatedText), nameof(StatusProvenance),
+                     nameof(ReportedStatusText), nameof(ReportedStatusTooltip) })
             OnPropertyChanged(property);
     }
 
@@ -149,6 +174,9 @@ public sealed class JobRowViewModel : ObservableObject
 
     public void RefreshElapsed(DateTimeOffset now)
     {
+        // Original right-panel behavior: active/unknown jobs use the wall clock;
+        // completed jobs use their last observed activity. The table's Duration
+        // column intentionally does not call this method.
         var started = Snapshot.Metadata.Started;
         if (started is null)
         {
@@ -170,6 +198,45 @@ public sealed class JobRowViewModel : ObservableObject
         {
             SetText("—", ref _elapsedText, nameof(ElapsedText));
         }
+    }
+
+    private void UpdateDuration(ForgeJobSnapshot snapshot)
+    {
+        if (snapshot.Metadata.Started is not { } started ||
+            snapshot.LastActivity is not { } lastActivity)
+        {
+            SetDurationUnavailable(
+                "N/A — started or last activity is unavailable; duration is not inferred.");
+            return;
+        }
+
+        var duration = lastActivity - started;
+        if (duration < TimeSpan.Zero)
+        {
+            SetDurationUnavailable(
+                "N/A — last activity precedes started; duration is invalid and is not inferred.");
+            return;
+        }
+
+        SetProperty(ref _durationSortSeconds, duration.TotalSeconds, nameof(DurationSortSeconds));
+        SetText(FormatDuration(duration), ref _durationText, nameof(DurationText));
+        SetText(
+            $"Observed duration {FormatDurationDetail(duration)} " +
+            $"(started {started.ToLocalTime():yyyy-MM-dd HH:mm:ss}, " +
+            $"last activity {lastActivity.ToLocalTime():yyyy-MM-dd HH:mm:ss}). " +
+            "Static observation; no live timer.",
+            ref _durationTooltip,
+            nameof(DurationTooltip));
+    }
+
+    private void SetDurationUnavailable(string tooltip)
+    {
+        SetProperty(
+            ref _durationSortSeconds,
+            double.PositiveInfinity,
+            nameof(DurationSortSeconds));
+        SetText("N/A", ref _durationText, nameof(DurationText));
+        SetText(tooltip, ref _durationTooltip, nameof(DurationTooltip));
     }
 
     private void MergeEvents(IReadOnlyList<MonitoringEvent> incoming)
@@ -240,18 +307,103 @@ public sealed class JobRowViewModel : ObservableObject
         return true;
     }
 
-    private static string LeafDirectory(string path)
+    private static bool TryGetProjectLeaf(string? path, out string leaf)
     {
+        leaf = string.Empty;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
         try
         {
-            var trimmed = Path.TrimEndingDirectorySeparator(path);
-            var leaf = Path.GetFileName(trimmed);
-            return string.IsNullOrWhiteSpace(leaf) ? path : leaf;
+            if (path.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+            {
+                return false;
+            }
+
+            var trimmed = TrimTrailingDirectorySeparators(path);
+            if (trimmed.Length == 0 || !Path.IsPathFullyQualified(trimmed))
+            {
+                return false;
+            }
+
+            var root = Path.GetPathRoot(trimmed);
+            if (string.IsNullOrEmpty(root) ||
+                string.Equals(
+                    TrimTrailingDirectorySeparators(trimmed),
+                    TrimTrailingDirectorySeparators(root),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var candidate = Path.GetFileName(trimmed);
+            if (string.IsNullOrWhiteSpace(candidate) ||
+                candidate is "." or ".." ||
+                candidate.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            {
+                return false;
+            }
+
+            leaf = candidate;
+            return true;
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
-            return path;
+            return false;
         }
+    }
+
+    private static string TrimTrailingDirectorySeparators(string path)
+    {
+        var end = path.Length;
+        while (end > 0 &&
+               (path[end - 1] == Path.DirectorySeparatorChar ||
+                path[end - 1] == Path.AltDirectorySeparatorChar))
+        {
+            end--;
+        }
+
+        return path[..end];
+    }
+
+    private static string FormatJobDisplay(string jobId)
+    {
+        if (string.IsNullOrEmpty(jobId))
+        {
+            return jobId;
+        }
+
+        var elementStarts = StringInfo.ParseCombiningCharacters(jobId);
+        return elementStarts.Length <= 4
+            ? jobId
+            : "…" + jobId[elementStarts[^4]..];
+    }
+
+    private static string FormatDurationDetail(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+        {
+            duration = TimeSpan.Zero;
+        }
+
+        if (duration.TotalDays >= 1)
+        {
+            return $"{(int)duration.TotalDays}d {duration.Hours}h {duration.Minutes}m {duration.Seconds}s";
+        }
+
+        if (duration.TotalHours >= 1)
+        {
+            return $"{(int)duration.TotalHours}h {duration.Minutes}m {duration.Seconds}s";
+        }
+
+        if (duration.TotalMinutes >= 1)
+        {
+            return $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
+        }
+
+        return $"{(int)duration.TotalSeconds}s";
     }
 
     private static string FormatDuration(TimeSpan duration)

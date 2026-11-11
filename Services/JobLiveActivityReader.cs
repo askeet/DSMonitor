@@ -203,6 +203,7 @@ public static class JobLiveActivityReader
 
             ActivityExcerpt? doing = null;
             ActivityExcerpt? done = null;
+            ActivityExcerpt? latestText = null;
             var texts = new Dictionary<(string Session, string Message), (ActivityExcerpt Excerpt, bool VerifiedAssistant)>();
             // Discard the first record when starting mid-file, even if it
             // happens to be complete. Never parse a possibly partial record.
@@ -273,6 +274,7 @@ public static class JobLiveActivityReader
                         doing = Excerpt(
                             text,
                             verifiedAssistant ? AssistantTextKind : RolelessTextKind);
+                        latestText = doing;
                         texts[key] = (doing, verifiedAssistant);
                     }
                     else if (isTool)
@@ -317,6 +319,7 @@ public static class JobLiveActivityReader
             {
                 Doing = doing,
                 Done = done,
+                LatestText = latestText,
                 Availability = "Bounded source re-read; timestamps describe source records, not execution liveness."
             };
         }
@@ -325,6 +328,87 @@ public static class JobLiveActivityReader
             return Unavailable("N/A — job source changed or became unavailable during read.");
         }
     }
+
+    /// <summary>
+    /// Selects the newest eligible text excerpt by physical source order that
+    /// may carry an explicit reported status. The latest text is retained even
+    /// after later tool activity, so a stale finished result cannot win merely
+    /// because a new finish event has not arrived. If the newest text lacks a
+    /// part identity or record binding, the result is null rather than falling
+    /// back to an older report.
+    /// </summary>
+    public static FullReportTarget? SelectReportedStatusTarget(LiveActivitySnapshot activity)
+    {
+        ArgumentNullException.ThrowIfNull(activity);
+
+        var newestText = SelectNewest(
+            activity.LatestText,
+            IsTextExcerpt(activity.Doing) ? activity.Doing : null);
+        var excerpt = SelectNewest(newestText, activity.Done);
+        if (excerpt is null ||
+            string.IsNullOrWhiteSpace(excerpt.PartId) ||
+            string.IsNullOrWhiteSpace(excerpt.RecordDigest))
+        {
+            return null;
+        }
+
+        return FullReportTarget.FromExcerpt(excerpt);
+    }
+
+    private static ActivityExcerpt? SelectNewest(
+        ActivityExcerpt? first,
+        ActivityExcerpt? second)
+    {
+        if (first is null)
+        {
+            return second;
+        }
+
+        if (second is null)
+        {
+            return first;
+        }
+
+        return first.ByteOffset >= second.ByteOffset ? first : second;
+    }
+
+    /// <summary>
+    /// Reuses the guarded job-specific full-report retrieval and the pure
+    /// reported-status parser for one eligible text excerpt. Returns null when
+    /// no eligible text target is available. An ineligible, incomplete,
+    /// unavailable, or unsafe report still yields a non-null extraction that the
+    /// presentation policy maps to N/A; no other part is substituted.
+    /// </summary>
+    public static ReportedStatusExtraction? ReadReportedStatus(
+        ForgeJobMetadata job,
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation,
+        LiveActivitySnapshot activity,
+        string runsRoot,
+        DateTimeOffset observedAt,
+        CancellationToken cancellationToken = default)
+    {
+        var target = SelectReportedStatusTarget(activity);
+        if (target is null)
+        {
+            return null;
+        }
+
+        var report = ReadFullReport(
+            job,
+            evidence,
+            observation,
+            target,
+            runsRoot,
+            observedAt,
+            cancellationToken);
+        return ReportedStatusParser.Extract(report);
+    }
+
+    private static bool IsTextExcerpt(ActivityExcerpt? excerpt) =>
+        excerpt is not null &&
+        excerpt.Kind is AssistantTextKind or RolelessTextKind or
+            AssistantResultKind or RolelessResultKind;
 
     /// <summary>
     /// Retrieve one previously selected text part from the same guarded,

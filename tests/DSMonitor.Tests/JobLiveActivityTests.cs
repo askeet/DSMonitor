@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using DSMonitor.Models;
 using DSMonitor.Parsing;
 using DSMonitor.Persistence;
@@ -695,7 +696,8 @@ public sealed class JobLiveActivityTests
         Assert.AreEqual(0.25, reopened.Jobs.Single().ObservedCost);
         Assert.AreEqual(secret, reopened.Jobs.Single().LiveActivity.Done?.Text);
         var row = new JobRowViewModel(reopened.Jobs.Single());
-        Assert.AreEqual(@"C:\one\same-name", row.ProjectText);
+        Assert.AreEqual("same-name", row.ProjectText);
+        Assert.AreEqual(@"C:\one\same-name", row.ProjectTooltip);
         StringAssert.Contains(row.TaskText, "N/A");
         StringAssert.Contains(row.DoneProvenance, "unverified");
         StringAssert.Contains(row.DoneProvenance, "message m");
@@ -852,6 +854,223 @@ public sealed class JobLiveActivityTests
         Assert.IsNull(userExtraction.Value);
         Assert.AreEqual(0, userExtraction.Declarations.Count);
     }
+
+    [TestMethod]
+    public async Task ReportedStatus_V3MonitoringBindsInitialRefreshIsolationAndUnknownStatus()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job0");
+        workspace.WriteMetadata("job1");
+        workspace.WriteLog("job0", Text("Status: DONE", "m0"), Finish("m0"));
+        workspace.WriteLog("job1", Text("Status: RUNNING", "m1"), Finish("m1"));
+        var database = Path.Combine(workspace.Root, "events-v3.db");
+
+        async Task<MonitoringSnapshot> Scan()
+        {
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            MonitoringSnapshot? result = null;
+            var service = new ForgeMonitoringService(
+                workspace.RunsRoot,
+                new MonitoringRunLoggerFactory(workspace.LogsRoot),
+                clock: () => Now,
+                ledgerFactory: () => EventLedger.OpenV3Projection(database, workspace.Root));
+            await service.RunAsync(snapshot =>
+            {
+                result = snapshot;
+                cancellation.Cancel();
+                return Task.CompletedTask;
+            }, cancellation.Token);
+            return result!;
+        }
+
+        var initial = await Scan();
+        var initial0 = initial.Jobs.Single(job => job.JobId == "job0");
+        var initial1 = initial.Jobs.Single(job => job.JobId == "job1");
+        Assert.AreEqual(ForgeJobStatus.Unknown, initial0.Status);
+        Assert.AreEqual(ForgeJobStatus.Unknown, initial0.Metadata.ExplicitStatus);
+        Assert.AreEqual(
+            ReportedStatusState.Reported,
+            initial0.ReportedStatus?.State,
+            initial0.ReportedStatus?.Reason);
+        Assert.AreEqual("DONE", initial0.ReportedStatus!.Value);
+        Assert.AreEqual("job0", initial0.ReportedStatus.Source.JobId);
+        Assert.AreEqual("shared-session", initial0.ReportedStatus.Source.SessionId);
+        Assert.AreEqual("m0", initial0.ReportedStatus.Source.MessageId);
+        Assert.AreEqual("text-m0", initial0.ReportedStatus.Source.PartId);
+
+        Assert.AreEqual("RUNNING", initial1.ReportedStatus?.Value);
+        Assert.AreEqual("job1", initial1.ReportedStatus!.Source.JobId);
+        Assert.AreEqual("shared-session", initial1.ReportedStatus.Source.SessionId);
+        Assert.AreEqual("m1", initial1.ReportedStatus.Source.MessageId);
+        Assert.AreEqual("text-m1", initial1.ReportedStatus.Source.PartId);
+
+        var initialRow0 = new JobRowViewModel(initial0);
+        var initialRow1 = new JobRowViewModel(initial1);
+        Assert.AreEqual("DONE", initialRow0.ReportedStatusText);
+        Assert.AreEqual("RUNNING", initialRow1.ReportedStatusText);
+        StringAssert.Contains(initialRow0.ReportedStatusTooltip, "unverified agent-reported");
+
+        // Refresh only job0; job1 must keep its own message-bound value.
+        workspace.AppendLog(
+            "job0",
+            Text("Status: **FAILED**", "m0-refresh", timestamp: 1_800_000_000_500),
+            Finish("m0-refresh"));
+        var refreshed = await Scan();
+        var refreshed0 = refreshed.Jobs.Single(job => job.JobId == "job0");
+        var refreshed1 = refreshed.Jobs.Single(job => job.JobId == "job1");
+        Assert.AreEqual("FAILED", refreshed0.ReportedStatus?.Value);
+        Assert.AreEqual("m0-refresh", refreshed0.ReportedStatus!.Source.MessageId);
+        Assert.AreEqual("RUNNING", refreshed1.ReportedStatus?.Value);
+        Assert.AreEqual(ForgeJobStatus.Unknown, refreshed0.Status);
+        Assert.AreEqual(ForgeJobStatus.Unknown, refreshed0.Metadata.ExplicitStatus);
+
+        initialRow0.Update(refreshed0, refreshed.ObservedAt);
+        Assert.AreEqual("FAILED", initialRow0.ReportedStatusText);
+        StringAssert.StartsWith(initialRow0.ReportedStatusTooltip, "FAILED");
+        Assert.AreEqual("RUNNING", initialRow1.ReportedStatusText);
+    }
+
+    [TestMethod]
+    public async Task ReportedStatus_SingleRunningService_RefreshesNewerTextBeforeFinishAndAfterTool()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job0");
+        workspace.WriteMetadata("job1");
+        workspace.WriteLog("job0", Text("Status: DONE", "m0"), Finish("m0"));
+        workspace.WriteLog("job1", Text("Status: RUNNING", "m1"), Finish("m1"));
+        var database = Path.Combine(workspace.Root, "events-v3.db");
+        var clockTicks = 0;
+        DateTimeOffset Clock() => Now.AddMilliseconds(Interlocked.Increment(ref clockTicks));
+
+        await using var harness = new RunningServiceHarness();
+        harness.Start(new ForgeMonitoringService(
+            workspace.RunsRoot,
+            new MonitoringRunLoggerFactory(workspace.LogsRoot),
+            new MonitoringOptions(TimeSpan.FromMilliseconds(50)),
+            Clock,
+            () => EventLedger.OpenV3Projection(database, workspace.Root)));
+
+        var initial = await harness.WaitForAsync(
+            snapshot => Job(snapshot, "job0")?.ReportedStatus?.Value == "DONE",
+            TimeSpan.FromSeconds(10));
+        var initial0 = Job(initial, "job0")!;
+        Assert.AreEqual("m0", initial0.ReportedStatus!.Source.MessageId);
+        Assert.AreEqual(initial.ObservedAt, initial0.ReportedStatus.Source.ObservedAt);
+
+        // A cached extraction must be revalidated with the current timestamp.
+        var unchanged = await harness.WaitForAsync(
+            snapshot => snapshot.ObservedAt > initial.ObservedAt &&
+                        Job(snapshot, "job0")?.ReportedStatus?.Value == "DONE",
+            TimeSpan.FromSeconds(10));
+        var unchanged0 = Job(unchanged, "job0")!;
+        Assert.AreEqual(unchanged.ObservedAt, unchanged0.ReportedStatus!.Source.ObservedAt);
+        Assert.AreEqual("m0", unchanged0.ReportedStatus.Source.MessageId);
+
+        // Newer eligible text without a new finish must supersede the old Done.
+        workspace.AppendLog(
+            "job0",
+            Text("Status: FAILED", "m0-new", timestamp: 1_800_000_000_500));
+        var beforeFinish = await harness.WaitForAsync(
+            snapshot => Job(snapshot, "job0")?.ReportedStatus?.Value == "FAILED",
+            TimeSpan.FromSeconds(10));
+        var beforeFinish0 = Job(beforeFinish, "job0")!;
+        var beforeFinish1 = Job(beforeFinish, "job1")!;
+        Assert.AreEqual("m0-new", beforeFinish0.ReportedStatus!.Source.MessageId);
+        Assert.AreEqual("text-m0-new", beforeFinish0.ReportedStatus.Source.PartId);
+        Assert.AreEqual("RUNNING", beforeFinish1.ReportedStatus?.Value);
+        Assert.AreEqual("m1", beforeFinish1.ReportedStatus!.Source.MessageId);
+        Assert.AreEqual(ForgeJobStatus.Unknown, beforeFinish0.Status);
+
+        // A later tool event must not revert the reported status to the old Done.
+        workspace.AppendLog(
+            "job0",
+            ToolUse(
+                1_800_000_000_600,
+                "shell",
+                "completed",
+                1_800_000_000_600,
+                1_800_000_000_700,
+                message: "m0-new"));
+        var afterTool = await harness.WaitForAsync(
+            snapshot => Job(snapshot, "job0")?.LiveActivity.Doing?.Kind
+                .Contains("tool", StringComparison.OrdinalIgnoreCase) == true,
+            TimeSpan.FromSeconds(10));
+        var afterTool0 = Job(afterTool, "job0")!;
+        Assert.AreEqual("FAILED", afterTool0.ReportedStatus?.Value);
+        Assert.AreEqual("m0-new", afterTool0.ReportedStatus!.Source.MessageId);
+        Assert.AreEqual("RUNNING", Job(afterTool, "job1")?.ReportedStatus?.Value);
+        Assert.AreEqual(ForgeJobStatus.Unknown, afterTool0.Status);
+        Assert.AreEqual(ForgeJobStatus.Unknown, afterTool0.Metadata.ExplicitStatus);
+        await harness.StopAsync();
+    }
+
+    [TestMethod]
+    public void ReportedStatus_CacheKeyBindsPhysicalIdentityGenerationAndRecord()
+    {
+        var identityA = new LedgerSourceIdentity(0x1234, 0x5678, 0x9ABC);
+        var identityB = new LedgerSourceIdentity(0x1234, 0x5678, 0x9ABD);
+        var evidence = new LiveActivitySourceEvidence(
+            "job",
+            @"C:\synthetic\runs\job.log",
+            @"C:\synthetic\runs\job.log",
+            identityA,
+            Array.Empty<string>());
+        var observation = new LedgerSourceObservation(
+            "job",
+            @"C:\synthetic\runs\job.log",
+            identityA,
+            identityA,
+            7,
+            100,
+            100,
+            false);
+        var target = new FullReportTarget(
+            "job",
+            "session",
+            "message",
+            "part",
+            0,
+            new string('a', 64));
+
+        Assert.IsTrue(ForgeMonitoringService.CanReuseReportedStatus(evidence, observation));
+        var key = ForgeMonitoringService.CreateReportedStatusCacheKey(
+            evidence,
+            observation,
+            target);
+        Assert.AreEqual(
+            key,
+            ForgeMonitoringService.CreateReportedStatusCacheKey(evidence, observation, target));
+
+        var replacementObservation = observation with { PhysicalIdentity = identityB };
+        Assert.IsFalse(
+            ForgeMonitoringService.CanReuseReportedStatus(evidence, replacementObservation));
+        Assert.AreNotEqual(
+            key,
+            ForgeMonitoringService.CreateReportedStatusCacheKey(
+                evidence,
+                replacementObservation,
+                target));
+
+        var newGeneration = observation with { GenerationId = 8 };
+        Assert.IsTrue(ForgeMonitoringService.CanReuseReportedStatus(evidence, newGeneration));
+        Assert.AreNotEqual(
+            key,
+            ForgeMonitoringService.CreateReportedStatusCacheKey(
+                evidence,
+                newGeneration,
+                target));
+
+        var differentRecord = target with { ExpectedRecordDigest = new string('b', 64) };
+        Assert.AreNotEqual(
+            key,
+            ForgeMonitoringService.CreateReportedStatusCacheKey(
+                evidence,
+                observation,
+                differentRecord));
+    }
+
+    private static ForgeJobSnapshot? Job(MonitoringSnapshot snapshot, string jobId) =>
+        snapshot.Jobs.SingleOrDefault(job => job.JobId == jobId);
 
     [TestMethod]
     public void FullReport_RetrievesRecordBeyond64KiBPreviewWithoutChangingPreviewBehavior()
@@ -1990,6 +2209,100 @@ public sealed class JobLiveActivityTests
                     : (object)new { status }
             }
         });
+
+    private sealed class RunningServiceHarness : IAsyncDisposable
+    {
+        private readonly Channel<MonitoringSnapshot> _snapshots =
+            Channel.CreateUnbounded<MonitoringSnapshot>();
+        private readonly CancellationTokenSource _cts = new();
+        private Task? _task;
+
+        public void Start(ForgeMonitoringService service)
+        {
+            _task = Task.Run(async () =>
+            {
+                try
+                {
+                    await service.RunAsync(
+                        snapshot => _snapshots.Writer
+                            .WriteAsync(snapshot, _cts.Token)
+                            .AsTask(),
+                        _cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected during test shutdown.
+                }
+                finally
+                {
+                    _snapshots.Writer.TryComplete();
+                }
+            });
+        }
+
+        public async Task<MonitoringSnapshot> WaitForAsync(
+            Func<MonitoringSnapshot, bool> predicate,
+            TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (true)
+            {
+                var remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    throw new TimeoutException(
+                        "The expected monitoring snapshot did not arrive.");
+                }
+
+                using var timeoutCts = new CancellationTokenSource(remaining);
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                    _cts.Token,
+                    timeoutCts.Token);
+                MonitoringSnapshot snapshot;
+                try
+                {
+                    snapshot = await _snapshots.Reader.ReadAsync(linked.Token);
+                }
+                catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+                {
+                    throw new TimeoutException(
+                        "The expected monitoring snapshot did not arrive.");
+                }
+
+                if (predicate(snapshot))
+                {
+                    return snapshot;
+                }
+            }
+        }
+
+        public async Task StopAsync()
+        {
+            if (!_cts.IsCancellationRequested)
+            {
+                _cts.Cancel();
+            }
+
+            if (_task is not null)
+            {
+                try
+                {
+                    await _task;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected during test shutdown.
+                }
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await StopAsync();
+            _cts.Dispose();
+            _snapshots.Writer.TryComplete();
+        }
+    }
 
     private sealed record PreparedActivity(
         ForgeJobMetadata Job,

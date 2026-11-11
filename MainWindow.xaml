@@ -629,15 +629,46 @@
                                   Margin="0,0,0,0"
                                   AutomationProperties.Name="Forge jobs">
                             <DataGrid.Columns>
-                                <DataGridTemplateColumn Header="JOB" Width="120">
-                                    <DataGridTemplateColumn.HeaderTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="JOB" Style="{StaticResource JobHeaderText}" />
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.HeaderTemplate>
+                                <DataGridTemplateColumn Header="Project"
+                                                        Width="*"
+                                                        MinWidth="110"
+                                                        SortMemberPath="ProjectText"
+                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}">
                                     <DataGridTemplateColumn.CellTemplate>
                                         <DataTemplate>
-                                            <TextBlock Text="{Binding JobId}"
+                                            <TextBlock Text="{Binding ProjectText}"
+                                                       Style="{StaticResource JobCellText}"
+                                                       ToolTip="{Binding ProjectTooltip}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+
+                                <DataGridTextColumn Header="Started"
+                                                    Binding="{Binding StartedText}"
+                                                    Width="96"
+                                                    ElementStyle="{StaticResource JobCellText}"
+                                                    HeaderStyle="{StaticResource JobColumnHeaderStyle}" />
+
+                                <DataGridTemplateColumn Header="Duration"
+                                                        Width="78"
+                                                        SortMemberPath="DurationSortSeconds"
+                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding DurationText}"
+                                                       Style="{StaticResource JobCellText}"
+                                                       ToolTip="{Binding DurationTooltip}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+
+                                <DataGridTemplateColumn Header="Job"
+                                                        Width="110"
+                                                        SortMemberPath="JobId"
+                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding JobDisplayText}"
                                                        Foreground="{StaticResource TextPrimary}"
                                                        FontFamily="Cascadia Mono, Consolas"
                                                        FontSize="11"
@@ -648,79 +679,18 @@
                                     </DataGridTemplateColumn.CellTemplate>
                                 </DataGridTemplateColumn>
 
-                                <DataGridTemplateColumn Header="PROJECT" Width="*" MinWidth="95">
-                                    <DataGridTemplateColumn.HeaderTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="PROJECT" Style="{StaticResource JobHeaderText}" />
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.HeaderTemplate>
+                                <DataGridTemplateColumn Header="Reported Status"
+                                                        Width="140"
+                                                        SortMemberPath="ReportedStatusText"
+                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}">
                                     <DataGridTemplateColumn.CellTemplate>
                                         <DataTemplate>
-                                            <TextBlock Text="{Binding ProjectText}"
+                                            <TextBlock Text="{Binding ReportedStatusText}"
                                                        Style="{StaticResource JobCellText}"
-                                                       ToolTip="{Binding ProjectTooltip}" />
+                                                       ToolTip="{Binding ReportedStatusTooltip}" />
                                         </DataTemplate>
                                     </DataGridTemplateColumn.CellTemplate>
                                 </DataGridTemplateColumn>
-
-                                <DataGridTextColumn Header="DOING · OBSERVED" Width="220" Binding="{Binding DoingText}" IsReadOnly="True" />
-                                <DataGridTextColumn Header="DONE · REPORTED" Width="220" Binding="{Binding DoneText}" IsReadOnly="True" />
-                                <DataGridTextColumn Header="CHAT" Width="130" Binding="{Binding ChatText}" IsReadOnly="True" />
-                                <DataGridTextColumn Header="TASK" Width="120" Binding="{Binding TaskText}" IsReadOnly="True" />
-                                <DataGridTextColumn Header="LAST UPDATED · SOURCE" Width="140" Binding="{Binding LiveUpdatedText}" IsReadOnly="True" />
-                                <DataGridTemplateColumn Header="MODEL" Width="92">
-                                    <DataGridTemplateColumn.HeaderTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="MODEL" Style="{StaticResource JobHeaderText}" />
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.HeaderTemplate>
-                                    <DataGridTemplateColumn.CellTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="{Binding ModelText}"
-                                                       Style="{StaticResource JobCellText}"
-                                                       ToolTip="{Binding ModelText}" />
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.CellTemplate>
-                                </DataGridTemplateColumn>
-
-                                <DataGridTemplateColumn Header="STATUS" Width="88">
-                                    <DataGridTemplateColumn.HeaderTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="STATUS" Style="{StaticResource JobHeaderText}" />
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.HeaderTemplate>
-                                    <DataGridTemplateColumn.CellTemplate>
-                                        <DataTemplate>
-                                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                                <Ellipse Width="7" Height="7" Margin="0,0,6,0"
-                                                         Fill="{Binding Snapshot.Status, Converter={StaticResource ForgeStatusBrush}}" />
-                                                <TextBlock Text="{Binding StatusText}"
-                                                           Foreground="{Binding Snapshot.Status, Converter={StaticResource ForgeStatusBrush}}"
-                                                           FontSize="10.5"
-                                                           FontWeight="SemiBold"
-                                                           VerticalAlignment="Center" />
-                                            </StackPanel>
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.CellTemplate>
-                                </DataGridTemplateColumn>
-
-                                <DataGridTextColumn Header="STARTED"
-                                                    Binding="{Binding StartedText}"
-                                                    Width="96"
-                                                    ElementStyle="{StaticResource JobCellText}"
-                                                    HeaderStyle="{StaticResource JobColumnHeaderStyle}" />
-
-                                <DataGridTextColumn Header="ELAPSED"
-                                                    Binding="{Binding ElapsedText}"
-                                                    Width="60"
-                                                    ElementStyle="{StaticResource JobCellText}"
-                                                    HeaderStyle="{StaticResource JobColumnHeaderStyle}" />
-
-                                <DataGridTextColumn Header="LAST"
-                                                    Binding="{Binding LastActivityText}"
-                                                    Width="58"
-                                                    ElementStyle="{StaticResource JobCellText}"
-                                                    HeaderStyle="{StaticResource JobColumnHeaderStyle}" />
                             </DataGrid.Columns>
                         </DataGrid>
 
@@ -813,12 +783,14 @@
                                 </StackPanel>
                             </StackPanel>
                             <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
-                                <TextBlock Text="{Binding SelectedJob.ElapsedText}"
+                                <TextBlock x:Name="SelectedJobElapsedText"
+                                           Text="{Binding SelectedJob.ElapsedText}"
                                            Foreground="{StaticResource TextPrimary}"
                                            FontSize="20"
                                            FontWeight="SemiBold"
                                            HorizontalAlignment="Right" />
-                                <TextBlock Text="elapsed / observed span"
+                                <TextBlock x:Name="SelectedJobElapsedLabel"
+                                           Text="elapsed / observed span"
                                            Foreground="{StaticResource TextMuted}"
                                            FontSize="10"
                                            HorizontalAlignment="Right" />
@@ -859,7 +831,7 @@
                                                        FontFamily="Cascadia Mono, Consolas" />
 
                                             <TextBlock Grid.Row="2" Text="Project path" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding ProjectTooltip}" Style="{StaticResource DetailValue}" />
+                                            <TextBlock Grid.Row="2" Grid.Column="1" x:Name="SelectedJobProjectPath" Text="{Binding ProjectTooltip}" Style="{StaticResource DetailValue}" />
 
                                             <TextBlock Grid.Row="3" Text="Model / agent" Style="{StaticResource DetailLabel}" />
                                             <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ModelText}" Style="{StaticResource DetailValue}" />

@@ -25,6 +25,14 @@ public sealed record ForgeJobSnapshot
     public LiveActivitySnapshot LiveActivity { get; init; } = new();
 
     /// <summary>
+    /// Transient extraction from the job-scoped agent text. Only a
+    /// <see cref="ReportedStatusState.Reported"/> value is presented; the
+    /// original extraction, its source report, and provenance are retained.
+    /// Never authoritative Forge status.
+    /// </summary>
+    public ReportedStatusExtraction? ReportedStatus { get; init; }
+
+    /// <summary>
     /// True when the durable source coverage is incomplete. An observed cost is
     /// then a committed subtotal, never a claim that the total is complete.
     /// </summary>

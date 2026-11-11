@@ -405,6 +405,7 @@ public sealed class ForgeMonitoringService
             state.SeenEventKeys.Remove(staleId);
             state.SeenKeyOrder.Remove(staleId);
             state.AcceptedEventCounts.Remove(staleId);
+            state.ReportedStatuses.Remove(staleId);
         }
 
         if (eventsToLog.Count > 0)
@@ -775,6 +776,38 @@ public sealed class ForgeMonitoringService
                     committedAggregate.LatestSessionId!);
             }
 
+            var liveActivity = new LiveActivitySnapshot
+            {
+                Availability = "N/A — durable source unavailable or conflicting; no cached excerpt is shown."
+            };
+            ReportedStatusExtraction? reportedStatus = null;
+            if (!registrationConflict &&
+                primarySourceObservation is { } primaryObservationForActivity &&
+                coverage.State != LedgerCoverageState.Conflict &&
+                activityPreflight.TryGetValue(metadata.JobId, out var activityEvidence))
+            {
+                liveActivity = JobLiveActivityReader.Read(
+                    metadata,
+                    activityEvidence,
+                    primaryObservationForActivity,
+                    _runsRoot,
+                    observedAt,
+                    cancellationToken,
+                    _options.MaxBytesPerPoll);
+                reportedStatus = ResolveReportedStatus(
+                    state,
+                    metadata,
+                    activityEvidence,
+                    primaryObservationForActivity,
+                    liveActivity,
+                    observedAt,
+                    cancellationToken);
+            }
+            else
+            {
+                state.ReportedStatuses.Remove(metadata.JobId);
+            }
+
             jobs.Add(new ForgeJobSnapshot
             {
                 Metadata = metadata,
@@ -787,22 +820,8 @@ public sealed class ForgeMonitoringService
                     : null,
                 HasIncompleteCoverage = coverage.State != LedgerCoverageState.Clean,
                 HasObservedAmbiguousTimestamps = committedAggregate.TimelineAmbiguous,
-                LiveActivity = !registrationConflict &&
-                               primarySourceObservation is { } primaryObservation &&
-                               coverage.State != LedgerCoverageState.Conflict &&
-                               activityPreflight.TryGetValue(metadata.JobId, out var activityEvidence)
-                    ? JobLiveActivityReader.Read(
-                        metadata,
-                        activityEvidence,
-                        primaryObservation,
-                        _runsRoot,
-                        observedAt,
-                        cancellationToken,
-                        _options.MaxBytesPerPoll)
-                    : new LiveActivitySnapshot
-                    {
-                        Availability = "N/A — durable source unavailable or conflicting; no cached excerpt is shown."
-                    },
+                LiveActivity = liveActivity,
+                ReportedStatus = reportedStatus,
                 Events = timeline.RetainSourceOrder(),
                 Warnings = jobWarnings.Distinct(StringComparer.Ordinal).ToArray(),
                 ObservedAt = observedAt
@@ -819,6 +838,7 @@ public sealed class ForgeMonitoringService
             state.PreviousStatuses.Remove(staleId);
             state.LastSessions.Remove(staleId);
             state.AcceptedEventCounts.Remove(staleId);
+            state.ReportedStatuses.Remove(staleId);
         }
 
         if (eventsToLog.Count > 0)
@@ -841,6 +861,107 @@ public sealed class ForgeMonitoringService
         state.LastWarnings = snapshot.Warnings;
         return snapshot;
     }
+
+    private ReportedStatusExtraction? ResolveReportedStatus(
+        RunState state,
+        ForgeJobMetadata metadata,
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation,
+        LiveActivitySnapshot activity,
+        DateTimeOffset observedAt,
+        CancellationToken cancellationToken)
+    {
+        var target = JobLiveActivityReader.SelectReportedStatusTarget(activity);
+        if (target is null)
+        {
+            state.ReportedStatuses.Remove(metadata.JobId);
+            return null;
+        }
+
+        var cacheable = CanReuseReportedStatus(evidence, observation);
+        var key = CreateReportedStatusCacheKey(evidence, observation, target);
+        if (cacheable &&
+            state.ReportedStatuses.TryGetValue(metadata.JobId, out var cached) &&
+            cached.Key == key)
+        {
+            // The target record is still bound to the same verified physical
+            // source, generation, and exact record digest. Keep the extraction
+            // but revalidate its observation timestamp for the current scan.
+            var revalidated = RevalidateReportedStatus(cached.Extraction, observedAt);
+            state.ReportedStatuses[metadata.JobId] =
+                new ReportedStatusCacheEntry(key, revalidated);
+            return revalidated;
+        }
+
+        var extraction = JobLiveActivityReader.ReadReportedStatus(
+            metadata,
+            evidence,
+            observation,
+            activity,
+            _runsRoot,
+            observedAt,
+            cancellationToken);
+        if (!cacheable || extraction is null || !extraction.Source.IsComplete)
+        {
+            // Only a complete, digest-bound report from a verified physical
+            // source generation is stable enough to reuse. Everything else is
+            // retried on a later scan.
+            state.ReportedStatuses.Remove(metadata.JobId);
+        }
+        else
+        {
+            state.ReportedStatuses[metadata.JobId] = new ReportedStatusCacheEntry(key, extraction);
+        }
+
+        return extraction;
+    }
+
+    /// <summary>
+    /// A cached extraction is reusable only when the current scan proves the
+    /// same verified physical source and ledger generation as the source that
+    /// produced it. A byte-identical replacement with a different file identity
+    /// or generation must not reuse the retired extraction.
+    /// </summary>
+    internal static bool CanReuseReportedStatus(
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation)
+    {
+        ArgumentNullException.ThrowIfNull(evidence);
+        ArgumentNullException.ThrowIfNull(observation);
+        return observation.IsConsistent &&
+               evidence.PhysicalIdentity.IsVerified &&
+               evidence.PhysicalIdentity.Equals(observation.PhysicalIdentity) &&
+               !string.IsNullOrWhiteSpace(evidence.VerifiedPath) &&
+               !string.IsNullOrWhiteSpace(observation.SourcePath);
+    }
+
+    internal static ReportedStatusCacheKey CreateReportedStatusCacheKey(
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation,
+        FullReportTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(evidence);
+        ArgumentNullException.ThrowIfNull(observation);
+        ArgumentNullException.ThrowIfNull(target);
+        return new ReportedStatusCacheKey(
+            evidence.VerifiedPath,
+            observation.SourcePath,
+            observation.PhysicalIdentity,
+            observation.GenerationId,
+            target.JobId,
+            target.SessionId,
+            target.MessageId,
+            target.PartId,
+            target.ExpectedByteOffset,
+            target.ExpectedRecordDigest);
+    }
+
+    private static ReportedStatusExtraction RevalidateReportedStatus(
+        ReportedStatusExtraction extraction,
+        DateTimeOffset observedAt) =>
+        extraction.Source.ObservedAt == observedAt
+            ? extraction
+            : extraction with { Source = extraction.Source with { ObservedAt = observedAt } };
 
     private static void TryMarkSourceUnavailable(
         EventLedger ledger,
@@ -937,6 +1058,22 @@ public sealed class ForgeMonitoringService
         return snapshot;
     }
 
+    internal readonly record struct ReportedStatusCacheKey(
+        string? VerifiedPath,
+        string SourcePath,
+        LedgerSourceIdentity PhysicalIdentity,
+        long GenerationId,
+        string JobId,
+        string SessionId,
+        string MessageId,
+        string? PartId,
+        long? ByteOffset,
+        string? RecordDigest);
+
+    private sealed record ReportedStatusCacheEntry(
+        ReportedStatusCacheKey Key,
+        ReportedStatusExtraction Extraction);
+
     private sealed class RunState
     {
         public RunState(IEnumerable<string> startupWarnings)
@@ -966,6 +1103,8 @@ public sealed class ForgeMonitoringService
             new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> ReportedWarnings { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, ForgeJobSnapshot> LastJobs { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, ReportedStatusCacheEntry> ReportedStatuses { get; } =
             new(StringComparer.OrdinalIgnoreCase);
         public IReadOnlyList<string> LastWarnings { get; set; }
     }

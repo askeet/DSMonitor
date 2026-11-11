@@ -25,6 +25,15 @@ public sealed record LiveActivitySnapshot
 {
     public ActivityExcerpt? Doing { get; init; }
     public ActivityExcerpt? Done { get; init; }
+
+    /// <summary>
+    /// Latest eligible text excerpt in physical source order, retained even
+    /// when a later tool activity replaces <see cref="Doing"/>. Reported-status
+    /// selection uses this to avoid preferring an older <see cref="Done"/>
+    /// result after newer text arrives. Transient; never persisted.
+    /// </summary>
+    internal ActivityExcerpt? LatestText { get; init; }
+
     public string Availability { get; init; } = "N/A — no safely attributed activity available.";
     public const string RetentionNotice =
         "Transient excerpts from a bounded tail (up to 64 KB) of the job log; older results may be unavailable. " +
