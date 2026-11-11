@@ -11,7 +11,15 @@ public sealed record ActivityExcerpt(
     string SourcePath,
     long ByteOffset,
     DateTimeOffset? SourceTimestamp,
-    DateTimeOffset ObservedAt);
+    DateTimeOffset ObservedAt)
+{
+    /// <summary>
+    /// SHA-256 of the exact raw record bytes observed for this excerpt. It binds
+    /// a later full-report request to the same source record and detects
+    /// length-changing or same-length content rewrites. Transient only.
+    /// </summary>
+    public string? RecordDigest { get; init; }
+}
 
 public sealed record LiveActivitySnapshot
 {

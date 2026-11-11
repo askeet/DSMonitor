@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using DSMonitor.Models;
@@ -16,6 +17,13 @@ public sealed record LiveActivitySourceEvidence(
     LedgerSourceIdentity PhysicalIdentity,
     IReadOnlyList<string> DuplicateOwners)
 {
+    /// <summary>
+    /// Guarded-open failure observed during preflight. It lets callers classify
+    /// an unavailable source as unsafe (link/reparse/path) rather than merely
+    /// missing, without changing which sources are considered available.
+    /// </summary>
+    public SafeReadFailure Failure { get; init; }
+
     public bool IsAvailable =>
         !string.IsNullOrWhiteSpace(NormalizedPath) &&
         !string.IsNullOrWhiteSpace(VerifiedPath) &&
@@ -32,6 +40,7 @@ public sealed record LiveActivitySourceEvidence(
 public static class JobLiveActivityReader
 {
     public const int MaxReadBytes = 64 * 1024;
+    public const int MaxFullReportBytes = 256 * 1024;
     public const int MaxExcerptLength = 600;
     private const string AssistantTextKind = "Assistant-reported text";
     private const string RolelessTextKind = "Observed roleless text — unverified";
@@ -66,6 +75,7 @@ public static class JobLiveActivityReader
             string? normalizedPath = null;
             string? verifiedPath = null;
             var identity = default(LedgerSourceIdentity);
+            var openFailure = SafeReadFailure.None;
             if (job.HasExplicitLogPath && job.LogPath is { } logPath)
             {
                 try
@@ -82,6 +92,7 @@ public static class JobLiveActivityReader
                 {
                     using var opened = SafeFileAccess.OpenRead(
                         logPath, runsRoot, rejectHardLinks: true);
+                    openFailure = opened.Failure;
                     if (opened.Stream is not null &&
                         opened.VerifiedPath is not null &&
                         opened.PhysicalIdentity.IsVerified)
@@ -92,7 +103,7 @@ public static class JobLiveActivityReader
                 }
             }
 
-            associations.Add(new Association(job, normalizedPath, verifiedPath, identity));
+            associations.Add(new Association(job, normalizedPath, verifiedPath, identity, openFailure));
         }
 
         var result = new Dictionary<string, LiveActivitySourceEvidence>(StringComparer.Ordinal);
@@ -110,7 +121,10 @@ public static class JobLiveActivityReader
                 association.NormalizedPath,
                 association.VerifiedPath,
                 association.Identity,
-                owners);
+                owners)
+            {
+                Failure = association.Failure
+            };
         }
 
         return result;
@@ -151,56 +165,16 @@ public static class JobLiveActivityReader
         ArgumentNullException.ThrowIfNull(evidence);
         ArgumentNullException.ThrowIfNull(observation);
 
-        if (job.IsProvisional || !job.HasExplicitLogPath || job.LogPath is null)
+        var guard = TryOpenGuardedSource(
+            job, evidence, observation, runsRoot, out var guarded, out var guardReason);
+        if (guard != SourceGuardFailure.None)
         {
-            return Unavailable("N/A — explicit metadata log association unavailable.");
+            return Unavailable(guardReason);
         }
 
-        if (!TryNormalize(job.LogPath, out var jobPath) ||
-            !TryNormalize(evidence.NormalizedPath, out var evidencePath) ||
-            !string.Equals(jobPath, evidencePath, StringComparison.OrdinalIgnoreCase))
-        {
-            return Unavailable("N/A — job/source association could not be verified.");
-        }
-
-        if (!string.Equals(evidence.JobId, job.JobId, StringComparison.Ordinal))
-        {
-            return Unavailable("N/A — preflight evidence belongs to a different job.");
-        }
-
-        if (!evidence.IsAvailable || evidence.DuplicateOwners is not { Count: 0 })
-        {
-            return Unavailable(
-                "N/A — multiple jobs claim this source or its physical identity is unavailable; ownership is ambiguous.");
-        }
-
-        if (!string.Equals(observation.JobId, job.JobId, StringComparison.Ordinal) ||
-            !TryNormalize(observation.SourcePath, out var observedPath) ||
-            !string.Equals(observedPath, evidencePath, StringComparison.OrdinalIgnoreCase))
-        {
-            return Unavailable("N/A — ingestion observation belongs to a different job or source.");
-        }
-
-        if (!observation.IsConsistent ||
-            !observation.Identity.Equals(evidence.PhysicalIdentity))
-        {
-            return Unavailable(
-                "N/A — source physical identity is unavailable, weak, or changed before ingestion.");
-        }
-
-        using var opened = SafeFileAccess.OpenRead(
-            job.LogPath, runsRoot, rejectHardLinks: true);
-        var verifiedPath = opened.VerifiedPath;
-        if (opened.Stream is not { } stream ||
-            verifiedPath is null ||
-            !opened.PhysicalIdentity.Equals(observation.Identity) ||
-            !string.Equals(
-                verifiedPath,
-                evidence.VerifiedPath,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return Unavailable("N/A — job source unavailable or physical identity changed; no excerpt is shown.");
-        }
+        using var guardedSource = guarded;
+        var stream = guardedSource!.Stream;
+        var verifiedPath = guardedSource.VerifiedPath;
 
         try
         {
@@ -214,23 +188,14 @@ public static class JobLiveActivityReader
                 observation.CapturedLength,
                 Math.Clamp(maxBytes, 1, MaxReadBytes));
             var start = observation.CapturedLength - count;
-            var bytes = new byte[count];
-            stream.Position = start;
-            beforeContentRead?.Invoke();
-            var read = 0;
-            while (read < count)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var chunk = stream.Read(bytes, read, count - read);
-                if (chunk == 0)
-                {
-                    break;
-                }
-
-                read += chunk;
-            }
-
-            if (read != count)
+            if (!TryReadWindow(
+                    stream,
+                    start,
+                    count,
+                    beforeContentRead,
+                    cancellationToken,
+                    out var bytes,
+                    out var read))
             {
                 return Unavailable(
                     "N/A — the bounded capture could not be read completely; no excerpt is shown.");
@@ -261,22 +226,17 @@ public static class JobLiveActivityReader
                     using var document = JsonDocument.Parse(line);
                     var root = document.RootElement;
                     if (root.ValueKind != JsonValueKind.Object ||
-                        !root.TryGetProperty("part", out var part) ||
-                        part.ValueKind != JsonValueKind.Object)
+                        !TryGetSingleObject(root, "part", out var part))
                     {
                         continue;
                     }
 
-                    var partSession = Get(part, "sessionID") ?? Get(part, "sessionId");
-                    var session = Get(root, "sessionID") ?? Get(root, "sessionId") ?? partSession;
-                    if (partSession is not null &&
-                        !string.Equals(partSession, session, StringComparison.Ordinal))
+                    if (!TryResolvePreviewIdentity(
+                            root, part, out var session, out var message, out var partId))
                     {
                         continue;
                     }
 
-                    var message = Get(part, "messageID") ?? Get(part, "messageId");
-                    if (!ValidId(session) || !ValidId(message)) continue;
                     if (!TryGetRoleEvidence(root, part, out var verifiedAssistant)) continue;
                     if (!TryGetActivityKind(root, part, out var isText, out var isTool, out var isFinish))
                     {
@@ -290,7 +250,6 @@ public static class JobLiveActivityReader
                     }
 
                     var key = (session!, message!);
-                    var partId = Get(part, "id") ?? Get(part, "partID");
                     var sourcePath = verifiedPath;
                     ActivityExcerpt Excerpt(string text, string kind) => new(
                         Sanitize(text),
@@ -302,9 +261,13 @@ public static class JobLiveActivityReader
                         sourcePath,
                         offset,
                         parsed.Event.Timestamp,
-                        observedAt);
+                        observedAt)
+                    {
+                        RecordDigest = ComputeDigest(bytes, recordStart, index - recordStart)
+                    };
                     if (isText &&
-                        Get(part, "text") is { } text &&
+                        TryGetSingleString(part, "text", out var text, out var hasText) &&
+                        hasText &&
                         !string.IsNullOrWhiteSpace(text))
                     {
                         doing = Excerpt(
@@ -321,7 +284,9 @@ public static class JobLiveActivityReader
                             verifiedAssistant ? AssistantToolKind : RolelessToolKind);
                     }
                     else if (isFinish &&
-                             Get(part, "reason") is "stop" or "end-turn" &&
+                             TryGetSingleString(part, "reason", out var finishReason, out var hasReason) &&
+                             hasReason &&
+                             finishReason is "stop" or "end-turn" &&
                              texts.TryGetValue(key, out var result))
                     {
                         var verifiedResult = verifiedAssistant && result.VerifiedAssistant;
@@ -333,6 +298,7 @@ public static class JobLiveActivityReader
                 }
                 catch (JsonException) { /* Malformed/overlong/partial records are unavailable. */ }
                 catch (DecoderFallbackException) { /* Invalid UTF-8 cannot establish source identity. */ }
+                catch (InvalidOperationException) { /* Invalid escaped text/identity cannot be attributed. */ }
             }
 
             beforePublishCheck?.Invoke();
@@ -358,6 +324,815 @@ public static class JobLiveActivityReader
         {
             return Unavailable("N/A — job source changed or became unavailable during read.");
         }
+    }
+
+    /// <summary>
+    /// Retrieve one previously selected text part from the same guarded,
+    /// metadata-bound source used by the preview. The bounded cap is
+    /// <see cref="MaxFullReportBytes"/>; the 600-character preview and its
+    /// selection behavior are unchanged. The result is transient and never
+    /// persisted. A missing, incomplete, or unverified target is never replaced
+    /// by another part, and no multipart assembly is performed. A target that
+    /// carries the preview record digest binds the exact record bytes, so
+    /// same-length in-place rewrites are detected; a target without that binding
+    /// fails closed instead of returning unproven content.
+    /// </summary>
+    public static FullReportResult ReadFullReport(
+        ForgeJobMetadata job,
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation,
+        FullReportTarget target,
+        string runsRoot,
+        DateTimeOffset observedAt,
+        CancellationToken cancellationToken = default) =>
+        ReadFullReport(
+            job,
+            evidence,
+            observation,
+            target,
+            runsRoot,
+            observedAt,
+            cancellationToken,
+            beforeContentRead: null,
+            beforePublishCheck: null);
+
+    internal static FullReportResult ReadFullReport(
+        ForgeJobMetadata job,
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation,
+        FullReportTarget target,
+        string runsRoot,
+        DateTimeOffset observedAt,
+        CancellationToken cancellationToken,
+        Action? beforeContentRead,
+        Action? beforePublishCheck)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentNullException.ThrowIfNull(job);
+        ArgumentNullException.ThrowIfNull(evidence);
+        ArgumentNullException.ThrowIfNull(observation);
+        ArgumentNullException.ThrowIfNull(target);
+
+        FullReportResult Fail(FullReportStatus status, string reason) =>
+            EmptyResult(status, reason, job.JobId, target, observedAt);
+
+        if (!string.Equals(target.JobId, job.JobId, StringComparison.Ordinal))
+        {
+            return Fail(
+                FullReportStatus.Unsafe,
+                "N/A — the target belongs to a different job; no report is shown.");
+        }
+
+        if (target.PartId is null || string.IsNullOrWhiteSpace(target.PartId))
+        {
+            return Fail(
+                FullReportStatus.Unavailable,
+                "N/A — the target part identity is unavailable; no substitute part is shown.");
+        }
+
+        if (!ValidId(target.SessionId) || !ValidId(target.MessageId) || !ValidId(target.PartId))
+        {
+            return Fail(
+                FullReportStatus.Unsafe,
+                "N/A — the target identity is unsafe; no report is shown.");
+        }
+
+        var guard = TryOpenGuardedSource(
+            job, evidence, observation, runsRoot, out var guarded, out var guardReason);
+        if (guard != SourceGuardFailure.None)
+        {
+            return Fail(
+                guard == SourceGuardFailure.Unsafe
+                    ? FullReportStatus.Unsafe
+                    : FullReportStatus.Unavailable,
+                guardReason);
+        }
+
+        using var guardedSource = guarded;
+        var stream = guardedSource!.Stream;
+        var verifiedPath = guardedSource.VerifiedPath;
+        try
+        {
+            if (stream.Length < observation.CapturedLength)
+            {
+                return Fail(
+                    FullReportStatus.Incomplete,
+                    "N/A — source length is below the captured boundary; full content is not available.");
+            }
+
+            if (observation.CapturedLength <= 0)
+            {
+                return Fail(
+                    FullReportStatus.Unavailable,
+                    "N/A — the bounded source capture is empty; no report is shown.");
+            }
+
+            var count = (int)Math.Min(
+                observation.CapturedLength,
+                (long)MaxFullReportBytes);
+            var start = observation.CapturedLength - count;
+            if (!TryReadWindow(
+                    stream,
+                    start,
+                    count,
+                    beforeContentRead,
+                    cancellationToken,
+                    out var bytes,
+                    out var read))
+            {
+                return Fail(
+                    FullReportStatus.Incomplete,
+                    "N/A — the bounded capture could not be read completely; full content is not available.");
+            }
+
+            // The bounded read is exactly min(captured length, cap). A target at
+            // the start of a non-zero window cannot be proven to begin a record
+            // without reading a 262145th predecessor byte, so it fails closed.
+            if (!TryLocateTargetRecord(
+                    bytes,
+                    read,
+                    start,
+                    target,
+                    out var recordStart,
+                    out var recordEnd,
+                    out var locateStatus,
+                    out var locateReason))
+            {
+                return Fail(locateStatus, locateReason);
+            }
+
+            var result = ReadTargetRecord(
+                bytes,
+                recordStart,
+                recordEnd,
+                start,
+                target,
+                job,
+                verifiedPath,
+                observedAt);
+            if (!result.IsComplete)
+            {
+                return result;
+            }
+
+            if (string.IsNullOrWhiteSpace(target.ExpectedRecordDigest))
+            {
+                return Fail(
+                    FullReportStatus.Incomplete,
+                    "N/A — the target has no exact source-record binding; full content cannot be proven.");
+            }
+
+            if (!IsHexDigest(target.ExpectedRecordDigest))
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the target record binding is invalid; no report is shown.");
+            }
+
+            var actualDigest = ComputeDigest(bytes, recordStart, recordEnd - recordStart);
+            if (!string.Equals(
+                    actualDigest,
+                    target.ExpectedRecordDigest,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the selected source record changed since preview; no substitute content is shown.");
+            }
+
+            beforePublishCheck?.Invoke();
+            if (!SourceStillMatches(
+                    job,
+                    runsRoot,
+                    observation,
+                    verifiedPath,
+                    stream,
+                    out _))
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — source changed before publication; the full report was discarded.");
+            }
+
+            return result;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            return Fail(
+                FullReportStatus.Unsafe,
+                "N/A — job source changed or became unavailable during read.");
+        }
+    }
+
+    private static bool TryLocateTargetRecord(
+        byte[] bytes,
+        int read,
+        long windowStart,
+        FullReportTarget target,
+        out int recordStart,
+        out int recordEnd,
+        out FullReportStatus status,
+        out string reason)
+    {
+        recordStart = -1;
+        recordEnd = -1;
+        status = FullReportStatus.Unavailable;
+        reason = "N/A — the target part is not present in the bounded capture.";
+
+        if (target.ExpectedByteOffset is { } expected)
+        {
+            if (expected < 0)
+            {
+                status = FullReportStatus.Unsafe;
+                reason = "N/A — the target offset is invalid; no report is shown.";
+                return false;
+            }
+
+            if (expected < windowStart)
+            {
+                status = FullReportStatus.Incomplete;
+                reason = "N/A — the target record begins before the bounded window; full content is not available.";
+                return false;
+            }
+
+            var relative = expected - windowStart;
+            if (relative >= read)
+            {
+                status = FullReportStatus.Incomplete;
+                reason = "N/A — the target record is outside the captured boundary; full content is not available.";
+                return false;
+            }
+
+            var start = (int)relative;
+            if (start == 0 && windowStart > 0)
+            {
+                status = FullReportStatus.Incomplete;
+                reason =
+                    "N/A — the bounded window start cannot be proven to be a record boundary within the source-byte cap; full content is not available.";
+                return false;
+            }
+
+            if (start > 0 && bytes[start - 1] != (byte)'\n')
+            {
+                status = FullReportStatus.Unsafe;
+                reason = "N/A — the target record boundary no longer matches the observed offset; no substitute part is shown.";
+                return false;
+            }
+
+            var end = Array.IndexOf(bytes, (byte)'\n', start, read - start);
+            if (end < 0)
+            {
+                status = FullReportStatus.Incomplete;
+                reason = "N/A — the target record is not newline-terminated in the bounded capture; full content is not available.";
+                return false;
+            }
+
+            recordStart = start;
+            recordEnd = end;
+            return true;
+        }
+
+        // No expected offset: match the exact session/message/part identity and
+        // never fall back to a different part. Discard a possibly partial first
+        // record when the window starts mid-file.
+        var lineStart = windowStart == 0 ? 0 : Array.IndexOf(bytes, (byte)'\n', 0, read) + 1;
+        if (windowStart > 0 && lineStart == 0)
+        {
+            status = FullReportStatus.Incomplete;
+            reason = "N/A — the bounded window contains no complete record; full content is not available.";
+            return false;
+        }
+
+        var matchStart = -1;
+        var matchEnd = -1;
+        for (var index = lineStart; index < read; index++)
+        {
+            if (bytes[index] != (byte)'\n') continue;
+            var candidateStart = lineStart;
+            var candidateEnd = index;
+            lineStart = index + 1;
+            if (!RecordIdentityMatches(bytes, candidateStart, candidateEnd, target)) continue;
+            if (matchStart >= 0)
+            {
+                status = FullReportStatus.Unsafe;
+                reason = "N/A — multiple records match the target part; the target is ambiguous.";
+                return false;
+            }
+
+            matchStart = candidateStart;
+            matchEnd = candidateEnd;
+        }
+
+        if (matchStart >= 0)
+        {
+            // Never publish an earlier complete match while a newer
+            // unterminated record also matches the target; the tail may be a
+            // duplicate or a conflicting partial record.
+            if (lineStart < read &&
+                RecordIdentityMatches(bytes, lineStart, read, target))
+            {
+                status = FullReportStatus.Incomplete;
+                reason = "N/A — an unterminated record also matches the target; the target is ambiguous or incomplete.";
+                return false;
+            }
+
+            recordStart = matchStart;
+            recordEnd = matchEnd;
+            return true;
+        }
+
+        if (lineStart < read &&
+            RecordIdentityMatches(bytes, lineStart, read, target))
+        {
+            status = FullReportStatus.Incomplete;
+            reason = "N/A — the target record is not newline-terminated in the bounded capture; full content is not available.";
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool RecordIdentityMatches(
+        byte[] bytes,
+        int start,
+        int end,
+        FullReportTarget target)
+    {
+        try
+        {
+            var line = StrictUtf8.GetString(bytes, start, end - start).TrimStart('\uFEFF');
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryGetSingleObject(root, "part", out var part))
+            {
+                return false;
+            }
+
+            return TryResolveIdentity(root, part, out var session, out var message, out var partId) &&
+                   string.Equals(session, target.SessionId, StringComparison.Ordinal) &&
+                   string.Equals(message, target.MessageId, StringComparison.Ordinal) &&
+                   string.Equals(partId, target.PartId, StringComparison.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static FullReportResult ReadTargetRecord(
+        byte[] bytes,
+        int recordStart,
+        int recordEnd,
+        long windowStart,
+        FullReportTarget target,
+        ForgeJobMetadata job,
+        string verifiedPath,
+        DateTimeOffset observedAt)
+    {
+        var byteOffset = windowStart + recordStart;
+        var recordLength = (long)(recordEnd - recordStart);
+        FullReportResult Fail(FullReportStatus status, string reason) => new(
+            status,
+            reason,
+            null,
+            job.JobId,
+            target.SessionId,
+            target.MessageId,
+            target.PartId,
+            verifiedPath,
+            byteOffset,
+            recordLength,
+            null,
+            observedAt,
+            string.Empty);
+
+        string line;
+        try
+        {
+            line = StrictUtf8.GetString(bytes, recordStart, recordEnd - recordStart)
+                .TrimStart('\uFEFF');
+        }
+        catch (DecoderFallbackException)
+        {
+            return Fail(
+                FullReportStatus.Unsafe,
+                "N/A — the target record contains invalid UTF-8; no report is shown.");
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryGetSingleObject(root, "part", out var part))
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the target record does not contain exactly one part object.");
+            }
+
+            if (!TryResolveIdentity(root, part, out var session, out var message, out var partId) ||
+                !string.Equals(session, target.SessionId, StringComparison.Ordinal) ||
+                !string.Equals(message, target.MessageId, StringComparison.Ordinal) ||
+                !string.Equals(partId, target.PartId, StringComparison.Ordinal))
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the record no longer matches the targeted part; no substitute part is shown.");
+            }
+
+            if (!TryGetRoleEvidence(root, part, out var verifiedAssistant))
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the target record has conflicting, unsupported, or user role evidence.");
+            }
+
+            if (!TryGetActivityKind(root, part, out var isText, out _, out _) || !isText)
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the target record is not an eligible text part.");
+            }
+
+            if (!TryGetSingleString(part, "text", out var text, out var hasText) ||
+                !hasText ||
+                string.IsNullOrWhiteSpace(text))
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the target record has no single eligible text content.");
+            }
+
+            if (!ForgeEventParser.TryParse(line, job.JobId, observedAt, out var parsed) ||
+                parsed is null)
+            {
+                return Fail(
+                    FullReportStatus.Unsafe,
+                    "N/A — the target record could not be parsed as an eligible Forge event.");
+            }
+
+            var kind = verifiedAssistant ? AssistantTextKind : RolelessTextKind;
+            return new FullReportResult(
+                FullReportStatus.Complete,
+                "Complete guarded capture of one text part.",
+                text,
+                job.JobId,
+                session!,
+                message!,
+                partId!,
+                verifiedPath,
+                byteOffset,
+                recordLength,
+                parsed.Event.Timestamp,
+                observedAt,
+                kind);
+        }
+        catch (JsonException)
+        {
+            return Fail(
+                FullReportStatus.Unsafe,
+                "N/A — the target record is malformed JSON; no report is shown.");
+        }
+        catch (InvalidOperationException)
+        {
+            return Fail(
+                FullReportStatus.Unsafe,
+                "N/A — the target record contains malformed escaped text or identity; no report is shown.");
+        }
+    }
+
+    private static bool TryResolveIdentity(
+        JsonElement root,
+        JsonElement part,
+        out string? session,
+        out string? message,
+        out string? partId) =>
+        TryResolveIdentityCore(
+            root, part, requireSafePartId: true, out session, out message, out partId);
+
+    /// <summary>
+    /// Preview variant: strict alias and root/part consistency checks, but an
+    /// unsafe single part id remains displayable as null rather than rejecting
+    /// the whole observation.
+    /// </summary>
+    private static bool TryResolvePreviewIdentity(
+        JsonElement root,
+        JsonElement part,
+        out string? session,
+        out string? message,
+        out string? partId) =>
+        TryResolveIdentityCore(
+            root, part, requireSafePartId: false, out session, out message, out partId);
+
+    private static bool TryResolveIdentityCore(
+        JsonElement root,
+        JsonElement part,
+        bool requireSafePartId,
+        out string? session,
+        out string? message,
+        out string? partId)
+    {
+        session = null;
+        message = null;
+        partId = null;
+
+        if (!TryGetAlias(root, "sessionID", "sessionId", out var rootSession) ||
+            !TryGetAlias(part, "sessionID", "sessionId", out var partSession) ||
+            !TryGetAlias(root, "messageID", "messageId", out var rootMessage) ||
+            !TryGetAlias(part, "messageID", "messageId", out var partMessage) ||
+            !TryGetAlias(part, "id", "partID", out var partIdentity))
+        {
+            return false;
+        }
+
+        if (rootSession is not null &&
+            partSession is not null &&
+            !string.Equals(rootSession, partSession, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (rootMessage is not null &&
+            partMessage is not null &&
+            !string.Equals(rootMessage, partMessage, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        session = rootSession ?? partSession;
+        message = partMessage;
+        partId = partIdentity;
+        return ValidId(session) &&
+               ValidId(message) &&
+               (!requireSafePartId || ValidId(partId));
+    }
+
+    /// <summary>
+    /// Resolve one aliased identity field without null-coalescing: duplicate
+    /// aliases or conflicting alias values are rejected.
+    /// </summary>
+    private static bool TryGetAlias(
+        JsonElement value,
+        string primaryName,
+        string alternateName,
+        out string? result)
+    {
+        result = null;
+        if (!TryGetSingleString(value, primaryName, out var primary, out var hasPrimary) ||
+            !TryGetSingleString(value, alternateName, out var alternate, out var hasAlternate))
+        {
+            return false;
+        }
+
+        if (hasPrimary && hasAlternate)
+        {
+            // Equal alias forms are consistent; conflicting values are rejected.
+            if (!string.Equals(primary, alternate, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            result = primary;
+            return true;
+        }
+
+        result = hasPrimary ? primary : alternate;
+        return true;
+    }
+
+    private static bool TryGetSingleObject(
+        JsonElement value,
+        string name,
+        out JsonElement result)
+    {
+        result = default;
+        var count = 0;
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!property.NameEquals(name)) continue;
+            count++;
+            if (count > 1) return false;
+            if (property.Value.ValueKind != JsonValueKind.Object) return false;
+            result = property.Value;
+        }
+
+        return count == 1;
+    }
+
+    private static bool TryGetSingleString(
+        JsonElement value,
+        string name,
+        out string? result,
+        out bool present)
+    {
+        result = null;
+        present = false;
+        var count = 0;
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!property.NameEquals(name)) continue;
+            count++;
+            if (count > 1) return false;
+            if (property.Value.ValueKind == JsonValueKind.Null)
+            {
+                present = true;
+                continue;
+            }
+
+            if (property.Value.ValueKind != JsonValueKind.String) return false;
+            result = property.Value.GetString();
+            present = true;
+        }
+
+        return true;
+    }
+
+    private static FullReportResult EmptyResult(
+        FullReportStatus status,
+        string reason,
+        string jobId,
+        FullReportTarget target,
+        DateTimeOffset observedAt) => new(
+            status,
+            reason,
+            null,
+            jobId,
+            target.SessionId,
+            target.MessageId,
+            target.PartId,
+            null,
+            null,
+            null,
+            null,
+            observedAt,
+            string.Empty);
+
+    private static string ComputeDigest(byte[] bytes, int start, int length) =>
+        Convert.ToHexString(SHA256.HashData(bytes.AsSpan(start, length)));
+
+    private static bool IsHexDigest(string value)
+    {
+        if (value.Length != 64)
+        {
+            return false;
+        }
+
+        foreach (var character in value)
+        {
+            if (!char.IsAsciiHexDigit(character))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryReadWindow(
+        FileStream stream,
+        long start,
+        int count,
+        Action? beforeContentRead,
+        CancellationToken cancellationToken,
+        out byte[] bytes,
+        out int read)
+    {
+        bytes = new byte[count];
+        stream.Position = start;
+        beforeContentRead?.Invoke();
+        read = 0;
+        while (read < count)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var chunk = stream.Read(bytes, read, count - read);
+            if (chunk == 0)
+            {
+                break;
+            }
+
+            read += chunk;
+        }
+
+        return read == count;
+    }
+
+    private enum SourceGuardFailure
+    {
+        None,
+        Unavailable,
+        Unsafe
+    }
+
+    private static SourceGuardFailure TryOpenGuardedSource(
+        ForgeJobMetadata job,
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation,
+        string runsRoot,
+        out GuardedSource? source,
+        out string reason)
+    {
+        source = null;
+
+        if (job.IsProvisional || !job.HasExplicitLogPath || job.LogPath is null)
+        {
+            reason = "N/A — explicit metadata log association unavailable.";
+            return SourceGuardFailure.Unavailable;
+        }
+
+        if (!TryNormalize(job.LogPath, out var jobPath) ||
+            !TryNormalize(evidence.NormalizedPath, out var evidencePath) ||
+            !string.Equals(jobPath, evidencePath, StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "N/A — job/source association could not be verified.";
+            return SourceGuardFailure.Unsafe;
+        }
+
+        if (!string.Equals(evidence.JobId, job.JobId, StringComparison.Ordinal))
+        {
+            reason = "N/A — preflight evidence belongs to a different job.";
+            return SourceGuardFailure.Unsafe;
+        }
+
+        if (evidence.DuplicateOwners is { Count: > 0 })
+        {
+            reason =
+                "N/A — multiple jobs claim this source or its physical identity is unavailable; ownership is ambiguous.";
+            return SourceGuardFailure.Unsafe;
+        }
+
+        if (!evidence.IsAvailable)
+        {
+            reason =
+                "N/A — multiple jobs claim this source or its physical identity is unavailable; ownership is ambiguous.";
+            return evidence.Failure is SafeReadFailure.OutsideRoot or
+                SafeReadFailure.ReparsePoint or SafeReadFailure.Unverifiable
+                ? SourceGuardFailure.Unsafe
+                : SourceGuardFailure.Unavailable;
+        }
+
+        if (!string.Equals(observation.JobId, job.JobId, StringComparison.Ordinal) ||
+            !TryNormalize(observation.SourcePath, out var observedPath) ||
+            !string.Equals(observedPath, evidencePath, StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "N/A — ingestion observation belongs to a different job or source.";
+            return SourceGuardFailure.Unsafe;
+        }
+
+        if (!observation.IsConsistent ||
+            !observation.Identity.Equals(evidence.PhysicalIdentity))
+        {
+            reason = "N/A — source physical identity is unavailable, weak, or changed before ingestion.";
+            return SourceGuardFailure.Unsafe;
+        }
+
+        var opened = SafeFileAccess.OpenRead(
+            job.LogPath, runsRoot, rejectHardLinks: true);
+        var verifiedPath = opened.VerifiedPath;
+        if (opened.Stream is null ||
+            verifiedPath is null ||
+            !opened.PhysicalIdentity.Equals(observation.Identity) ||
+            !string.Equals(
+                verifiedPath,
+                evidence.VerifiedPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var unsafeFailure = opened.Stream is not null ||
+                                opened.Failure is SafeReadFailure.OutsideRoot or
+                                    SafeReadFailure.ReparsePoint or SafeReadFailure.Unverifiable;
+            opened.Dispose();
+            reason = "N/A — job source unavailable or physical identity changed; no excerpt is shown.";
+            return unsafeFailure
+                ? SourceGuardFailure.Unsafe
+                : SourceGuardFailure.Unavailable;
+        }
+
+        source = new GuardedSource(opened, verifiedPath);
+        reason = string.Empty;
+        return SourceGuardFailure.None;
+    }
+
+    private sealed class GuardedSource : IDisposable
+    {
+        public GuardedSource(SafeReadResult opened, string verifiedPath)
+        {
+            Opened = opened;
+            VerifiedPath = verifiedPath;
+        }
+
+        private SafeReadResult Opened { get; }
+        public FileStream Stream => Opened.Stream!;
+        public string VerifiedPath { get; }
+        public void Dispose() => Opened.Dispose();
     }
 
     private static bool SourceStillMatches(
@@ -570,9 +1345,6 @@ public static class JobLiveActivityReader
     }
 
     private static LiveActivitySnapshot Unavailable(string reason) => new() { Availability = reason };
-    private static string? Get(JsonElement value, string name) =>
-        value.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String
-            ? property.GetString() : null;
     private static bool ValidId(string? value) => !string.IsNullOrWhiteSpace(value) &&
         value.Length <= 256 && !value.Any(character => char.IsControl(character) ||
             char.GetUnicodeCategory(character) == UnicodeCategory.Format);
@@ -598,5 +1370,6 @@ public static class JobLiveActivityReader
         ForgeJobMetadata Job,
         string? NormalizedPath,
         string? VerifiedPath,
-        LedgerSourceIdentity Identity);
+        LedgerSourceIdentity Identity,
+        SafeReadFailure Failure);
 }

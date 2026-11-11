@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using DSMonitor.Models;
@@ -714,6 +715,999 @@ public sealed class JobLiveActivityTests
         Assert.IsNull((await Scan()).Jobs.Single().LiveActivity.Done);
     }
 
+    [TestMethod]
+    public void FullReport_ReturnsCompleteOriginalTextBeyondPreviewAnd4278Characters()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var original = "line1\nline2\t😀\u202e" + new string('é', 5_000);
+        workspace.WriteLog("job", Text(original, "m"));
+        var prepared = Prepare(workspace);
+        var preview = JobLiveActivityReader.Read(
+            prepared.Job, prepared.Evidence, prepared.Observation, workspace.RunsRoot, Now);
+
+        Assert.IsNotNull(preview.Doing);
+        Assert.AreEqual(JobLiveActivityReader.MaxExcerptLength, preview.Doing!.Text.Length);
+        Assert.IsFalse(preview.Doing.Text.Contains('\n'));
+        Assert.IsFalse(preview.Doing.Text.Contains('\u202e'));
+
+        var result = ReadFullReport(workspace, prepared, FullReportTarget.FromExcerpt(preview.Doing));
+        Assert.AreEqual(FullReportStatus.Complete, result.Status, result.Reason);
+        Assert.IsTrue(result.IsComplete);
+        Assert.AreEqual(original, result.Text);
+        Assert.AreEqual("job", result.JobId);
+        Assert.AreEqual("shared-session", result.SessionId);
+        Assert.AreEqual("m", result.MessageId);
+        Assert.AreEqual("text-m", result.PartId);
+        Assert.AreEqual(preview.Doing.ByteOffset, result.ByteOffset);
+        Assert.AreEqual(DateTimeOffset.FromUnixTimeMilliseconds(1_800_000_000_000), result.SourceTimestamp);
+        Assert.AreEqual(Now, result.ObservedAt);
+        Assert.IsTrue(result.RecordLengthBytes > 5_000);
+        StringAssert.Contains(result.Kind, "Assistant");
+        StringAssert.Contains(result.Provenance, "part text-m");
+        StringAssert.Contains(result.Provenance, "source");
+    }
+
+    [TestMethod]
+    public void FullReport_RetrievesRecordBeyond64KiBPreviewWithoutChangingPreviewBehavior()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var original = new string('x', 80_000);
+        workspace.WriteLog("job", Text(original, "m"), Finish("m"));
+
+        // The 64 KiB preview still starts inside the oversized text record and
+        // therefore shows no attributed excerpt.
+        var preview = Read(workspace);
+        Assert.IsNull(preview.Doing);
+        Assert.IsNull(preview.Done);
+
+        var result = ReadFullReport(
+            workspace,
+            Target("m", digest: FirstRecordDigest(workspace)));
+        Assert.AreEqual(FullReportStatus.Complete, result.Status, result.Reason);
+        Assert.AreEqual(original, result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_256KiBBoundary_ExactFitIsComplete_OverCapIsIncomplete()
+    {
+        var baseLength = Encoding.UTF8.GetByteCount(Text(string.Empty, "m"));
+        var fittingText = new string('y', JobLiveActivityReader.MaxFullReportBytes - 1 - baseLength);
+        using (var workspace = new TestWorkspace())
+        {
+            workspace.WriteMetadata("job");
+            var record = Text(fittingText, "m");
+            Assert.AreEqual(
+                JobLiveActivityReader.MaxFullReportBytes - 1,
+                Encoding.UTF8.GetByteCount(record));
+            File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(record + "\n"));
+
+            var result = ReadFullReport(
+                workspace,
+                Target("m", offset: 0, digest: FirstRecordDigest(workspace)));
+            Assert.AreEqual(FullReportStatus.Complete, result.Status, result.Reason);
+            Assert.AreEqual(fittingText, result.Text);
+            Assert.AreEqual(0L, result.ByteOffset);
+            Assert.AreEqual(
+                (long)(JobLiveActivityReader.MaxFullReportBytes - 1),
+                result.RecordLengthBytes);
+        }
+
+        var overText = new string('y', JobLiveActivityReader.MaxFullReportBytes + 1 - baseLength);
+        using (var workspace = new TestWorkspace())
+        {
+            workspace.WriteMetadata("job");
+            var record = Text(overText, "m");
+            Assert.AreEqual(
+                JobLiveActivityReader.MaxFullReportBytes + 1,
+                Encoding.UTF8.GetByteCount(record));
+            File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(record + "\n"));
+
+            var result = ReadFullReport(workspace, Target("m", offset: 0));
+            Assert.AreEqual(FullReportStatus.Incomplete, result.Status, result.Reason);
+            Assert.IsNull(result.Text);
+        }
+    }
+
+    [TestMethod]
+    public void FullReport_MalformedTargetRecord_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(
+                "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+                "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"text\":\"unterminated\"\n"));
+
+        var result = ReadFullReport(workspace, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_InvalidUtf8TargetRecord_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            new byte[] { (byte)'{', 0xFF, (byte)'}', (byte)'\n' });
+
+        var result = ReadFullReport(workspace, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_MissingTerminatingNewline_IsIncomplete()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(Text("no newline", "m")));
+        var prepared = Prepare(workspace);
+
+        var byOffset = ReadFullReport(workspace, prepared, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Incomplete, byOffset.Status, byOffset.Reason);
+        StringAssert.Contains(byOffset.Reason, "newline");
+        Assert.IsNull(byOffset.Text);
+
+        var byIdentity = ReadFullReport(workspace, prepared, Target("m"));
+        Assert.AreEqual(FullReportStatus.Incomplete, byIdentity.Status, byIdentity.Reason);
+        StringAssert.Contains(byIdentity.Reason, "newline");
+        Assert.IsNull(byIdentity.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_MissingSource_IsUnavailable()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("present", "m"));
+        var prepared = Prepare(workspace);
+        File.Delete(workspace.LogPath("job"));
+
+        var result = ReadFullReport(workspace, prepared, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Unavailable, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_TruncatedSource_IsIncomplete()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("before truncate", "m"));
+        var prepared = Prepare(workspace);
+        using (var stream = new FileStream(
+                   workspace.LogPath("job"),
+                   FileMode.Open,
+                   FileAccess.Write,
+                   FileShare.ReadWrite | FileShare.Delete))
+        {
+            stream.SetLength(0);
+        }
+
+        var result = ReadFullReport(workspace, prepared, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Incomplete, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_ReplacementDuringRead_DiscardsTheReport()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("before replacement", "m"));
+        var prepared = Prepare(workspace);
+        var digest = FirstRecordDigest(workspace);
+        var replacement = Path.Combine(workspace.RunsRoot, "full-report-during-read.tmp");
+
+        var result = ReadFullReport(
+            workspace,
+            prepared,
+            Target("m", offset: 0, digest: digest),
+            beforePublishCheck: () =>
+            {
+                File.WriteAllText(replacement, Text("after replacement", "m") + "\n");
+                File.Delete(workspace.LogPath("job"));
+                File.Move(replacement, workspace.LogPath("job"));
+            });
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_SameSizeDifferentPartReplacement_NeverSubstitutesAnotherPart()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var first = Text("alpha", "m");
+        var second = Text("alpha", "n");
+        Assert.AreEqual(first.Length, second.Length);
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(first + "\n"));
+        var prepared = Prepare(workspace);
+        var digest = FirstRecordDigest(workspace);
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(second + "\n"));
+
+        var result = ReadFullReport(
+            workspace,
+            prepared,
+            Target("m", offset: 0, digest: digest));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_HardLinkedSource_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("aliased content", "m"));
+        Assert.IsTrue(
+            ReparsePointFixture.TryCreateHardLink(
+                Path.Combine(workspace.RunsRoot, "full-report-alias.log"),
+                workspace.LogPath("job")),
+            "Synthetic hard link fixture could not be created.");
+
+        var result = ReadFullReport(workspace, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_AmbiguousOwnership_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteMetadata("other", logPath: workspace.LogPath("job"));
+        workspace.WriteLog("job", Text("private", "m"));
+
+        var result = ReadFullReport(workspace, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_SourceIdentityMismatch_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("identity", "m"));
+        var prepared = Prepare(workspace, identityReader: _ => SyntheticIdentityB);
+        Assert.IsFalse(prepared.Observation.IsConsistent);
+
+        var result = ReadFullReport(workspace, prepared, Target("m", offset: 0));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_Roles_RejectUserAndConflicts_KeepRolelessUnverified()
+    {
+        var scenarios = new (string Name, string Record, FullReportStatus Expected)[]
+        {
+            (
+                "user",
+                RoleRecord("text", "m", "payload", new[] { "\"user\"" }, Array.Empty<string>()),
+                FullReportStatus.Unsafe),
+            (
+                "conflict",
+                RoleRecord(
+                    "text",
+                    "m",
+                    "payload",
+                    new[] { "\"assistant\"" },
+                    new[] { "\"user\"" }),
+                FullReportStatus.Unsafe),
+            (
+                "roleless",
+                RoleRecord("text", "m", "payload", Array.Empty<string>(), Array.Empty<string>()),
+                FullReportStatus.Complete)
+        };
+
+        foreach (var scenario in scenarios)
+        {
+            using var workspace = new TestWorkspace();
+            workspace.WriteMetadata("job");
+            workspace.WriteLog("job", scenario.Record);
+            var result = ReadFullReport(
+                workspace,
+                TargetPart("m", "part-m", offset: 0, digest: FirstRecordDigest(workspace)));
+            Assert.AreEqual(
+                scenario.Expected,
+                result.Status,
+                scenario.Name + ": " + result.Reason);
+            if (scenario.Expected == FullReportStatus.Complete)
+            {
+                Assert.AreEqual("payload", result.Text, scenario.Name);
+                StringAssert.Contains(result.Kind, "unverified", scenario.Name);
+                Assert.IsFalse(
+                    result.Kind.Contains("Assistant", StringComparison.Ordinal),
+                    scenario.Name);
+            }
+            else
+            {
+                Assert.IsNull(result.Text, scenario.Name);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void FullReport_NonTextSelectedPart_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", ToolUse(
+            1_800_000_001_000,
+            "shell",
+            "completed",
+            1_800_000_000_000,
+            1_800_000_001_000));
+        var preview = Read(workspace);
+        Assert.IsNotNull(preview.Doing);
+
+        var result = ReadFullReport(workspace, FullReportTarget.FromExcerpt(preview.Doing!));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_SharedSession_IsolatesJobsAndNeverSubstitutesAnotherPart()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job0");
+        workspace.WriteMetadata("job1");
+        workspace.WriteLog("job0", Text("alpha", "m0"));
+        workspace.WriteLog("job1", Text("bravo", "m1"));
+        var prepared0 = Prepare(workspace, "job0");
+        var prepared1 = Prepare(workspace, "job1");
+
+        var own = ReadFullReport(
+            workspace,
+            prepared1,
+            new FullReportTarget(
+                "job1",
+                "shared-session",
+                "m1",
+                "text-m1",
+                0,
+                FirstRecordDigest(workspace, "job1")));
+        Assert.AreEqual(FullReportStatus.Complete, own.Status, own.Reason);
+        Assert.AreEqual("bravo", own.Text);
+
+        var cross = ReadFullReport(
+            workspace,
+            prepared0,
+            new FullReportTarget("job0", "shared-session", "m1", "text-m1"));
+        Assert.AreEqual(FullReportStatus.Unavailable, cross.Status, cross.Reason);
+        Assert.IsNull(cross.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_TargetForDifferentJob_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("content", "m"));
+        var prepared = Prepare(workspace);
+
+        var result = ReadFullReport(
+            workspace,
+            prepared,
+            new FullReportTarget("other", "shared-session", "m", "text-m", 0));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_MissingPartIdentity_IsUnavailableAndDoesNotGuess()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("content", "m"));
+
+        var result = ReadFullReport(
+            workspace,
+            new FullReportTarget("job", "shared-session", "m", null));
+        Assert.AreEqual(FullReportStatus.Unavailable, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_RepeatedReads_AreStableAndStateless()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text(new string('r', 5_000), "m"));
+        var prepared = Prepare(workspace);
+        var target = Target("m", offset: 0, digest: FirstRecordDigest(workspace));
+
+        var first = ReadFullReport(workspace, prepared, target);
+        var second = ReadFullReport(workspace, prepared, target);
+        var third = ReadFullReport(workspace, prepared, target);
+        foreach (var result in new[] { first, second, third })
+        {
+            Assert.AreEqual(FullReportStatus.Complete, result.Status, result.Reason);
+            Assert.AreEqual(5_000, result.Text?.Length);
+            Assert.AreEqual(first.ByteOffset, result.ByteOffset);
+            Assert.AreEqual(first.RecordLengthBytes, result.RecordLengthBytes);
+            Assert.AreEqual(first.SourceTimestamp, result.SourceTimestamp);
+        }
+    }
+
+    [TestMethod]
+    public void FullReport_InvalidEscapedSurrogateText_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var record =
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"timestamp\":1800000000000," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"text\":\"bad \\uD800\"}}";
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(record + "\n"));
+
+        var result = ReadFullReport(
+            workspace,
+            Target("m", offset: 0, digest: FirstRecordDigest(workspace)));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_InvalidEscapedSurrogateIdentity_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var record =
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"bad \\uD800\",\"messageID\":\"m\",\"text\":\"payload\"}}";
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(record + "\n"));
+
+        var result = ReadFullReport(
+            workspace,
+            new FullReportTarget(
+                "job",
+                "shared-session",
+                "m",
+                "bad \uD800",
+                0,
+                FirstRecordDigest(workspace)));
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void Preview_InvalidEscapedSurrogateRecord_IsSkippedAndLaterRecordShown()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var invalid =
+            "{\"type\":\"text\",\"sessionID\":\"bad \\uD800\"," +
+            "\"part\":{\"id\":\"text-bad\",\"messageID\":\"bad\",\"text\":\"bad \\uD800\"}}";
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(invalid + "\n" + Text("survives", "m") + "\n"));
+
+        var activity = Read(workspace);
+        Assert.AreEqual("survives", activity.Doing?.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_WindowStartInsideUnprovenRecord_IsIncomplete()
+    {
+        var baseLength = Encoding.UTF8.GetByteCount(Text(string.Empty, "m"));
+        var body = new string('y', JobLiveActivityReader.MaxFullReportBytes - 1 - baseLength);
+        var record = Text(body, "m");
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var prefix = new string('A', 100);
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(prefix + record + "\n"));
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(record)));
+
+        // File length is 100 + 262143 + 1, so the bounded window starts exactly
+        // at the record offset with no preceding newline.
+        var result = ReadFullReport(
+            workspace,
+            new FullReportTarget("job", "shared-session", "m", "text-m", 100, digest));
+        Assert.AreEqual(FullReportStatus.Incomplete, result.Status, result.Reason);
+        StringAssert.Contains(result.Reason, "source-byte cap");
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_WindowStartRecord_CannotProvePredecessorWithinCap_IsIncomplete()
+    {
+        var baseLength = Encoding.UTF8.GetByteCount(Text(string.Empty, "m"));
+        var body = new string('y', JobLiveActivityReader.MaxFullReportBytes - 1 - baseLength);
+        var record = Text(body, "m");
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var prefix = new string('A', 99) + "\n";
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(prefix + record + "\n"));
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(record)));
+
+        // A real newline precedes the record at absolute byte 99, but proving it
+        // would require a 262145th source byte, so the strict cap fails closed.
+        var result = ReadFullReport(
+            workspace,
+            new FullReportTarget("job", "shared-session", "m", "text-m", 100, digest));
+        Assert.AreEqual(FullReportStatus.Incomplete, result.Status, result.Reason);
+        StringAssert.Contains(result.Reason, "source-byte cap");
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_TargetInsideWindowWithPredecessorNewline_IsComplete()
+    {
+        var baseLength = Encoding.UTF8.GetByteCount(Text(string.Empty, "m"));
+        var body = new string('y', JobLiveActivityReader.MaxFullReportBytes - 2 - baseLength);
+        var record = Text(body, "m");
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var prefix = new string('A', 99) + "\n";
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(prefix + record + "\n"));
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(record)));
+
+        // The record starts one byte inside the window, so its predecessor
+        // newline is available without exceeding the 262144-byte bound.
+        var result = ReadFullReport(
+            workspace,
+            new FullReportTarget("job", "shared-session", "m", "text-m", 100, digest));
+        Assert.AreEqual(FullReportStatus.Complete, result.Status, result.Reason);
+        Assert.AreEqual(body, result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_UnterminatedDuplicateTargetTail_IsIncomplete()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var first = Text("first", "m");
+        var duplicateTail = Text("second", "m");
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(first + "\n" + duplicateTail));
+
+        var result = ReadFullReport(
+            workspace,
+            Target("m", digest: FirstRecordDigest(workspace)));
+        Assert.AreEqual(FullReportStatus.Incomplete, result.Status, result.Reason);
+        StringAssert.Contains(result.Reason, "unterminated");
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_UnterminatedDifferentTail_StillReturnsCompleteMatch()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var first = Text("first", "m");
+        var otherTail = Text("tail", "other");
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(first + "\n" + otherTail));
+
+        var result = ReadFullReport(
+            workspace,
+            Target("m", digest: FirstRecordDigest(workspace)));
+        Assert.AreEqual(FullReportStatus.Complete, result.Status, result.Reason);
+        Assert.AreEqual("first", result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_ConflictingOrDuplicateIdentityAliases_AreUnsafe()
+    {
+        var records = new (string Name, string Record)[]
+        {
+            (
+                "session-alias",
+                "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"sessionId\":\"other\"," +
+                "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"text\":\"payload\"}}"),
+            (
+                "session-duplicate",
+                "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"sessionID\":\"shared-session\"," +
+                "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"text\":\"payload\"}}"),
+            (
+                "message-alias",
+                "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+                "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"messageId\":\"other\",\"text\":\"payload\"}}"),
+            (
+                "part-alias",
+                "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+                "\"part\":{\"id\":\"text-m\",\"partID\":\"text-other\",\"messageID\":\"m\",\"text\":\"payload\"}}")
+        };
+
+        foreach (var scenario in records)
+        {
+            using var workspace = new TestWorkspace();
+            workspace.WriteMetadata("job");
+            File.WriteAllBytes(
+                workspace.LogPath("job"),
+                Encoding.UTF8.GetBytes(scenario.Record + "\n"));
+            var result = ReadFullReport(
+                workspace,
+                Target("m", offset: 0, digest: FirstRecordDigest(workspace)));
+            Assert.AreEqual(
+                FullReportStatus.Unsafe,
+                result.Status,
+                scenario.Name + ": " + result.Reason);
+            Assert.IsNull(result.Text, scenario.Name);
+        }
+    }
+
+    [TestMethod]
+    public void FullReport_SingleIdentityAliases_AreAccepted()
+    {
+        var records = new (string Name, string Record)[]
+        {
+            (
+                "camel",
+                "{\"type\":\"text\",\"part\":{\"id\":\"text-m\"," +
+                "\"sessionId\":\"shared-session\",\"messageId\":\"m\",\"text\":\"payload\"}}"),
+            (
+                "partID",
+                "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+                "\"part\":{\"partID\":\"text-m\",\"messageID\":\"m\",\"text\":\"payload\"}}"),
+            (
+                "root-and-part-session",
+                "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+                "\"part\":{\"id\":\"text-m\",\"sessionID\":\"shared-session\"," +
+                "\"messageID\":\"m\",\"text\":\"payload\"}}")
+        };
+
+        foreach (var scenario in records)
+        {
+            using var workspace = new TestWorkspace();
+            workspace.WriteMetadata("job");
+            File.WriteAllBytes(
+                workspace.LogPath("job"),
+                Encoding.UTF8.GetBytes(scenario.Record + "\n"));
+            var result = ReadFullReport(
+                workspace,
+                Target("m", offset: 0, digest: FirstRecordDigest(workspace)));
+            Assert.AreEqual(
+                FullReportStatus.Complete,
+                result.Status,
+                scenario.Name + ": " + result.Reason);
+            Assert.AreEqual("payload", result.Text, scenario.Name);
+        }
+    }
+
+    [TestMethod]
+    public void FullReport_TargetWithoutRecordBinding_IsIncomplete()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("content", "m"));
+        var prepared = Prepare(workspace);
+
+        var result = ReadFullReport(
+            workspace,
+            prepared,
+            new FullReportTarget("job", "shared-session", "m", "text-m", 0));
+        Assert.AreEqual(FullReportStatus.Incomplete, result.Status, result.Reason);
+        StringAssert.Contains(result.Reason, "binding");
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_DigestMismatchAfterLengthChangingRewrite_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        workspace.WriteLog("job", Text("alpha", "m"));
+        var preview = Read(workspace);
+        Assert.AreEqual("alpha", preview.Doing?.Text);
+        var target = FullReportTarget.FromExcerpt(preview.Doing!);
+
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(Text("bravo-longer", "m") + "\n"));
+        var fresh = Prepare(workspace);
+
+        var result = ReadFullReport(workspace, fresh, target);
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void FullReport_DigestMismatchAfterSameLengthRewrite_IsUnsafe()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(Text("alpha", "m") + "\n"));
+        var preview = Read(workspace);
+        Assert.AreEqual("alpha", preview.Doing?.Text);
+        var target = FullReportTarget.FromExcerpt(preview.Doing!);
+
+        // Same record length, same part identity, same physical file: only the
+        // digest can prove the content did not change.
+        File.WriteAllBytes(
+            workspace.LogPath("job"),
+            Encoding.UTF8.GetBytes(Text("bravo", "m") + "\n"));
+        var fresh = Prepare(workspace);
+
+        var result = ReadFullReport(workspace, fresh, target);
+        Assert.AreEqual(FullReportStatus.Unsafe, result.Status, result.Reason);
+        Assert.IsNull(result.Text);
+    }
+
+    [TestMethod]
+    public void Preview_DuplicatePart_IsRejectedRegardlessOfOrder()
+    {
+        var records = new[]
+        {
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"p-user\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"user secret\",\"role\":\"user\"}," +
+            "\"part\":{\"id\":\"p-assistant\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"assistant visible\",\"role\":\"assistant\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"p-assistant\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"assistant visible\",\"role\":\"assistant\"}," +
+            "\"part\":{\"id\":\"p-user\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"user secret\",\"role\":\"user\"}}"
+        };
+        foreach (var record in records)
+        {
+            AssertPreviewRejected(record);
+        }
+    }
+
+    [TestMethod]
+    public void FullReport_DuplicatePart_IsUnsafe()
+    {
+        var record =
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"p-user\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"user secret\",\"role\":\"user\"}," +
+            "\"part\":{\"id\":\"p-assistant\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"assistant visible\",\"role\":\"assistant\"}}";
+        AssertFullReport(
+            record, "shared-session", "m", "p-assistant", 0, FullReportStatus.Unsafe);
+    }
+
+    [TestMethod]
+    public void Preview_DuplicateText_IsRejected()
+    {
+        AssertPreviewRejected(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"first text\",\"text\":\"second text\",\"role\":\"assistant\"}}");
+    }
+
+    [TestMethod]
+    public void FullReport_DuplicateText_IsUnsafe()
+    {
+        AssertFullReport(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"first text\",\"text\":\"second text\",\"role\":\"assistant\"}}",
+            "shared-session", "m", "text-m", 0, FullReportStatus.Unsafe);
+    }
+
+    [TestMethod]
+    public void Preview_DuplicateReason_DoesNotInferDone()
+    {
+        var scenarios = new (string Name, string Reason, bool ExpectDone)[]
+        {
+            ("duplicate", "\"reason\":\"tool-calls\",\"reason\":\"stop\"", false),
+            ("single-stop", "\"reason\":\"stop\"", true),
+            ("single-tool-calls", "\"reason\":\"tool-calls\"", false)
+        };
+        foreach (var scenario in scenarios)
+        {
+            using var workspace = new TestWorkspace();
+            workspace.WriteMetadata("job");
+            var finish =
+                "{\"type\":\"step_finish\",\"sessionID\":\"shared-session\"," +
+                "\"part\":{\"id\":\"finish-m\",\"messageID\":\"m\",\"type\":\"step-finish\"," +
+                scenario.Reason + ",\"cost\":0.25,\"role\":\"assistant\"}}";
+            File.WriteAllBytes(
+                workspace.LogPath("job"),
+                Encoding.UTF8.GetBytes(Text("candidate", "m") + "\n" + finish + "\n"));
+            var activity = Read(workspace);
+            Assert.AreEqual("candidate", activity.Doing?.Text, scenario.Name);
+            if (scenario.ExpectDone)
+            {
+                Assert.AreEqual("candidate", activity.Done?.Text, scenario.Name);
+            }
+            else
+            {
+                Assert.IsNull(activity.Done, scenario.Name);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void Preview_DuplicateRoleAndType_AreRejected()
+    {
+        AssertPreviewRejected(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"payload\",\"role\":\"assistant\",\"role\":\"user\"}}");
+        AssertPreviewRejected(
+            "{\"type\":\"text\",\"type\":\"tool_use\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}");
+        AssertPreviewRejected(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"type\":\"tool\"," +
+            "\"text\":\"payload\"}}");
+    }
+
+    [TestMethod]
+    public void FullReport_DuplicateRoleAndType_AreUnsafe()
+    {
+        AssertFullReport(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\"," +
+            "\"text\":\"payload\",\"role\":\"assistant\",\"role\":\"user\"}}",
+            "shared-session", "m", "text-m", 0, FullReportStatus.Unsafe);
+        AssertFullReport(
+            "{\"type\":\"text\",\"type\":\"tool_use\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}",
+            "shared-session", "m", "text-m", 0, FullReportStatus.Unsafe);
+        AssertFullReport(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"type\":\"tool\"," +
+            "\"text\":\"payload\"}}",
+            "shared-session", "m", "text-m", 0, FullReportStatus.Unsafe);
+    }
+
+    [TestMethod]
+    public void Preview_ConflictingOrDuplicateAliases_AreRejected()
+    {
+        var records = new[]
+        {
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"sessionId\":\"other\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"messageId\":\"other\"," +
+            "\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"partID\":\"text-other\",\"messageID\":\"m\"," +
+            "\"type\":\"text\",\"text\":\"payload\"}}"
+        };
+        foreach (var record in records)
+        {
+            AssertPreviewRejected(record);
+        }
+    }
+
+    [TestMethod]
+    public void Preview_EqualConsistentAliases_AreAccepted()
+    {
+        var records = new[]
+        {
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"partID\":\"text-m\",\"messageID\":\"m\"," +
+            "\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"sessionId\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"sessionID\":\"shared-session\",\"messageID\":\"m\"," +
+            "\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"messageID\":\"m\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}"
+        };
+        foreach (var record in records)
+        {
+            AssertPreviewAccepted(record, "payload");
+        }
+    }
+
+    [TestMethod]
+    public void FullReport_EqualConsistentAliases_AreComplete()
+    {
+        var records = new[]
+        {
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"partID\":\"text-m\",\"messageID\":\"m\"," +
+            "\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"sessionId\":\"shared-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}",
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"messageID\":\"m\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"m\",\"type\":\"text\",\"text\":\"payload\"}}"
+        };
+        foreach (var record in records)
+        {
+            AssertFullReport(
+                record, "shared-session", "m", "text-m", 0,
+                FullReportStatus.Complete, "payload");
+        }
+    }
+
+    [TestMethod]
+    public void Preview_RootPartMessageConflict_IsRejected()
+    {
+        AssertPreviewRejected(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"messageID\":\"root-m\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"part-m\",\"type\":\"text\"," +
+            "\"text\":\"payload\",\"role\":\"assistant\"}}");
+    }
+
+    [TestMethod]
+    public void FullReport_RootPartMessageConflict_IsUnsafe()
+    {
+        AssertFullReport(
+            "{\"type\":\"text\",\"sessionID\":\"shared-session\",\"messageID\":\"root-m\"," +
+            "\"part\":{\"id\":\"text-m\",\"messageID\":\"part-m\",\"type\":\"text\"," +
+            "\"text\":\"payload\",\"role\":\"assistant\"}}",
+            "shared-session", "part-m", "text-m", 0, FullReportStatus.Unsafe);
+    }
+
+    [TestMethod]
+    public void Preview_RootPartSessionConflict_IsRejected()
+    {
+        AssertPreviewRejected(
+            "{\"type\":\"text\",\"sessionID\":\"root-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"sessionID\":\"part-session\",\"messageID\":\"m\"," +
+            "\"type\":\"text\",\"text\":\"payload\",\"role\":\"assistant\"}}");
+    }
+
+    [TestMethod]
+    public void FullReport_RootPartSessionConflict_IsUnsafe()
+    {
+        AssertFullReport(
+            "{\"type\":\"text\",\"sessionID\":\"root-session\"," +
+            "\"part\":{\"id\":\"text-m\",\"sessionID\":\"part-session\",\"messageID\":\"m\"," +
+            "\"type\":\"text\",\"text\":\"payload\",\"role\":\"assistant\"}}",
+            "root-session", "m", "text-m", 0, FullReportStatus.Unsafe);
+    }
+
+    private static void AssertPreviewRejected(string record)
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(record + "\n"));
+        var activity = Read(workspace);
+        Assert.IsNull(activity.Doing);
+        Assert.IsNull(activity.Done);
+    }
+
+    private static void AssertPreviewAccepted(string record, string expectedText)
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(record + "\n"));
+        var activity = Read(workspace);
+        Assert.AreEqual(expectedText, activity.Doing?.Text);
+    }
+
+    private static void AssertFullReport(
+        string record,
+        string session,
+        string message,
+        string part,
+        long offset,
+        FullReportStatus expected,
+        string? expectedText = null)
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        File.WriteAllBytes(workspace.LogPath("job"), Encoding.UTF8.GetBytes(record + "\n"));
+        var result = ReadFullReport(
+            workspace,
+            new FullReportTarget(
+                "job", session, message, part, offset, FirstRecordDigest(workspace)));
+        Assert.AreEqual(expected, result.Status, result.Reason);
+        if (expected == FullReportStatus.Complete)
+        {
+            Assert.AreEqual(expectedText, result.Text);
+        }
+        else
+        {
+            Assert.IsNull(result.Text);
+        }
+    }
+
     private static string RoleRecord(
         string type,
         string message,
@@ -779,6 +1773,50 @@ public sealed class JobLiveActivityTests
             Now,
             CancellationToken.None,
             maxBytes,
+            beforeContentRead,
+            beforePublishCheck);
+
+    private static FullReportTarget Target(
+        string message,
+        long? offset = null,
+        string? digest = null) =>
+        new("job", "shared-session", message, "text-" + message, offset, digest);
+
+    private static FullReportTarget TargetPart(
+        string message,
+        string part,
+        long? offset = null,
+        string? digest = null) =>
+        new("job", "shared-session", message, part, offset, digest);
+
+    private static string FirstRecordDigest(TestWorkspace workspace, string jobId = "job")
+    {
+        var bytes = File.ReadAllBytes(workspace.LogPath(jobId));
+        var end = Array.IndexOf(bytes, (byte)'\n');
+        Assert.IsTrue(end >= 0, "Synthetic record must be newline-terminated.");
+        return Convert.ToHexString(SHA256.HashData(bytes.AsSpan(0, end)));
+    }
+
+    private static FullReportResult ReadFullReport(
+        TestWorkspace workspace,
+        FullReportTarget target,
+        LedgerSourceIdentityReader? identityReader = null) =>
+        ReadFullReport(workspace, Prepare(workspace, identityReader: identityReader), target);
+
+    private static FullReportResult ReadFullReport(
+        TestWorkspace workspace,
+        PreparedActivity prepared,
+        FullReportTarget target,
+        Action? beforeContentRead = null,
+        Action? beforePublishCheck = null) =>
+        JobLiveActivityReader.ReadFullReport(
+            prepared.Job,
+            prepared.Evidence,
+            prepared.Observation,
+            target,
+            workspace.RunsRoot,
+            Now,
+            CancellationToken.None,
             beforeContentRead,
             beforePublishCheck);
 
