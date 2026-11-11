@@ -749,6 +749,111 @@ public sealed class JobLiveActivityTests
     }
 
     [TestMethod]
+    public void ReportedStatus_IntegrationPreservesPreviewFullReportAndForgeStatus()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job", status: "DONE");
+        const string report = "Plan complete.\nStatus: **v1.2.3-complete**\n";
+        workspace.WriteLog("job", Text(report, "m"), Finish("m"));
+        var prepared = Prepare(workspace);
+        var forgeStatus = prepared.Job.ExplicitStatus;
+
+        var preview = JobLiveActivityReader.Read(
+            prepared.Job, prepared.Evidence, prepared.Observation, workspace.RunsRoot, Now);
+        Assert.IsNotNull(preview.Doing);
+        StringAssert.Contains(preview.Doing!.Text, "Status:");
+
+        var full = ReadFullReport(
+            workspace,
+            prepared,
+            Target("m", offset: 0, digest: FirstRecordDigest(workspace)));
+        Assert.AreEqual(FullReportStatus.Complete, full.Status, full.Reason);
+        Assert.AreEqual(report, full.Text);
+
+        var extraction = ReportedStatusParser.Extract(full);
+        Assert.AreEqual(ReportedStatusState.Reported, extraction.State, extraction.Reason);
+        Assert.AreEqual("v1.2.3-complete", extraction.Value);
+        Assert.AreEqual(15, extraction.Value!.Length);
+        Assert.IsTrue(extraction.IsRoleVerified);
+        Assert.AreSame(full, extraction.Source);
+        Assert.AreEqual("job", extraction.Source.JobId);
+        Assert.AreEqual("shared-session", extraction.Source.SessionId);
+        Assert.AreEqual("m", extraction.Source.MessageId);
+        Assert.AreEqual("text-m", extraction.Source.PartId);
+        StringAssert.Contains(extraction.Provenance, "part text-m");
+
+        // Extraction is read-only: the prior preview, full report, and Forge
+        // metadata status remain unchanged.
+        Assert.AreEqual(report, full.Text);
+        Assert.AreEqual(ForgeJobStatus.Done, forgeStatus);
+        Assert.AreEqual(forgeStatus, prepared.Job.ExplicitStatus);
+        var after = JobLiveActivityReader.Read(
+            prepared.Job, prepared.Evidence, prepared.Observation, workspace.RunsRoot, Now);
+        Assert.AreEqual(preview.Doing.Text, after.Doing?.Text);
+    }
+
+    [TestMethod]
+    public void ReportedStatus_IntegrationRejectsUserRoleAndIsolatesSharedSessions()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job0");
+        workspace.WriteMetadata("job1");
+        workspace.WriteMetadata("user");
+        workspace.WriteLog("job0", Text("Status: DONE", "m0"));
+        workspace.WriteLog("job1", Text("Status: RUNNING", "m1", role: null));
+        workspace.WriteLog("user", Text("Status: FAILED", "mu", role: "user"));
+
+        var prepared0 = Prepare(workspace, "job0");
+        var prepared1 = Prepare(workspace, "job1");
+        var preparedUser = Prepare(workspace, "user");
+
+        var full0 = ReadFullReport(
+            workspace,
+            prepared0,
+            new FullReportTarget(
+                "job0", "shared-session", "m0", "text-m0", 0, FirstRecordDigest(workspace, "job0")));
+        var full1 = ReadFullReport(
+            workspace,
+            prepared1,
+            new FullReportTarget(
+                "job1", "shared-session", "m1", "text-m1", 0, FirstRecordDigest(workspace, "job1")));
+        var fullUser = ReadFullReport(
+            workspace,
+            preparedUser,
+            new FullReportTarget(
+                "user", "shared-session", "mu", "text-mu", 0, FirstRecordDigest(workspace, "user")));
+
+        Assert.AreEqual(FullReportStatus.Complete, full0.Status, full0.Reason);
+        Assert.AreEqual(FullReportStatus.Complete, full1.Status, full1.Reason);
+        Assert.AreEqual(FullReportStatus.Unsafe, fullUser.Status, fullUser.Reason);
+
+        var extraction0 = ReportedStatusParser.Extract(full0);
+        var extraction1 = ReportedStatusParser.Extract(full1);
+        var userExtraction = ReportedStatusParser.Extract(fullUser);
+
+        Assert.AreEqual(ReportedStatusState.Reported, extraction0.State, extraction0.Reason);
+        Assert.AreEqual("DONE", extraction0.Value);
+        Assert.AreEqual("job0", extraction0.Source.JobId);
+        Assert.AreEqual("shared-session", extraction0.Source.SessionId);
+        Assert.AreEqual("m0", extraction0.Source.MessageId);
+        Assert.AreEqual("text-m0", extraction0.Source.PartId);
+        Assert.IsTrue(extraction0.IsRoleVerified);
+
+        Assert.AreEqual(ReportedStatusState.Reported, extraction1.State, extraction1.Reason);
+        Assert.AreEqual("RUNNING", extraction1.Value);
+        Assert.AreEqual("job1", extraction1.Source.JobId);
+        Assert.AreEqual("shared-session", extraction1.Source.SessionId);
+        Assert.AreEqual("m1", extraction1.Source.MessageId);
+        Assert.AreEqual("text-m1", extraction1.Source.PartId);
+        Assert.IsTrue(extraction1.IsUnverified);
+        StringAssert.Contains(extraction1.Provenance, "unverified");
+
+        Assert.AreEqual(ReportedStatusState.Ineligible, userExtraction.State, userExtraction.Reason);
+        Assert.IsNull(userExtraction.Value);
+        Assert.AreEqual(0, userExtraction.Declarations.Count);
+    }
+
+    [TestMethod]
     public void FullReport_RetrievesRecordBeyond64KiBPreviewWithoutChangingPreviewBehavior()
     {
         using var workspace = new TestWorkspace();
