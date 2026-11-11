@@ -598,6 +598,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         foreach (var row in Jobs)
         {
             row.RefreshElapsed(now);
+            row.RefreshDuration(now);
         }
     }
 

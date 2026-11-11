@@ -1,4 +1,3 @@
-using System.Globalization;
 using DSMonitor.Models;
 
 namespace DSMonitor.ViewModels;
@@ -12,10 +11,13 @@ namespace DSMonitor.ViewModels;
 /// <see cref="ReportedStatusState.Reported"/> value is shown. Missing,
 /// not-reported, empty, ambiguous, unavailable, and ineligible extractions
 /// render a neutral <c>N/A</c> placeholder.
+///
+/// The complete value is preserved. The table relies on WPF
+/// <c>TextTrimming</c> for visual ellipsis and keeps the full text in the
+/// tooltip; presentation code no longer applies a fixed character limit.
 /// </summary>
 public static class ReportedStatusPresentation
 {
-    public const int MaxDisplayLength = 15;
     public const string Unavailable = "N/A";
 
     private const string UnverifiedTooltipSuffix =
@@ -26,12 +28,12 @@ public static class ReportedStatusPresentation
         "not authoritative Forge execution status.";
 
     /// <summary>
-    /// Runtime display: the reported value truncated to
-    /// <see cref="MaxDisplayLength"/> characters, or the neutral placeholder.
+    /// Runtime display: the complete reported value, or the neutral
+    /// placeholder. The view applies ellipsis; no character limit is imposed.
     /// </summary>
     public static string ToDisplay(ReportedStatusExtraction? extraction) =>
         TryGetReportedValue(extraction, out var value)
-            ? TruncateForDisplay(value)
+            ? value
             : Unavailable;
 
     /// <summary>
@@ -61,41 +63,5 @@ public static class ReportedStatusPresentation
 
         value = extraction.Value;
         return true;
-    }
-
-    /// <summary>
-    /// Truncates to at most <see cref="MaxDisplayLength"/> UTF-16 code units,
-    /// replacing the final code unit with an ellipsis when the value is longer.
-    /// Truncation follows text-element boundaries so surrogate pairs and
-    /// combining sequences are never split. If no complete element fits, the
-    /// ellipsis alone is returned rather than unsafe partial content.
-    /// </summary>
-    private static string TruncateForDisplay(string value)
-    {
-        if (value.Length <= MaxDisplayLength)
-        {
-            return value;
-        }
-
-        var prefix = TakeTextElements(value, MaxDisplayLength - 1);
-        return prefix.Length == 0 ? "…" : prefix + "…";
-    }
-
-    private static string TakeTextElements(string value, int maxCodeUnits)
-    {
-        var starts = StringInfo.ParseCombiningCharacters(value);
-        var end = 0;
-        for (var index = 0; index < starts.Length; index++)
-        {
-            var next = index + 1 < starts.Length ? starts[index + 1] : value.Length;
-            if (next > maxCodeUnits)
-            {
-                break;
-            }
-
-            end = next;
-        }
-
-        return value[..end];
     }
 }

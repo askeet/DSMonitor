@@ -169,10 +169,75 @@
             <Setter Property="VerticalAlignment" Value="Center" />
         </Style>
 
+        <Style x:Key="ActivitySpinner" TargetType="ContentControl">
+            <Setter Property="Width" Value="12" />
+            <Setter Property="Height" Value="12" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="IsTabStop" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ContentControl">
+                        <Ellipse x:Name="SpinnerRing"
+                                 Width="10"
+                                 Height="10"
+                                 HorizontalAlignment="Center"
+                                 VerticalAlignment="Center"
+                                 Stroke="{StaticResource AccentGreen}"
+                                 StrokeThickness="2"
+                                 StrokeDashArray="2.5 1.5"
+                                 RenderTransformOrigin="0.5,0.5">
+                            <Ellipse.RenderTransform>
+                                <RotateTransform />
+                            </Ellipse.RenderTransform>
+                        </Ellipse>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="Visibility" Value="Visible">
+                                <Trigger.EnterActions>
+                                    <BeginStoryboard x:Name="ActivitySpinStoryboard">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="SpinnerRing"
+                                                             Storyboard.TargetProperty="(UIElement.RenderTransform).(RotateTransform.Angle)"
+                                                             From="0"
+                                                             To="360"
+                                                             Duration="0:0:0.9"
+                                                             RepeatBehavior="Forever" />
+                                        </Storyboard>
+                                    </BeginStoryboard>
+                                </Trigger.EnterActions>
+                                <Trigger.ExitActions>
+                                    <RemoveStoryboard BeginStoryboardName="ActivitySpinStoryboard" />
+                                </Trigger.ExitActions>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <DataTemplate x:Key="ReportedStatusCellTemplate">
+            <Grid VerticalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <ContentControl x:Name="ReportedStatusSpinner"
+                                Grid.Column="0"
+                                Margin="0,0,6,0"
+                                Style="{StaticResource ActivitySpinner}"
+                                ToolTip="Job execution is active according to Forge metadata."
+                                Visibility="{Binding IsActive, Converter={StaticResource BoolToVisibility}}" />
+                <TextBlock Grid.Column="1"
+                           Text="{Binding ReportedStatusCellText}"
+                           Style="{StaticResource JobCellText}"
+                           ToolTip="{Binding ReportedStatusCellTooltip}" />
+            </Grid>
+        </DataTemplate>
+
         <Style x:Key="JobColumnHeaderStyle" TargetType="DataGridColumnHeader">
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="Padding" Value="8,0,4,0" />
+            <Setter Property="Padding" Value="6,0,3,0" />
             <Setter Property="HorizontalContentAlignment" Value="Left" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
@@ -196,8 +261,8 @@
             <Setter Property="IsReadOnly" Value="True" />
             <Setter Property="SelectionMode" Value="Single" />
             <Setter Property="SelectionUnit" Value="FullRow" />
-            <Setter Property="RowHeight" Value="51" />
-            <Setter Property="ColumnHeaderHeight" Value="31" />
+            <Setter Property="RowHeight" Value="44" />
+            <Setter Property="ColumnHeaderHeight" Value="28" />
             <Setter Property="EnableRowVirtualization" Value="True" />
             <Setter Property="EnableColumnVirtualization" Value="True" />
             <Setter Property="HorizontalScrollBarVisibility" Value="Auto" />
@@ -207,7 +272,7 @@
                     <Style TargetType="DataGridColumnHeader">
                         <Setter Property="Background" Value="Transparent" />
                         <Setter Property="BorderThickness" Value="0" />
-                        <Setter Property="Padding" Value="8,0,4,0" />
+                        <Setter Property="Padding" Value="6,0,3,0" />
                         <Setter Property="HorizontalContentAlignment" Value="Left" />
                         <Setter Property="VerticalContentAlignment" Value="Center" />
                     </Style>
@@ -237,7 +302,7 @@
                     <Style TargetType="DataGridCell">
                         <Setter Property="Background" Value="Transparent" />
                         <Setter Property="BorderThickness" Value="0" />
-                        <Setter Property="Padding" Value="8,0,4,0" />
+                        <Setter Property="Padding" Value="6,0,3,0" />
                         <Setter Property="FocusVisualStyle" Value="{x:Null}" />
                         <Setter Property="VerticalContentAlignment" Value="Center" />
                     </Style>
@@ -626,12 +691,12 @@
                                   Style="{StaticResource JobsGrid}"
                                   ItemsSource="{Binding JobsView}"
                                   SelectedItem="{Binding SelectedJob, Mode=TwoWay}"
-                                  Margin="0,0,0,0"
+                                  Margin="5,0,5,0"
                                   AutomationProperties.Name="Forge jobs">
                             <DataGrid.Columns>
                                 <DataGridTemplateColumn Header="Project"
-                                                        Width="*"
-                                                        MinWidth="110"
+                                                        Width="90"
+                                                        MinWidth="72"
                                                         SortMemberPath="ProjectText"
                                                         HeaderStyle="{StaticResource JobColumnHeaderStyle}">
                                     <DataGridTemplateColumn.CellTemplate>
@@ -663,7 +728,7 @@
                                 </DataGridTemplateColumn>
 
                                 <DataGridTemplateColumn Header="Job"
-                                                        Width="110"
+                                                        Width="50"
                                                         SortMemberPath="JobId"
                                                         HeaderStyle="{StaticResource JobColumnHeaderStyle}">
                                     <DataGridTemplateColumn.CellTemplate>
@@ -680,17 +745,10 @@
                                 </DataGridTemplateColumn>
 
                                 <DataGridTemplateColumn Header="Reported Status"
-                                                        Width="140"
+                                                        Width="*"
                                                         SortMemberPath="ReportedStatusText"
-                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}">
-                                    <DataGridTemplateColumn.CellTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="{Binding ReportedStatusText}"
-                                                       Style="{StaticResource JobCellText}"
-                                                       ToolTip="{Binding ReportedStatusTooltip}" />
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.CellTemplate>
-                                </DataGridTemplateColumn>
+                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}"
+                                                        CellTemplate="{StaticResource ReportedStatusCellTemplate}" />
                             </DataGrid.Columns>
                         </DataGrid>
 

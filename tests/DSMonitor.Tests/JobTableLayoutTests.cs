@@ -1,3 +1,4 @@
+using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using DSMonitor.Services;
@@ -31,10 +32,14 @@ public sealed class JobTableLayoutTests
                 grid.Columns.Select(column => column.Header?.ToString()).ToArray());
 
             Assert.AreEqual("DurationSortSeconds", grid.Columns[2].SortMemberPath);
+            Assert.IsTrue(
+                grid.Columns[0].Width.DisplayValue is >= 80 and <= 100,
+                "Project is a compact final-folder column of about twelve characters.");
             Assert.IsTrue(grid.Columns[1].Width.DisplayValue <= 100);
             Assert.IsTrue(grid.Columns[2].Width.DisplayValue <= 80);
             Assert.IsTrue(grid.Columns[3].Width.DisplayValue <= 120);
             Assert.IsTrue(grid.Columns[4].Width.DisplayValue <= 150);
+            Assert.AreEqual(44d, grid.RowHeight);
 
             Assert.AreEqual(DataGridSelectionMode.Single, grid.SelectionMode);
             Assert.AreEqual(DataGridSelectionUnit.FullRow, grid.SelectionUnit);
@@ -52,6 +57,58 @@ public sealed class JobTableLayoutTests
         {
             window.Close();
         }
+    }
+
+    [TestMethod]
+    public void ReportedStatusCellTemplate_BindsTheActivitySpinnerToActiveState()
+    {
+        using var workspace = new TestWorkspace();
+        var dataRoot = Path.Combine(workspace.Root, "data");
+        var composition = new MonitoringComposition(new MonitoringCompositionOptions(
+            workspace.RunsRoot,
+            workspace.LogsRoot,
+            Path.Combine(dataRoot, "events-v3.db"),
+            dataRoot,
+            TimeSpan.FromSeconds(1)));
+
+        var window = new MainWindow(composition);
+        try
+        {
+            var template = window.FindResource("ReportedStatusCellTemplate") as DataTemplate;
+            Assert.IsNotNull(template, "The reported-status cell must keep a shared testable template.");
+
+            var content = (FrameworkElement)template.LoadContent();
+            var spinner = FindDescendant<ContentControl>(content);
+            Assert.IsNotNull(spinner, "The cell must contain the small activity spinner.");
+            Assert.IsNotNull(window.FindResource("ActivitySpinner") as Style);
+
+            var binding = BindingOperations.GetBinding(spinner, UIElement.VisibilityProperty);
+            Assert.IsNotNull(binding);
+            Assert.AreEqual("IsActive", binding.Path.Path);
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
+    {
+        foreach (var child in LogicalTreeHelper.GetChildren(root))
+        {
+            if (child is T match)
+            {
+                return match;
+            }
+
+            if (child is DependencyObject dependencyObject &&
+                FindDescendant<T>(dependencyObject) is { } nested)
+            {
+                return nested;
+            }
+        }
+
+        return null;
     }
 
     [TestMethod]

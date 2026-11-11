@@ -132,20 +132,22 @@ public sealed class JobTablePresentationTests
     }
 
     [TestMethod]
-    public void Duration_DoesNotAdvanceWithTheWallClock()
+    public void Duration_FinishedJobDoesNotAdvanceWithTheWallClock()
     {
         var snapshot = Snapshot(
             started: Started,
             lastActivity: Started.AddMinutes(5),
-            status: ForgeJobStatus.Running);
+            status: ForgeJobStatus.Done);
         var row = new JobRowViewModel(snapshot);
         Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.IsTrue(row.DurationHasReportedCompletion);
 
         row.Update(snapshot, Started.AddDays(30));
 
         Assert.AreEqual("5m 0s", row.DurationText);
         Assert.AreEqual(300d, row.DurationSortSeconds);
         StringAssert.Contains(row.DurationTooltip, "Observed duration 5m 0s");
+        StringAssert.Contains(row.DurationTooltip, "Frozen");
     }
 
     [TestMethod]
@@ -154,7 +156,8 @@ public sealed class JobTablePresentationTests
         var row = new JobRowViewModel(Snapshot(
             started: Started,
             lastActivity: Started.AddMinutes(5),
-            status: ForgeJobStatus.Running));
+            status: ForgeJobStatus.Running,
+            observedAt: Started.AddMinutes(5)));
 
         row.RefreshElapsed(Started.AddMinutes(30));
 
@@ -283,7 +286,7 @@ public sealed class JobTablePresentationTests
     }
 
     [TestMethod]
-    public void ReportedStatus_LongValueTruncatesToFifteenAndKeepsFullTooltip()
+    public void ReportedStatus_LongValueIsPreservedForWpfEllipsisAndFullTooltip()
     {
         const string longValue = "v1.2.3-complete-with-extra";
         var extraction = Extract("Status: **" + longValue + "**");
@@ -291,8 +294,7 @@ public sealed class JobTablePresentationTests
 
         var display = ReportedStatusPresentation.ToDisplay(extraction);
 
-        Assert.AreEqual(ReportedStatusPresentation.MaxDisplayLength, display.Length);
-        Assert.AreEqual("v1.2.3-complet…", display);
+        Assert.AreEqual(longValue, display);
         Assert.AreEqual(
             longValue + " — unverified agent-reported text; not authoritative Forge execution status.",
             ReportedStatusPresentation.ToTooltip(extraction));
@@ -312,7 +314,7 @@ public sealed class JobTablePresentationTests
     }
 
     [TestMethod]
-    public void ReportedStatus_UnicodeTruncationKeepsSurrogatePairsIntact()
+    public void ReportedStatus_UnicodeValueKeepsSurrogatePairsIntactWithoutTruncation()
     {
         const string emoji = "😀😀😀😀😀😀😀😀";
         Assert.AreEqual(16, emoji.Length);
@@ -320,20 +322,19 @@ public sealed class JobTablePresentationTests
 
         var display = ReportedStatusPresentation.ToDisplay(extraction);
 
-        Assert.AreEqual(15, display.Length);
-        Assert.AreEqual("😀😀😀😀😀😀😀…", display);
+        Assert.AreEqual(emoji, display);
         AssertSurrogatePairsIntact(display);
         StringAssert.StartsWith(ReportedStatusPresentation.ToTooltip(extraction), emoji);
     }
 
     [TestMethod]
-    public void ReportedStatus_UnicodeElementLongerThanBudgetFallsBackToEllipsis()
+    public void ReportedStatus_LongCombiningSequenceIsPreservedInFull()
     {
         var combining = "a" + new string('\u0301', 15);
         var extraction = Extract("Status: **" + combining + "**");
         Assert.AreEqual(ReportedStatusState.Reported, extraction.State);
 
-        Assert.AreEqual("…", ReportedStatusPresentation.ToDisplay(extraction));
+        Assert.AreEqual(combining, ReportedStatusPresentation.ToDisplay(extraction));
     }
 
     [DataTestMethod]
@@ -374,6 +375,58 @@ public sealed class JobTablePresentationTests
         row.Update(Snapshot(reportedStatus: null), Started.AddMinutes(3));
         Assert.AreEqual("N/A", row.ReportedStatusText);
         StringAssert.Contains(row.ReportedStatusTooltip, "N/A");
+    }
+
+    [TestMethod]
+    public void ReportedStatusCell_UnavailableStatusUsesJobActivityWithBulletAndFullTooltip()
+    {
+        const string activityText = "Inspecting the bounded synthetic source and preparing the next step.";
+        var row = new JobRowViewModel(Snapshot(
+            reportedStatus: null,
+            liveActivity: Activity(activityText)));
+
+        Assert.AreEqual("• " + activityText, row.ReportedStatusCellText);
+        StringAssert.StartsWith(row.ReportedStatusCellTooltip, activityText);
+        StringAssert.Contains(row.ReportedStatusCellTooltip, "unverified observed job activity");
+        StringAssert.Contains(row.ReportedStatusCellTooltip, "not authoritative");
+    }
+
+    [TestMethod]
+    public void ReportedStatusCell_ReportedStatusWinsOverActivity()
+    {
+        var row = new JobRowViewModel(Snapshot(
+            reportedStatus: Extract("Status: DONE"),
+            liveActivity: Activity("Still working on another step.")));
+
+        Assert.AreEqual("DONE", row.ReportedStatusCellText);
+        Assert.AreEqual(row.ReportedStatusTooltip, row.ReportedStatusCellTooltip);
+    }
+
+    [TestMethod]
+    public void ReportedStatusCell_MissingStatusAndActivityStaysNeutralNA()
+    {
+        var row = new JobRowViewModel(Snapshot(reportedStatus: null));
+
+        Assert.AreEqual("N/A", row.ReportedStatusCellText);
+        StringAssert.Contains(row.ReportedStatusCellTooltip, "N/A");
+    }
+
+    [TestMethod]
+    public void ReportedStatusCell_RefreshPublishesFallbackChanges()
+    {
+        var row = new JobRowViewModel(Snapshot(reportedStatus: null));
+        Assert.AreEqual("N/A", row.ReportedStatusCellText);
+        StringAssert.Contains(row.ReportedStatusCellTooltip, "N/A");
+
+        var changed = new List<string>();
+        row.PropertyChanged += (_, args) => changed.Add(args.PropertyName ?? string.Empty);
+        row.Update(
+            Snapshot(reportedStatus: null, liveActivity: Activity("new activity")),
+            Started.AddMinutes(2));
+
+        Assert.AreEqual("• new activity", row.ReportedStatusCellText);
+        CollectionAssert.Contains(changed, nameof(JobRowViewModel.ReportedStatusCellText));
+        CollectionAssert.Contains(changed, nameof(JobRowViewModel.ReportedStatusCellTooltip));
     }
 
     private static void AssertSurrogatePairsIntact(string value)
@@ -429,13 +482,32 @@ public sealed class JobTablePresentationTests
             Started.AddMinutes(1),
             "Assistant-reported text");
 
+    private static LiveActivitySnapshot Activity(string text) =>
+        new()
+        {
+            Doing = new ActivityExcerpt(
+                text,
+                "Assistant-reported text",
+                "job_mw8vbgms_9e9j",
+                "session_synthetic",
+                "message_synthetic",
+                "part_synthetic",
+                @"C:\synthetic\runs\job.log",
+                128,
+                Started,
+                Started.AddMinutes(1)),
+            Availability = "Bounded synthetic activity."
+        };
+
     private static ForgeJobSnapshot Snapshot(
         string jobId = "job_mw8vbgms_9e9j",
         string? directory = @"D:\Repositories\WPF\DSMonitor",
         DateTimeOffset? started = null,
         DateTimeOffset? lastActivity = null,
         ForgeJobStatus status = ForgeJobStatus.Done,
-        ReportedStatusExtraction? reportedStatus = null) =>
+        ReportedStatusExtraction? reportedStatus = null,
+        DateTimeOffset? observedAt = null,
+        LiveActivitySnapshot? liveActivity = null) =>
         new()
         {
             Metadata = new ForgeJobMetadata
@@ -447,7 +519,8 @@ public sealed class JobTablePresentationTests
             },
             Status = status,
             LastActivity = lastActivity,
-            ObservedAt = Started.AddMinutes(1),
-            ReportedStatus = reportedStatus
+            ObservedAt = observedAt ?? Started.AddMinutes(1),
+            ReportedStatus = reportedStatus,
+            LiveActivity = liveActivity ?? new LiveActivitySnapshot()
         };
 }

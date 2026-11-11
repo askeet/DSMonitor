@@ -6,6 +6,21 @@ using DSMonitor.Services;
 
 namespace DSMonitor.ViewModels;
 
+/// <summary>
+/// Internal evidence basis for the table's Duration value. Reported metadata
+/// and activity heuristics are deliberately distinct so the UI never presents
+/// an inferred freeze as authoritative completion.
+/// </summary>
+internal enum JobDurationBasis
+{
+    Unavailable,
+    Live,
+    ObservedSpan,
+    FinishedTerminalMetadata,
+    FinishedReportedMetadata,
+    FinishedActivityHeuristic
+}
+
 public sealed class JobRowViewModel : ObservableObject
 {
     public const int MaxTimelineEvents = TimelineOrdering.DefaultCapacity;
@@ -18,6 +33,8 @@ public sealed class JobRowViewModel : ObservableObject
     private string _durationText = "N/A";
     private string _durationTooltip = "N/A — started or last activity is unavailable; duration is not inferred.";
     private double _durationSortSeconds = double.PositiveInfinity;
+    private DateTimeOffset? _durationStartedAt;
+    private JobDurationBasis _durationBasis = JobDurationBasis.Unavailable;
     private string _jobDisplayText = string.Empty;
     private string _elapsedText = "—";
     private string _lastActivityText = "—";
@@ -53,6 +70,67 @@ public sealed class JobRowViewModel : ObservableObject
     /// <summary>Unverified agent-reported text with the complete untruncated value.</summary>
     public string ReportedStatusTooltip => ReportedStatusPresentation.ToTooltip(Snapshot.ReportedStatus);
 
+    /// <summary>
+    /// Table cell value. When an unambiguous reported status is unavailable,
+    /// the job's own latest observed activity is shown with a bullet prefix
+    /// instead of a bare N/A. The activity remains unverified and is never
+    /// treated as authoritative status.
+    /// </summary>
+    public string ReportedStatusCellText
+    {
+        get
+        {
+            if (!string.Equals(
+                    ReportedStatusText,
+                    ReportedStatusPresentation.Unavailable,
+                    StringComparison.Ordinal))
+            {
+                return ReportedStatusText;
+            }
+
+            return TryGetJobActivity(out var activity)
+                ? "• " + activity.Text
+                : ReportedStatusPresentation.Unavailable;
+        }
+    }
+
+    /// <summary>
+    /// Table cell tooltip. Reported status keeps its unverified explanation; an
+    /// activity fallback keeps the complete observed text and is labeled as
+    /// unverified job activity rather than status.
+    /// </summary>
+    public string ReportedStatusCellTooltip
+    {
+        get
+        {
+            if (!string.Equals(
+                    ReportedStatusText,
+                    ReportedStatusPresentation.Unavailable,
+                    StringComparison.Ordinal))
+            {
+                return ReportedStatusTooltip;
+            }
+
+            return TryGetJobActivity(out var activity)
+                ? activity.Text +
+                  " — unverified observed job activity; not authoritative Forge execution status."
+                : ReportedStatusTooltip;
+        }
+    }
+
+    private bool TryGetJobActivity(out ActivityExcerpt activity)
+    {
+        if (Snapshot.LiveActivity.Doing is { } doing &&
+            string.Equals(doing.JobId, Snapshot.JobId, StringComparison.Ordinal))
+        {
+            activity = doing;
+            return true;
+        }
+
+        activity = null!;
+        return false;
+    }
+
     public bool IsActive => _status.IsActive();
     public string ProjectText => _projectText;
     public string ProjectTooltip => _projectTooltip;
@@ -61,6 +139,16 @@ public sealed class JobRowViewModel : ObservableObject
     public string DurationText => _durationText;
     public string DurationTooltip => _durationTooltip;
     public double DurationSortSeconds => _durationSortSeconds;
+
+    /// <summary>Internal evidence basis; tests use it to distinguish heuristic freezes.</summary>
+    internal JobDurationBasis DurationBasis => _durationBasis;
+    internal bool DurationUsesLiveClock => _durationBasis == JobDurationBasis.Live;
+    internal bool DurationHasReportedCompletion =>
+        _durationBasis is JobDurationBasis.FinishedTerminalMetadata or
+            JobDurationBasis.FinishedReportedMetadata;
+    internal bool DurationHasHeuristicCompletion =>
+        _durationBasis == JobDurationBasis.FinishedActivityHeuristic;
+
     public string ElapsedText => _elapsedText;
     public string LastActivityText => _lastActivityText;
     public string SessionText => _sessionText;
@@ -131,7 +219,7 @@ public sealed class JobRowViewModel : ObservableObject
                 : "—",
             ref _startedText,
             nameof(StartedText));
-        UpdateDuration(snapshot);
+        UpdateDuration(snapshot, now);
         SetText(snapshot.SessionId ?? "Not reported", ref _sessionText, nameof(SessionText));
         SetText(snapshot.ParsedEventCount.ToString(), ref _eventCountText, nameof(EventCountText));
         SetText(snapshot.CostText, ref _costText, nameof(CostText));
@@ -158,7 +246,8 @@ public sealed class JobRowViewModel : ObservableObject
         foreach (var property in new[] { nameof(ChatText), nameof(TaskText), nameof(DoingText),
                      nameof(DoneText), nameof(DoingProvenance), nameof(DoneProvenance),
                      nameof(LiveActivityNotice), nameof(LiveUpdatedText), nameof(StatusProvenance),
-                     nameof(ReportedStatusText), nameof(ReportedStatusTooltip) })
+                     nameof(ReportedStatusText), nameof(ReportedStatusTooltip),
+                     nameof(ReportedStatusCellText), nameof(ReportedStatusCellTooltip) })
             OnPropertyChanged(property);
     }
 
@@ -172,11 +261,27 @@ public sealed class JobRowViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Advances the table's live Duration without reading logs. The shared
+    /// dispatcher clock calls this about once per second; finished and
+    /// observed-span rows are left frozen.
+    /// </summary>
+    public void RefreshDuration(DateTimeOffset now)
+    {
+        if (_durationBasis != JobDurationBasis.Live ||
+            _durationStartedAt is not { } started)
+        {
+            return;
+        }
+
+        SetLiveDuration(started, now);
+    }
+
     public void RefreshElapsed(DateTimeOffset now)
     {
         // Original right-panel behavior: active/unknown jobs use the wall clock;
         // completed jobs use their last observed activity. The table's Duration
-        // column intentionally does not call this method.
+        // column uses RefreshDuration and keeps separate evidence.
         var started = Snapshot.Metadata.Started;
         if (started is null)
         {
@@ -200,34 +305,198 @@ public sealed class JobRowViewModel : ObservableObject
         }
     }
 
-    private void UpdateDuration(ForgeJobSnapshot snapshot)
+    private void UpdateDuration(ForgeJobSnapshot snapshot, DateTimeOffset now)
     {
-        if (snapshot.Metadata.Started is not { } started ||
-            snapshot.LastActivity is not { } lastActivity)
+        _durationStartedAt = snapshot.Metadata.Started;
+        if (snapshot.Metadata.Started is not { } started)
+        {
+            _durationBasis = JobDurationBasis.Unavailable;
+            SetDurationUnavailable(
+                "N/A — started is unavailable; duration is not inferred.");
+            return;
+        }
+
+        // Last accepted activity is the best observed finish; the bounded Done
+        // excerpt is a fallback when no event timestamp is available and the
+        // excerpt still belongs to this job.
+        var doneSourceTimestamp =
+            snapshot.LiveActivity.Done is { } done &&
+            string.Equals(done.JobId, snapshot.JobId, StringComparison.Ordinal)
+                ? done.SourceTimestamp
+                : null;
+        var observedFinish = snapshot.LastActivity ?? doneSourceTimestamp;
+
+        switch (snapshot.Status)
+        {
+            case ForgeJobStatus.Failed:
+            case ForgeJobStatus.Interrupted:
+            case ForgeJobStatus.TimedOut:
+                SetFinishedDuration(
+                    JobDurationBasis.FinishedTerminalMetadata,
+                    started,
+                    observedFinish,
+                    $"Forge metadata reports {snapshot.Status.ToDisplay()}.");
+                return;
+
+            case ForgeJobStatus.Done:
+                SetFinishedDuration(
+                    JobDurationBasis.FinishedReportedMetadata,
+                    started,
+                    observedFinish,
+                    "Forge metadata reports completion; not independently verified.");
+                return;
+
+            case ForgeJobStatus.Running:
+            case ForgeJobStatus.Blocked:
+                _durationBasis = JobDurationBasis.Live;
+                SetLiveDuration(started, now);
+                return;
+
+            default:
+                if (TryGetDoneActivityFinish(snapshot, out var doneAt))
+                {
+                    SetFinishedDuration(
+                        JobDurationBasis.FinishedActivityHeuristic,
+                        started,
+                        doneAt,
+                        "Frozen when the latest observed activity was a completed agent result; " +
+                        "heuristic only, not authoritative completion.");
+                }
+                else
+                {
+                    SetObservedSpan(snapshot, started);
+                }
+
+                return;
+        }
+    }
+
+    private void SetLiveDuration(DateTimeOffset started, DateTimeOffset now)
+    {
+        var duration = now - started;
+        var clockSkew = duration < TimeSpan.Zero;
+        if (clockSkew)
+        {
+            duration = TimeSpan.Zero;
+        }
+
+        SetProperty(ref _durationSortSeconds, duration.TotalSeconds, nameof(DurationSortSeconds));
+        SetText(FormatDuration(duration), ref _durationText, nameof(DurationText));
+        SetText(
+            $"Live duration {FormatDurationDetail(duration)} " +
+            $"(started {started.ToLocalTime():yyyy-MM-dd HH:mm:ss}). " +
+            "Updated about once per second from the Forge metadata start; " +
+            "not proof of execution or worker liveness." +
+            (clockSkew ? " Observation time precedes started; shown as 0s." : string.Empty),
+            ref _durationTooltip,
+            nameof(DurationTooltip));
+    }
+
+    private void SetFinishedDuration(
+        JobDurationBasis basis,
+        DateTimeOffset started,
+        DateTimeOffset? finishedAt,
+        string evidence)
+    {
+        _durationBasis = basis;
+        if (finishedAt is not { } finish)
+        {
+            SetDurationUnavailable(
+                $"N/A — {DescribeBasis(basis)} but no finish timestamp is available; " +
+                "duration is not inferred.");
+            return;
+        }
+
+        if (finish < started)
+        {
+            SetDurationUnavailable(
+                $"N/A — {DescribeBasis(basis)} and the finish timestamp precedes started; " +
+                "duration is invalid and is not inferred.");
+            return;
+        }
+
+        var duration = finish - started;
+        SetProperty(ref _durationSortSeconds, duration.TotalSeconds, nameof(DurationSortSeconds));
+        SetText(FormatDuration(duration), ref _durationText, nameof(DurationText));
+        SetText(
+            $"Observed duration {FormatDurationDetail(duration)} " +
+            $"(started {started.ToLocalTime():yyyy-MM-dd HH:mm:ss}, " +
+            $"finish {finish.ToLocalTime():yyyy-MM-dd HH:mm:ss}). {evidence} " +
+            "Frozen; no live timer.",
+            ref _durationTooltip,
+            nameof(DurationTooltip));
+    }
+
+    private void SetObservedSpan(ForgeJobSnapshot snapshot, DateTimeOffset started)
+    {
+        _durationBasis = JobDurationBasis.ObservedSpan;
+        if (snapshot.LastActivity is not { } lastActivity)
         {
             SetDurationUnavailable(
                 "N/A — started or last activity is unavailable; duration is not inferred.");
             return;
         }
 
-        var duration = lastActivity - started;
-        if (duration < TimeSpan.Zero)
+        if (lastActivity < started)
         {
             SetDurationUnavailable(
                 "N/A — last activity precedes started; duration is invalid and is not inferred.");
             return;
         }
 
+        var duration = lastActivity - started;
         SetProperty(ref _durationSortSeconds, duration.TotalSeconds, nameof(DurationSortSeconds));
         SetText(FormatDuration(duration), ref _durationText, nameof(DurationText));
         SetText(
             $"Observed duration {FormatDurationDetail(duration)} " +
             $"(started {started.ToLocalTime():yyyy-MM-dd HH:mm:ss}, " +
             $"last activity {lastActivity.ToLocalTime():yyyy-MM-dd HH:mm:ss}). " +
-            "Static observation; no live timer.",
+            "Status is UNKNOWN or unconfirmed, so the live clock is not extended; " +
+            "observed span only, not proof of completion. No live timer.",
             ref _durationTooltip,
             nameof(DurationTooltip));
     }
+
+    /// <summary>
+    /// Weak completion evidence from an already job-scoped done excerpt. It is
+    /// accepted only when the done record belongs to this job and no later
+    /// text/tool record was observed. A done record followed by newer activity
+    /// (an intermediate step finish) never freezes the row, and a repeated
+    /// done record is never treated as more than the latest observed record.
+    /// </summary>
+    private static bool TryGetDoneActivityFinish(
+        ForgeJobSnapshot snapshot,
+        out DateTimeOffset finish)
+    {
+        finish = default;
+        var done = snapshot.LiveActivity.Done;
+        if (done is null ||
+            string.IsNullOrWhiteSpace(done.Text) ||
+            !string.Equals(done.JobId, snapshot.JobId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (snapshot.LiveActivity.Doing is { } doing)
+        {
+            if (!string.Equals(doing.JobId, snapshot.JobId, StringComparison.Ordinal) ||
+                doing.ByteOffset > done.ByteOffset)
+            {
+                return false;
+            }
+        }
+
+        finish = done.SourceTimestamp ?? snapshot.LastActivity ?? done.ObservedAt;
+        return true;
+    }
+
+    private static string DescribeBasis(JobDurationBasis basis) => basis switch
+    {
+        JobDurationBasis.FinishedTerminalMetadata => "a terminal status is reported",
+        JobDurationBasis.FinishedReportedMetadata => "completion is reported",
+        JobDurationBasis.FinishedActivityHeuristic => "the latest observed activity is a completed result",
+        _ => "completion is unavailable"
+    };
 
     private void SetDurationUnavailable(string tooltip)
     {
