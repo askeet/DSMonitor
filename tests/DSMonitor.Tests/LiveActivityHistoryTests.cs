@@ -374,9 +374,11 @@ public sealed class LiveActivityHistoryTests
         StringAssert.Contains(olderRow.DurationTooltip, "no reliable same-part");
         Assert.AreEqual("—", unknownRow.StartedText);
 
-        // The reported status matches only the exact p1 target.
-        Assert.AreEqual("DONE", olderRow.ReportedStatusText);
-        StringAssert.Contains(olderRow.ReportedStatusTooltip, "unverified agent-reported");
+        // The history status now shows the normalized first line for this row.
+        Assert.AreEqual("DONE but older", olderRow.ReportedStatusText);
+        StringAssert.Contains(
+            olderRow.ReportedStatusTooltip,
+            "unverified first-line activity text");
         Assert.AreEqual("current text", newerRow.ReportedStatusText);
         StringAssert.Contains(newerRow.ReportedStatusTooltip, "not authoritative");
         Assert.AreEqual("unknown text", unknownRow.ReportedStatusText);
@@ -411,7 +413,9 @@ public sealed class LiveActivityHistoryTests
             foreignStatus,
             null);
         var foreignRow = new JobRowViewModel(foreignSnapshot);
-        Assert.AreEqual(older.Text, foreignRow.LiveActivityHistory.Single().ReportedStatusText);
+        Assert.AreEqual(
+            "DONE but older",
+            foreignRow.LiveActivityHistory.Single().ReportedStatusText);
     }
 
     [TestMethod]

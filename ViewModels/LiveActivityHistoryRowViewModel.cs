@@ -7,16 +7,15 @@ namespace DSMonitor.ViewModels;
 /// One row in the Live Activity tab. The Started value is the record's own
 /// source timestamp (or a neutral unknown marker), Duration is only the
 /// same-part tool start/end duration when the source supplied a valid pair, and
-/// Reported Status prefers an exact-bound unambiguous reported value for this
-/// row. Otherwise the row shows its own observed text. Nothing here establishes
-/// completion, success, or liveness.
+/// Reported Status shows the normalized first Markdown line for this row (with
+/// exact leading markers and paired bold removed), falling back to the existing
+/// reported text. Nothing here establishes completion, success, or liveness.
 /// </summary>
 public sealed class LiveActivityHistoryRowViewModel
 {
-    private const string UnverifiedActivitySuffix =
-        " — unverified observed job activity; not authoritative Forge execution status or completion.";
-
     private readonly ReportedStatusExtraction? _matchingReportedStatus;
+    private readonly string? _statusLineValue;
+    private readonly string? _fallbackStatusValue;
 
     public LiveActivityHistoryRowViewModel(
         LiveActivityHistoryEntry entry,
@@ -26,6 +25,12 @@ public sealed class LiveActivityHistoryRowViewModel
         Entry = entry ?? throw new ArgumentNullException(nameof(entry));
         _matchingReportedStatus = Matches(reportedStatus, entry)
             ? reportedStatus
+            : null;
+        var statusText = _matchingReportedStatus?.Source.Text;
+        _statusLineValue = LiveActivityStatusLinePolicy.Extract(
+            string.IsNullOrEmpty(statusText) ? entry.Text : statusText);
+        _fallbackStatusValue = _matchingReportedStatus is { HasValue: true } status
+            ? LiveActivityStatusLinePolicy.Extract(status.Value)
             : null;
         IsCurrentActiveTarget = isCurrentActiveTarget;
     }
@@ -66,19 +71,23 @@ public sealed class LiveActivityHistoryRowViewModel
     /// this value is never character-truncated by presentation code.
     /// </summary>
     public string ReportedStatusText =>
-        _matchingReportedStatus is { HasValue: true } status
-            ? ReportedStatusPresentation.ToDisplay(status)
-            : string.IsNullOrWhiteSpace(Entry.Text)
-                ? ReportedStatusPresentation.Unavailable
-                : Entry.Text;
+        _statusLineValue is not null
+            ? _statusLineValue
+            : _fallbackStatusValue is not null
+                ? _fallbackStatusValue
+                : _matchingReportedStatus is { HasValue: true } status
+                    ? ReportedStatusPresentation.ToDisplay(status)
+                    : ReportedStatusPresentation.Unavailable;
 
     /// <summary>Complete text or reported value for the full-text tooltip.</summary>
     public string ReportedStatusTooltip =>
-        _matchingReportedStatus is { HasValue: true } status
-            ? ReportedStatusPresentation.ToTooltip(status)
-            : (string.IsNullOrWhiteSpace(Entry.Text)
-                  ? ReportedStatusPresentation.Unavailable
-                  : Entry.Text) + UnverifiedActivitySuffix;
+        _statusLineValue is not null
+            ? LiveActivityStatusLinePolicy.Tooltip(_statusLineValue)
+            : _fallbackStatusValue is not null
+                ? LiveActivityStatusLinePolicy.Tooltip(_fallbackStatusValue)
+                : _matchingReportedStatus is { HasValue: true } status
+                    ? ReportedStatusPresentation.ToTooltip(status)
+                    : ReportedStatusPresentation.ToTooltip(null);
 
     public string Provenance =>
         $"{Entry.Kind}; job {Entry.JobId}; session {Entry.SessionId}; message {Entry.MessageId}; " +

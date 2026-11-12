@@ -28,9 +28,11 @@ internal static class LiveActivityHistoryPolicy
 /// activity. It never reads a source, writes state, or persists content. A
 /// refresh may extend the previous history only when the current guarded read
 /// proves the same exact job, verified path, physical identity, generation,
-/// nondecreasing captured length, and at least one previously complete record
-/// reappears at the same byte offset with the same record digest. Otherwise the
-/// prior history is discarded and replaced by the current successful read.
+/// nondecreasing captured length, and every previously retained record that is
+/// still inside the new bounded window reappears at the same byte offset with
+/// the same identity and record digest (and at least one such overlap exists).
+/// Otherwise the prior history is discarded and replaced by the current
+/// successful read.
 ///
 /// One entry is retained per exact ordinal (session, message, part) identity
 /// inside the job/generation. The newest physical record wins; an older reread
@@ -158,9 +160,72 @@ internal sealed class LiveActivityHistoryBuffer
             return false;
         }
 
-        // At least one previously complete record must be visible again at the
-        // same absolute offset and content digest. The reader emits only fully
-        // newline-terminated records, so a match is exact byte evidence.
+        // The reader exposes every complete record it parsed, before identity
+        // de-duplication. Every previously retained record that falls inside
+        // the new window must therefore still exist at the same absolute offset
+        // with the same exact identity and record digest. A single match is not
+        // enough: an unchanging later record must not hide a rewrite earlier in
+        // the same already-read overlap.
+        if (read.HistoryRecords.Count > 0)
+        {
+            var observedByOffset = BuildObservedByOffset(read.HistoryRecords, jobId);
+            if (observedByOffset is null)
+            {
+                return false;
+            }
+
+            var sawOverlap = false;
+            foreach (var prior in _entries.Values)
+            {
+                if (prior.ByteOffset < read.ReadWindowStart ||
+                    prior.ByteOffset >= read.ReadWindowEnd)
+                {
+                    continue;
+                }
+
+                if (!observedByOffset.TryGetValue(prior.ByteOffset, out var observed) ||
+                    !SameRecord(prior, observed))
+                {
+                    return false;
+                }
+
+                sawOverlap = true;
+            }
+
+            return sawOverlap;
+        }
+
+        // Snapshots constructed without pre-dedup record evidence (for example
+        // by a test or another caller) retain the older single-match proof.
+        // Production reads always populate HistoryRecords. Even here, a prior
+        // offset whose surviving record no longer matches cannot be carried.
+        var currentByOffset = new Dictionary<long, LiveActivityHistoryEntry>();
+        foreach (var entry in current.Values)
+        {
+            if (currentByOffset.TryGetValue(entry.ByteOffset, out var existing) &&
+                !SameRecord(existing, entry))
+            {
+                return false;
+            }
+
+            currentByOffset[entry.ByteOffset] = entry;
+        }
+
+        foreach (var prior in _entries.Values)
+        {
+            if (prior.ByteOffset < read.ReadWindowStart ||
+                prior.ByteOffset >= read.ReadWindowEnd)
+            {
+                continue;
+            }
+
+            if (currentByOffset.TryGetValue(prior.ByteOffset, out var observedAtOffset) &&
+                !SameRecord(prior, observedAtOffset))
+            {
+                return false;
+            }
+        }
+
         foreach (var prior in _entries.Values)
         {
             if (prior.ByteOffset < read.ReadWindowStart ||
@@ -181,6 +246,43 @@ internal sealed class LiveActivityHistoryBuffer
 
         return false;
     }
+
+    private static Dictionary<long, LiveActivityHistoryEntry>? BuildObservedByOffset(
+        IEnumerable<LiveActivityHistoryEntry> records,
+        string jobId)
+    {
+        var observed = new Dictionary<long, LiveActivityHistoryEntry>();
+        foreach (var record in records)
+        {
+            if (!string.Equals(record.JobId, jobId, StringComparison.Ordinal) ||
+                string.IsNullOrWhiteSpace(record.SessionId) ||
+                string.IsNullOrWhiteSpace(record.MessageId) ||
+                string.IsNullOrWhiteSpace(record.PartId) ||
+                string.IsNullOrWhiteSpace(record.RecordDigest))
+            {
+                continue;
+            }
+
+            if (observed.TryGetValue(record.ByteOffset, out var existing) &&
+                !SameRecord(existing, record))
+            {
+                // Two different records claiming one byte offset cannot prove
+                // continuity; fail closed rather than choosing one.
+                return null;
+            }
+
+            observed[record.ByteOffset] = record;
+        }
+
+        return observed;
+    }
+
+    private static bool SameRecord(
+        LiveActivityHistoryEntry left,
+        LiveActivityHistoryEntry right) =>
+        left.ByteOffset == right.ByteOffset &&
+        Identity(left) == Identity(right) &&
+        DigestEquals(left.RecordDigest, right.RecordDigest);
 
     private void Seed(
         string jobId,

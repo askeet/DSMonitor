@@ -378,16 +378,22 @@ public sealed class JobTablePresentationTests
     }
 
     [TestMethod]
-    public void ReportedStatusCell_UnavailableStatusUsesJobActivityWithBulletAndFullTooltip()
+    public void ReportedStatusCell_UnavailableStatusUsesNormalizedJobActivity()
     {
         const string activityText = "Inspecting the bounded synthetic source and preparing the next step.";
         var row = new JobRowViewModel(Snapshot(
             reportedStatus: null,
             liveActivity: Activity(activityText)));
 
-        Assert.AreEqual("• " + activityText, row.ReportedStatusCellText);
-        StringAssert.StartsWith(row.ReportedStatusCellTooltip, activityText);
-        StringAssert.Contains(row.ReportedStatusCellTooltip, "unverified observed job activity");
+        Assert.AreEqual(
+            "Inspecting the bounded synthetic source and preparing the next step",
+            row.ReportedStatusCellText);
+        StringAssert.StartsWith(
+            row.ReportedStatusCellTooltip,
+            "Inspecting the bounded synthetic source and preparing the next step");
+        StringAssert.Contains(
+            row.ReportedStatusCellTooltip,
+            "unverified first-line activity text");
         StringAssert.Contains(row.ReportedStatusCellTooltip, "not authoritative");
     }
 
@@ -399,7 +405,9 @@ public sealed class JobTablePresentationTests
             liveActivity: Activity("Still working on another step.")));
 
         Assert.AreEqual("DONE", row.ReportedStatusCellText);
-        Assert.AreEqual(row.ReportedStatusTooltip, row.ReportedStatusCellTooltip);
+        Assert.AreEqual(
+            LiveActivityStatusLinePolicy.Tooltip("DONE"),
+            row.ReportedStatusCellTooltip);
     }
 
     [TestMethod]
@@ -424,7 +432,7 @@ public sealed class JobTablePresentationTests
             Snapshot(reportedStatus: null, liveActivity: Activity("new activity")),
             Started.AddMinutes(2));
 
-        Assert.AreEqual("• new activity", row.ReportedStatusCellText);
+        Assert.AreEqual("new activity", row.ReportedStatusCellText);
         CollectionAssert.Contains(changed, nameof(JobRowViewModel.ReportedStatusCellText));
         CollectionAssert.Contains(changed, nameof(JobRowViewModel.ReportedStatusCellTooltip));
     }

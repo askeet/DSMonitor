@@ -47,8 +47,14 @@ public sealed class JobRowViewModel : ObservableObject
     private string _rawLogText = string.Empty;
     private bool _hasWarnings;
     private bool _hasRawLog;
+    private bool _monitoringActive = true;
     private IReadOnlyList<LiveActivityHistoryRowViewModel> _liveActivityHistory =
         Array.Empty<LiveActivityHistoryRowViewModel>();
+    private LiveActivityHistoryRowViewModel? _selectedActivity;
+    private string _selectedActivityText = "N/A";
+    private bool _selectedActivityTextIsComplete;
+    private string _selectedActivityCompletenessText = "No activity selected.";
+    private LiveActivityLoadKey? _selectedActivityLoadKey;
 
     public JobRowViewModel(ForgeJobSnapshot snapshot)
     {
@@ -73,51 +79,58 @@ public sealed class JobRowViewModel : ObservableObject
     public string ReportedStatusTooltip => ReportedStatusPresentation.ToTooltip(Snapshot.ReportedStatus);
 
     /// <summary>
-    /// Table cell value. When an unambiguous reported status is unavailable,
-    /// the job's own latest observed activity is shown with a bullet prefix
-    /// instead of a bare N/A. The activity remains unverified and is never
-    /// treated as authoritative status.
+    /// Table cell value. It uses the same normalized first-line policy as the
+    /// activity history: the job's owned reported source text when available,
+    /// then its owned reported value, then its owned text activity. The result
+    /// remains unverified and never establishes execution status.
     /// </summary>
-    public string ReportedStatusCellText
-    {
-        get
-        {
-            if (!string.Equals(
-                    ReportedStatusText,
-                    ReportedStatusPresentation.Unavailable,
-                    StringComparison.Ordinal))
-            {
-                return ReportedStatusText;
-            }
-
-            return TryGetJobActivity(out var activity)
-                ? "• " + activity.Text
-                : ReportedStatusPresentation.Unavailable;
-        }
-    }
+    public string ReportedStatusCellText =>
+        TryGetNormalizedReportedStatus(out var value)
+            ? value
+            : ReportedStatusPresentation.Unavailable;
 
     /// <summary>
-    /// Table cell tooltip. Reported status keeps its unverified explanation; an
-    /// activity fallback keeps the complete observed text and is labeled as
-    /// unverified job activity rather than status.
+    /// Table cell tooltip. It uses the same normalized first-line value and
+    /// unverified wording as the corresponding activity history row.
     /// </summary>
-    public string ReportedStatusCellTooltip
-    {
-        get
-        {
-            if (!string.Equals(
-                    ReportedStatusText,
-                    ReportedStatusPresentation.Unavailable,
-                    StringComparison.Ordinal))
-            {
-                return ReportedStatusTooltip;
-            }
+    public string ReportedStatusCellTooltip =>
+        TryGetNormalizedReportedStatus(out var value)
+            ? LiveActivityStatusLinePolicy.Tooltip(value)
+            : ReportedStatusPresentation.ToTooltip(null);
 
-            return TryGetJobActivity(out var activity)
-                ? activity.Text +
-                  " — unverified observed job activity; not authoritative Forge execution status."
-                : ReportedStatusTooltip;
+    private bool TryGetNormalizedReportedStatus(out string value)
+    {
+        value = string.Empty;
+        var status = Snapshot.ReportedStatus;
+
+        // Prefer the raw complete report only when it is owned by this job.
+        // This keeps the normalized first line identical to the corresponding
+        // activity history row without mixing another job's text.
+        if (status?.Source is { } source &&
+            string.Equals(source.JobId, Snapshot.JobId, StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(source.Text) &&
+            LiveActivityStatusLinePolicy.Extract(source.Text) is { } sourceValue)
+        {
+            value = sourceValue;
+            return true;
         }
+
+        if (status is { HasValue: true, Value: not null } &&
+            LiveActivityStatusLinePolicy.Extract(status.Value) is { } reportedValue)
+        {
+            value = reportedValue;
+            return true;
+        }
+
+        if (TryGetJobActivity(out var activity) &&
+            activity.Kind.Contains("text", StringComparison.OrdinalIgnoreCase) &&
+            LiveActivityStatusLinePolicy.Extract(activity.Text) is { } activityValue)
+        {
+            value = activityValue;
+            return true;
+        }
+
+        return false;
     }
 
     private bool TryGetJobActivity(out ActivityExcerpt activity)
@@ -133,7 +146,17 @@ public sealed class JobRowViewModel : ObservableObject
         return false;
     }
 
-    public bool IsActive => _status.IsActive();
+    /// <summary>
+    /// True when Forge metadata reports an active job, monitoring is still
+    /// active, and no exact job-scoped terminal step-finish is at or after the
+    /// latest observed activity. A running job with no Doing record still
+    /// qualifies; a result/source terminal event stops the spinner without
+    /// inferring completion from activity text.
+    /// </summary>
+    public bool IsActive =>
+        _monitoringActive &&
+        _status.IsActive() &&
+        !HasTerminalActivityEvidenceAtOrAfterLatestActivity();
     public string ProjectText => _projectText;
     public string ProjectTooltip => _projectTooltip;
     public string ModelText => _modelText;
@@ -185,10 +208,197 @@ public sealed class JobRowViewModel : ObservableObject
 
     public bool HasLiveActivityHistory => _liveActivityHistory.Count > 0;
 
+    /// <summary>
+    /// Currently selected history row. Each job owns its own selection, so
+    /// switching jobs never transfers or clears another job's chosen activity.
+    /// The newest row is selected by default and a matching exact identity is
+    /// retained across refreshes; if it disappears, selection falls back to the
+    /// newest available row.
+    /// </summary>
+    public LiveActivityHistoryRowViewModel? SelectedActivity
+    {
+        get => _selectedActivity;
+        set
+        {
+            if (ReferenceEquals(_selectedActivity, value))
+            {
+                return;
+            }
+
+            // A DataGrid resets SelectedItem to null when its ItemsSource or
+            // DataContext changes. Never let that transient clear erase a
+            // job's independent choice; a genuinely empty history still clears.
+            if (value is null && _liveActivityHistory.Count > 0)
+            {
+                return;
+            }
+
+            if (value is not null &&
+                !string.Equals(value.Entry.JobId, JobId, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            SetSelectedActivityValue(value);
+        }
+    }
+
+    public string SelectedActivityText => _selectedActivityText;
+    public bool SelectedActivityTextIsComplete => _selectedActivityTextIsComplete;
+    public string SelectedActivityCompletenessText => _selectedActivityCompletenessText;
+
+    internal event EventHandler? SelectedActivityChanged;
+
+    /// <summary>
+    /// Applies the global monitoring lifecycle. Stopped or failed monitoring
+    /// must not leave an active-target spinner running on retained rows, even
+    /// before a new snapshot arrives.
+    /// </summary>
+    internal void SetMonitoringActive(bool active)
+    {
+        if (_monitoringActive == active)
+        {
+            return;
+        }
+
+        _monitoringActive = active;
+        UpdateLiveActivityHistory(Snapshot);
+        OnPropertyChanged(nameof(IsActive));
+    }
+
+    internal bool IsSelectedActivityTextKind =>
+        _selectedActivity is { } row &&
+        row.Entry.Kind.Contains("text", StringComparison.OrdinalIgnoreCase);
+
+    internal LiveActivityLoadKey? CurrentSelectedActivityLoadKey =>
+        _selectedActivity is { } row ? LiveActivityLoadKey.FromRow(row) : null;
+
+    internal FullReportTarget? CreateSelectedActivityTarget()
+    {
+        if (_selectedActivity is not { } row)
+        {
+            return null;
+        }
+
+        var entry = row.Entry;
+        return new FullReportTarget(
+            entry.JobId,
+            entry.SessionId,
+            entry.MessageId,
+            entry.PartId,
+            entry.ByteOffset,
+            entry.RecordDigest);
+    }
+
+    internal bool HasSelectedActivityLoadKey(LiveActivityLoadKey key) =>
+        _selectedActivityLoadKey == key;
+
+    internal void MarkSelectedActivityLoadStarted(LiveActivityLoadKey key)
+    {
+        if (CurrentSelectedActivityLoadKey != key)
+        {
+            return;
+        }
+
+        _selectedActivityLoadKey = key;
+        _selectedActivityCompletenessText = "Retrieving source text…";
+        OnPropertyChanged(nameof(SelectedActivityCompletenessText));
+    }
+
+    internal void ApplySelectedActivityResult(
+        LiveActivityLoadKey key,
+        FullReportResult? result,
+        string? unavailableReason)
+    {
+        if (_selectedActivity is not { } row ||
+            CurrentSelectedActivityLoadKey != key)
+        {
+            return;
+        }
+
+        if (result is { IsComplete: true, Text: { } completeText })
+        {
+            var text = LiveActivityTextPolicy.SanitizeForDisplay(
+                completeText,
+                out var sanitized);
+            _selectedActivityText = text;
+            _selectedActivityTextIsComplete = !sanitized;
+            _selectedActivityCompletenessText = sanitized
+                ? "Incomplete — unsafe control characters were omitted."
+                : string.Empty;
+        }
+        else
+        {
+            _selectedActivityText = row.Entry.Text;
+            _selectedActivityTextIsComplete = false;
+            _selectedActivityCompletenessText = ShortCompleteness(result, unavailableReason);
+        }
+
+        RaiseSelectedActivityDisplayChanged();
+    }
+
+    private static string ShortCompleteness(
+        FullReportResult? result,
+        string? unavailableReason)
+    {
+        if (result is null)
+        {
+            return string.IsNullOrWhiteSpace(unavailableReason)
+                ? "N/A — source text unavailable."
+                : unavailableReason;
+        }
+
+        return result.Status switch
+        {
+            FullReportStatus.Incomplete =>
+                "Incomplete — source text is outside the safely retrieved window.",
+            FullReportStatus.Unavailable => "N/A — source text unavailable.",
+            FullReportStatus.Unsafe => "N/A — source text could not be safely verified.",
+            _ => "N/A — complete source text unavailable."
+        };
+    }
+
+    private void SetSelectedActivityValue(LiveActivityHistoryRowViewModel? value)
+    {
+        var previousKey = _selectedActivityLoadKey;
+        var nextKey = value is null ? (LiveActivityLoadKey?)null : LiveActivityLoadKey.FromRow(value);
+        _selectedActivity = value;
+
+        if (value is null)
+        {
+            _selectedActivityLoadKey = null;
+            _selectedActivityText = "N/A";
+            _selectedActivityTextIsComplete = false;
+            _selectedActivityCompletenessText = "No activity selected.";
+        }
+        else if (previousKey == nextKey)
+        {
+            // Same exact source revision: keep the already retrieved full text
+            // while refreshing the row object used for spinner/status display.
+        }
+        else
+        {
+            _selectedActivityLoadKey = null;
+            _selectedActivityText = value.Entry.Text;
+            _selectedActivityTextIsComplete = false;
+            _selectedActivityCompletenessText = "Incomplete — source text not yet verified.";
+        }
+
+        OnPropertyChanged(nameof(SelectedActivity));
+        RaiseSelectedActivityDisplayChanged();
+        SelectedActivityChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void RaiseSelectedActivityDisplayChanged()
+    {
+        OnPropertyChanged(nameof(SelectedActivityText));
+        OnPropertyChanged(nameof(SelectedActivityTextIsComplete));
+        OnPropertyChanged(nameof(SelectedActivityCompletenessText));
+    }
+
     public string LiveActivityHistoryNotice => LiveActivitySnapshot.HistoryRetentionNotice;
 
-    public string LiveActivityHistoryEmptyText =>
-        "N/A — no job-specific message or part has been safely observed in the bounded source window.";
+    public string LiveActivityHistoryEmptyText => "No activity observed.";
     public string StatusProvenance => $"{ForgeStatusLabel}; Forge metadata {Snapshot.Metadata.MetadataPath}; observed {Snapshot.ObservedAt:O}";
 
     private static string FormatProvenance(ActivityExcerpt? activity) => activity is null
@@ -264,10 +474,47 @@ public sealed class JobRowViewModel : ObservableObject
         foreach (var property in new[] { nameof(ChatText), nameof(TaskText), nameof(DoingText),
                      nameof(DoneText), nameof(DoingProvenance), nameof(DoneProvenance),
                      nameof(LiveActivityNotice), nameof(LiveUpdatedText), nameof(StatusProvenance),
-                     nameof(LiveActivityHistory), nameof(HasLiveActivityHistory),
+                     nameof(IsActive),
                      nameof(ReportedStatusText), nameof(ReportedStatusTooltip),
                      nameof(ReportedStatusCellText), nameof(ReportedStatusCellTooltip) })
             OnPropertyChanged(property);
+    }
+
+    private bool HasTerminalActivityEvidenceAtOrAfterLatestActivity()
+    {
+        var terminalOffset = Snapshot.LiveActivity.DoneEventByteOffset;
+        if (terminalOffset is null)
+        {
+            if (Snapshot.LiveActivity.Done is not { } done ||
+                !string.Equals(done.JobId, JobId, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            terminalOffset = done.ByteOffset;
+        }
+
+        var latestActivityOffset = long.MinValue;
+        if (Snapshot.LiveActivity.LatestLifecycleByteOffset is { } lifecycleOffset)
+        {
+            latestActivityOffset = lifecycleOffset;
+        }
+
+        if (Snapshot.LiveActivity.Doing is { } doing &&
+            string.Equals(doing.JobId, JobId, StringComparison.Ordinal))
+        {
+            latestActivityOffset = Math.Max(latestActivityOffset, doing.ByteOffset);
+        }
+
+        foreach (var entry in Snapshot.LiveActivity.History)
+        {
+            if (string.Equals(entry.JobId, JobId, StringComparison.Ordinal))
+            {
+                latestActivityOffset = Math.Max(latestActivityOffset, entry.ByteOffset);
+            }
+        }
+
+        return terminalOffset.Value >= latestActivityOffset;
     }
 
     public void SetRawLog(string? text)
@@ -529,16 +776,35 @@ public sealed class JobRowViewModel : ObservableObject
 
     private void UpdateLiveActivityHistory(ForgeJobSnapshot snapshot)
     {
+        var previousIdentity = _selectedActivity is { } previous
+            ? LiveActivitySelectionIdentity.FromEntry(previous.Entry)
+            : (LiveActivitySelectionIdentity?)null;
         var entries = LiveActivityHistoryPolicy.Order(
             snapshot.LiveActivity.History.Where(entry =>
                 string.Equals(entry.JobId, snapshot.JobId, StringComparison.Ordinal)));
         var doing = snapshot.LiveActivity.Doing;
-        _liveActivityHistory = entries
+        var rows = entries
             .Select(entry => new LiveActivityHistoryRowViewModel(
                 entry,
                 snapshot.ReportedStatus,
-                MatchesCurrentActiveTarget(snapshot, doing, entry)))
+                _monitoringActive && MatchesCurrentActiveTarget(snapshot, doing, entry)))
             .ToArray();
+        _liveActivityHistory = rows;
+        // Reset the ItemsSource before restoring selection so a DataGrid that
+        // clears SelectedItem on a collection reset cannot erase this job's
+        // independent activity choice.
+        OnPropertyChanged(nameof(LiveActivityHistory));
+        OnPropertyChanged(nameof(HasLiveActivityHistory));
+
+        var selected = previousIdentity is { } identity
+            ? rows.FirstOrDefault(row =>
+                LiveActivitySelectionIdentity.FromEntry(row.Entry).Equals(identity))
+            : null;
+        selected ??= rows.FirstOrDefault();
+        if (!ReferenceEquals(_selectedActivity, selected))
+        {
+            SetSelectedActivityValue(selected);
+        }
     }
 
     /// <summary>
@@ -556,14 +822,48 @@ public sealed class JobRowViewModel : ObservableObject
             return false;
         }
 
-        return string.Equals(doing.JobId, entry.JobId, StringComparison.Ordinal) &&
-               string.Equals(doing.SessionId, entry.SessionId, StringComparison.Ordinal) &&
-               string.Equals(doing.MessageId, entry.MessageId, StringComparison.Ordinal) &&
-               string.Equals(doing.PartId, entry.PartId, StringComparison.Ordinal) &&
-               string.Equals(doing.SourcePath, entry.SourcePath, StringComparison.Ordinal) &&
-               doing.ByteOffset == entry.ByteOffset &&
-               string.Equals(
-                   doing.RecordDigest,
+        if (!string.Equals(doing.JobId, entry.JobId, StringComparison.Ordinal) ||
+            !string.Equals(doing.SessionId, entry.SessionId, StringComparison.Ordinal) ||
+            !string.Equals(doing.MessageId, entry.MessageId, StringComparison.Ordinal) ||
+            !string.Equals(doing.PartId, entry.PartId, StringComparison.Ordinal) ||
+            !string.Equals(doing.SourcePath, entry.SourcePath, StringComparison.Ordinal) ||
+            doing.ByteOffset != entry.ByteOffset ||
+            !string.Equals(
+                doing.RecordDigest,
+                entry.RecordDigest,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // An explicit same-part tool end or a step-finish bound to this exact
+        // text record is observed terminal evidence. A step-finish later in
+        // physical source order also stops the spinner even when the result it
+        // describes belongs to another part; an out-of-order terminal event
+        // must not be resurrected by timestamps or display order. Never infer
+        // completion from text.
+        if (snapshot.LiveActivity.DoneEventByteOffset is { } terminalOffset &&
+            terminalOffset >= entry.ByteOffset)
+        {
+            return false;
+        }
+
+        if (entry.ObservedDuration is not null &&
+            entry.DurationStartUnixMilliseconds is not null &&
+            entry.DurationEndUnixMilliseconds is not null)
+        {
+            return false;
+        }
+
+        return snapshot.LiveActivity.Done is not { } done ||
+               !string.Equals(done.JobId, entry.JobId, StringComparison.Ordinal) ||
+               !string.Equals(done.SessionId, entry.SessionId, StringComparison.Ordinal) ||
+               !string.Equals(done.MessageId, entry.MessageId, StringComparison.Ordinal) ||
+               !string.Equals(done.PartId, entry.PartId, StringComparison.Ordinal) ||
+               !string.Equals(done.SourcePath, entry.SourcePath, StringComparison.Ordinal) ||
+               done.ByteOffset != entry.ByteOffset ||
+               !string.Equals(
+                   done.RecordDigest,
                    entry.RecordDigest,
                    StringComparison.OrdinalIgnoreCase);
     }

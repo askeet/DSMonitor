@@ -26,6 +26,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? _monitoringCts;
     private Task? _monitoringTask;
     private CancellationTokenSource? _rawLogCts;
+    private CancellationTokenSource? _selectedActivityCts;
     private bool _disposed;
 
     private MonitoringState _monitoringState = MonitoringState.Stopped;
@@ -233,6 +234,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(HasSelection));
                 OnPropertyChanged(nameof(IsSelectionEmpty));
                 BeginRawLogLoad(value);
+                BeginSelectedActivityLoad(value);
             }
         }
     }
@@ -325,6 +327,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var cts = _monitoringCts;
         var task = _monitoringTask;
 
+        // Retained rows must stop presenting an active-target spinner as soon
+        // as monitoring stops, even if no further snapshot is applied.
+        SetRowsMonitoringActive(false);
+        CancelSelectedActivityLoad();
+
         if (cts is null && !IsMonitoring)
         {
             MonitoringState = MonitoringState.Stopped;
@@ -364,6 +371,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _monitoringTask = null;
         }
 
+        // A snapshot delivered while cancellation was completing must not
+        // restore the active-target spinner after Stop.
+        SetRowsMonitoringActive(false);
         cts?.Dispose();
         IsMonitoring = false;
         MonitoringState = MonitoringState.Stopped;
@@ -394,6 +404,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (!_jobsById.TryGetValue(jobSnapshot.JobId, out var row))
             {
                 row = new JobRowViewModel(jobSnapshot);
+                row.SelectedActivityChanged += OnJobSelectedActivityChanged;
                 _jobsById[jobSnapshot.JobId] = row;
                 Jobs.Add(row);
             }
@@ -401,12 +412,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             {
                 row.Update(jobSnapshot, snapshot.ObservedAt);
             }
+
+            row.SetMonitoringActive(
+                snapshot.State is MonitoringState.Monitoring or MonitoringState.Idle);
         }
 
         foreach (var removedId in _jobsById.Keys.Where(id => !seenIds.Contains(id)).ToArray())
         {
             if (_jobsById.Remove(removedId, out var removed))
             {
+                removed.SelectedActivityChanged -= OnJobSelectedActivityChanged;
                 Jobs.Remove(removed);
                 if (ReferenceEquals(_selectedJob, removed))
                 {
@@ -500,6 +515,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _rawLogCts?.Cancel();
         _rawLogCts?.Dispose();
         _rawLogCts = null;
+        CancelSelectedActivityLoad();
         _monitoringCts?.Dispose();
         _monitoringCts = null;
     }
@@ -541,6 +557,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         IsMonitoring = false;
+        SetRowsMonitoringActive(false);
         MonitoringState = MonitoringState.Error;
         StateDetail = "Monitoring stopped after an unexpected error.";
         HasWarnings = true;
@@ -563,11 +580,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         WarningsText = "A UI operation failed. Monitoring can be restarted.";
     }
 
+    private void SetRowsMonitoringActive(bool active)
+    {
+        foreach (var row in Jobs)
+        {
+            row.SetMonitoringActive(active);
+        }
+    }
+
     private void ResetData()
     {
         _rawLogCts?.Cancel();
         _rawLogCts?.Dispose();
         _rawLogCts = null;
+        CancelSelectedActivityLoad();
 
         SelectedJob = null;
         Jobs.Clear();
@@ -621,6 +647,126 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private static bool Contains(string? value, string search) =>
         !string.IsNullOrEmpty(value) &&
         value.Contains(search, StringComparison.OrdinalIgnoreCase);
+
+    private void OnJobSelectedActivityChanged(object? sender, EventArgs e)
+    {
+        if (sender is JobRowViewModel job && ReferenceEquals(job, _selectedJob))
+        {
+            BeginSelectedActivityLoad(job);
+        }
+    }
+
+    private void BeginSelectedActivityLoad(JobRowViewModel? job)
+    {
+        if (job is null)
+        {
+            CancelSelectedActivityLoad();
+            return;
+        }
+
+        var key = job.CurrentSelectedActivityLoadKey;
+        var target = job.CreateSelectedActivityTarget();
+        if (key is not { } loadKey || target is null)
+        {
+            CancelSelectedActivityLoad();
+            return;
+        }
+
+        if (job.HasSelectedActivityLoadKey(loadKey))
+        {
+            return;
+        }
+
+        var reader = job.Snapshot.LiveActivity.FullTextReader;
+        if (!job.IsSelectedActivityTextKind)
+        {
+            CancelSelectedActivityLoad();
+            job.MarkSelectedActivityLoadStarted(loadKey);
+            job.ApplySelectedActivityResult(
+                loadKey,
+                null,
+                "N/A — complete text is available only for text activity.");
+            return;
+        }
+
+        if (reader is null)
+        {
+            CancelSelectedActivityLoad();
+            job.MarkSelectedActivityLoadStarted(loadKey);
+            job.ApplySelectedActivityResult(
+                loadKey,
+                null,
+                "N/A — complete text unavailable.");
+            return;
+        }
+
+        CancelSelectedActivityLoad();
+        var cts = new CancellationTokenSource();
+        _selectedActivityCts = cts;
+        job.MarkSelectedActivityLoadStarted(loadKey);
+        _ = LoadSelectedActivitySafelyAsync(job, loadKey, target, reader, cts);
+    }
+
+    private async Task LoadSelectedActivitySafelyAsync(
+        JobRowViewModel job,
+        LiveActivityLoadKey key,
+        FullReportTarget target,
+        Func<FullReportTarget, FullReportResult> reader,
+        CancellationTokenSource cts)
+    {
+        try
+        {
+            var result = await Task.Run(
+                () => reader(target),
+                cts.Token).ConfigureAwait(true);
+            if (cts.IsCancellationRequested ||
+                !ReferenceEquals(_selectedJob, job) ||
+                !job.HasSelectedActivityLoadKey(key))
+            {
+                return;
+            }
+
+            job.ApplySelectedActivityResult(key, result, null);
+        }
+        catch (OperationCanceledException)
+        {
+            // Selection or monitoring changed while retrieval was running.
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            if (!cts.IsCancellationRequested &&
+                ReferenceEquals(_selectedJob, job) &&
+                job.HasSelectedActivityLoadKey(key))
+            {
+                job.ApplySelectedActivityResult(
+                    key,
+                    null,
+                    "N/A — complete text unavailable.");
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_selectedActivityCts, cts))
+            {
+                _selectedActivityCts = null;
+            }
+
+            cts.Dispose();
+        }
+    }
+
+    private void CancelSelectedActivityLoad()
+    {
+        var cts = _selectedActivityCts;
+        _selectedActivityCts = null;
+        if (cts is null)
+        {
+            return;
+        }
+
+        cts.Cancel();
+        cts.Dispose();
+    }
 
     private void BeginRawLogLoad(JobRowViewModel? job)
     {

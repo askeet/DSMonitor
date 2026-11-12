@@ -172,14 +172,33 @@ public sealed class ForgeMonitoringService
                 catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
                     logger.Warning("A monitoring scan failed; showing the last known data.");
+                    // A failed scan cannot prove that cached activity still
+                    // belongs to the current source. Never republish stale Live
+                    // Activity rows; replace them with a neutral unavailable
+                    // marker and drop the transient continuity evidence.
+                    state.LiveActivityHistories.Clear();
+                    state.ReportedStatuses.Clear();
+                    var neutralJobs = state.LastJobs.Values
+                        .OrderByDescending(job => job.Metadata.Started ?? DateTimeOffset.MinValue)
+                        .Select(job => job with
+                        {
+                            LiveActivity = new LiveActivitySnapshot
+                            {
+                                Availability =
+                                    "N/A — monitoring scan failed; no cached activity is shown."
+                            },
+                            ReportedStatus = null
+                        })
+                        .ToArray();
+                    state.LastJobs = neutralJobs.ToDictionary(
+                        job => job.JobId,
+                        StringComparer.OrdinalIgnoreCase);
                     snapshot = new MonitoringSnapshot
                     {
                         ObservedAt = _clock(),
                         State = MonitoringState.Error,
                         ForgeDirectoryAvailable = Directory.Exists(_runsRoot),
-                        Jobs = state.LastJobs.Values
-                            .OrderByDescending(job => job.Metadata.Started ?? DateTimeOffset.MinValue)
-                            .ToArray(),
+                        Jobs = neutralJobs,
                         Warnings = state.LastWarnings
                             .Append("Monitoring scan failed; showing the last known data.")
                             .Distinct(StringComparer.Ordinal)
@@ -741,6 +760,11 @@ public sealed class ForgeMonitoringService
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
                 jobWarnings.Add("Committed durable aggregates could not be read.");
+                // This job is omitted for the scan. Its transient activity
+                // buffer must not survive an unproven aggregate/coverage read
+                // and later masquerade as continuous history.
+                state.LiveActivityHistories.Remove(metadata.JobId);
+                state.ReportedStatuses.Remove(metadata.JobId);
                 continue;
             }
 
@@ -805,6 +829,16 @@ public sealed class ForgeMonitoringService
                         activityEvidence,
                         primaryObservationForActivity,
                         liveActivity);
+                    liveActivity = liveActivity with
+                    {
+                        FullTextReader = target => JobLiveActivityReader.ReadFullReport(
+                            metadata,
+                            activityEvidence,
+                            primaryObservationForActivity,
+                            target,
+                            _runsRoot,
+                            _clock())
+                    };
                 }
                 else
                 {

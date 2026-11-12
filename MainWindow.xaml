@@ -225,7 +225,7 @@
                                 Grid.Column="0"
                                 Margin="0,0,6,0"
                                 Style="{StaticResource ActivitySpinner}"
-                                ToolTip="Job execution is active according to Forge metadata."
+                                ToolTip="Job-scoped activity/lifecycle evidence; not proof of worker liveness."
                                 Visibility="{Binding IsActive, Converter={StaticResource BoolToVisibility}}" />
                 <TextBlock Grid.Column="1"
                            Text="{Binding ReportedStatusCellText}"
@@ -894,50 +894,71 @@
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="*" />
                                         <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
                                     </Grid.RowDefinitions>
 
-                                    <Grid Margin="0,0,0,8">
-                                        <TextBlock Text="Job-specific activity history"
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="Observed Activity"
                                                    Foreground="{StaticResource TextPrimary}"
                                                    FontSize="12.5"
-                                                   FontWeight="SemiBold" />
-                                        <TextBlock Text="Newest source timestamp first · bounded"
+                                                   FontWeight="SemiBold"
+                                                   VerticalAlignment="Center" />
+                                        <TextBlock Grid.Column="1"
+                                                   Text="{Binding SelectedActivityCompletenessText}"
                                                    Foreground="{StaticResource TextMuted}"
-                                                   FontSize="10.5"
-                                                   HorizontalAlignment="Right" />
+                                                   FontSize="10"
+                                                   HorizontalAlignment="Right"
+                                                   VerticalAlignment="Center"
+                                                   Margin="12,0,0,0"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   Visibility="{Binding SelectedActivityTextIsComplete, Converter={StaticResource InverseBoolToVisibility}}" />
                                     </Grid>
 
-                                    <Border Grid.Row="1"
-                                            Background="#0F141B"
-                                            BorderBrush="{StaticResource BorderSoft}"
-                                            BorderThickness="1"
-                                            CornerRadius="9"
-                                            Padding="10"
-                                            Margin="0,0,0,8"
-                                            MaxHeight="170">
-                                        <ScrollViewer VerticalScrollBarVisibility="Auto"
-                                                      HorizontalScrollBarVisibility="Disabled"
-                                                      Padding="0,0,8,0">
-                                            <StackPanel>
-                                                <TextBlock Text="TASK" Style="{StaticResource CardLabel}" />
-                                                <TextBlock Text="{Binding TaskText}" Style="{StaticResource DetailValue}" Margin="0,4,0,8" />
-                                                <TextBlock Text="DOING · MOST RECENT OBSERVED ACTIVITY" Style="{StaticResource CardLabel}" />
-                                                <TextBlock Text="{Binding DoingText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
-                                                <TextBlock Text="{Binding DoingProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
-                                                <TextBlock Text="DONE · OBSERVED RESULT, UNVERIFIED" Style="{StaticResource CardLabel}" Margin="0,12,0,0" />
-                                                <TextBlock Text="{Binding DoneText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
-                                                <TextBlock Text="{Binding DoneProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
-                                                <TextBlock Text="{Binding StatusProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" Margin="0,10,0,0" />
-                                            </StackPanel>
-                                        </ScrollViewer>
-                                    </Border>
+                                    <TextBox x:Name="SelectedActivityTextBox"
+                                             Grid.Row="1"
+                                             Text="{Binding SelectedActivityText, Mode=OneWay}"
+                                             IsReadOnly="True"
+                                             IsReadOnlyCaretVisible="True"
+                                             AcceptsReturn="True"
+                                             TextWrapping="Wrap"
+                                             VerticalScrollBarVisibility="Auto"
+                                             HorizontalScrollBarVisibility="Disabled"
+                                             MinHeight="64"
+                                             MaxHeight="140"
+                                             Background="#0F141B"
+                                             Foreground="{StaticResource TextPrimary}"
+                                             BorderBrush="{StaticResource BorderSoft}"
+                                             BorderThickness="1"
+                                             Padding="8"
+                                             Margin="0,0,0,8"
+                                             FontFamily="Cascadia Mono, Consolas"
+                                             FontSize="11.5"
+                                             AutomationProperties.Name="Selected activity text" />
 
-                                    <Grid Grid.Row="2">
+                                    <Grid Grid.Row="2" Margin="0,0,0,6">
+                                        <TextBlock Text="Activity History"
+                                                   Foreground="{StaticResource TextPrimary}"
+                                                   FontSize="12.5"
+                                                   FontWeight="SemiBold"
+                                                   VerticalAlignment="Center" />
+                                        <ContentControl HorizontalAlignment="Right"
+                                                        VerticalAlignment="Center"
+                                                        Style="{StaticResource ActivitySpinner}"
+                                                        ToolTip="Job-scoped activity/lifecycle evidence; not proof of worker liveness."
+                                                        Visibility="{Binding IsActive, Converter={StaticResource BoolToVisibility}}" />
+                                    </Grid>
+
+                                    <Grid Grid.Row="3">
                                         <DataGrid x:Name="LiveActivityHistoryGrid"
                                                   Style="{StaticResource LiveActivityHistoryGrid}"
                                                   ItemsSource="{Binding LiveActivityHistory}"
+                                                  SelectedItem="{Binding SelectedActivity, Mode=TwoWay}"
+                                                  MinHeight="120"
                                                   AutomationProperties.Name="Live activity history">
                                             <DataGrid.Columns>
                                                 <DataGridTemplateColumn Header="Started"
@@ -992,18 +1013,6 @@
                                             </TextBlock.Style>
                                         </TextBlock>
                                     </Grid>
-
-                                    <StackPanel Grid.Row="3" Margin="0,8,0,0">
-                                        <TextBlock Text="{Binding LiveActivityNotice}"
-                                                   Foreground="{StaticResource TextSecondary}"
-                                                   FontSize="10.5"
-                                                   TextWrapping="Wrap" />
-                                        <TextBlock Text="{Binding LiveActivityHistoryNotice}"
-                                                   Foreground="{StaticResource TextMuted}"
-                                                   FontSize="10"
-                                                   TextWrapping="Wrap"
-                                                   Margin="0,4,0,0" />
-                                    </StackPanel>
                                 </Grid>
                             </TabItem>
 

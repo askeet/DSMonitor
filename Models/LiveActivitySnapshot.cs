@@ -45,6 +45,16 @@ public sealed record LiveActivitySnapshot
         Array.Empty<LiveActivityHistoryEntry>();
 
     /// <summary>
+    /// Every history-eligible record parsed from this bounded read before
+    /// de-duplication by exact session/message/part identity. The monitoring
+    /// service uses these exact-offset records only to prove that previously
+    /// retained history still matches the source byte-for-byte; they are never
+    /// displayed directly. Transient only.
+    /// </summary>
+    internal IReadOnlyList<LiveActivityHistoryEntry> HistoryRecords { get; init; } =
+        Array.Empty<LiveActivityHistoryEntry>();
+
+    /// <summary>
     /// Absolute first byte of the successfully parsed bounded window. Together
     /// with <see cref="ReadWindowEnd"/> this proves which previously complete
     /// records are still visible when deciding whether history may be carried
@@ -56,6 +66,31 @@ public sealed record LiveActivitySnapshot
     internal long ReadWindowEnd { get; init; } = -1;
 
     internal bool HasReadWindow => ReadWindowEnd >= 0 && ReadWindowStart >= 0;
+
+    /// <summary>
+    /// Absolute source offset of the exact step-finish record that produced
+    /// <see cref="Done"/>, when one was parsed in the current bounded read. It
+    /// lets display policy compare terminal evidence with later activity by
+    /// physical source order instead of by the text record the result describes.
+    /// Transient only.
+    /// </summary>
+    internal long? DoneEventByteOffset { get; init; }
+
+    /// <summary>
+    /// Absolute source offset of the newest text, tool, step-start or
+    /// step-finish record parsed in this bounded read. It lets spinner policy
+    /// recognize a new task after a terminal event even before a Doing excerpt
+    /// is available. Transient only.
+    /// </summary>
+    internal long? LatestLifecycleByteOffset { get; init; }
+
+    /// <summary>
+    /// Optional transient callback that retrieves the complete guarded text for
+    /// one selected target using the same job/source evidence as this read.
+    /// It performs no persistence, uses no new reader, and is null when the
+    /// current snapshot has no safely attributable source context.
+    /// </summary>
+    internal Func<FullReportTarget, FullReportResult>? FullTextReader { get; init; }
 
     public string Availability { get; init; } = "N/A — no safely attributed activity available.";
     public const string RetentionNotice =

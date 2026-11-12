@@ -22,7 +22,6 @@ namespace DSMonitor.Tests;
 public sealed class MainWindowEndToEndTests
 {
     private const string Session = "ses_e2e_shared";
-    private const string DoneHeading = "DONE · OBSERVED RESULT, UNVERIFIED";
     private TestWorkspace _workspace = null!;
     private SynchronizationContext? _priorContext;
 
@@ -87,9 +86,9 @@ public sealed class MainWindowEndToEndTests
             Assert.AreNotEqual(jobA.Snapshot.LiveActivity.Done!.MessageId, jobB.Snapshot.LiveActivity.Done!.MessageId);
 
             AssertRenderedDetail(window, viewModel, jobA, "alpha e2e result");
-            AssertRenderedProvenance(window, viewModel, jobA, roleless: false);
+            AssertRenderedActivitySurface(window, viewModel, jobA, roleless: false);
             AssertRenderedDetail(window, viewModel, jobB, "bravo e2e result");
-            AssertRenderedProvenance(window, viewModel, jobB, roleless: false);
+            AssertRenderedActivitySurface(window, viewModel, jobB, roleless: false);
 
             StopAndWait(window, viewModel);
             Assert.IsFalse(viewModel.IsMonitoring);
@@ -132,7 +131,7 @@ public sealed class MainWindowEndToEndTests
             StringAssert.Contains(noRole.Snapshot.LiveActivity.Done.Kind, "unverified");
             StringAssert.Contains(noRole.TaskText, "N/A");
             AssertRenderedDetail(window, viewModel, noRole, "unverified prompt");
-            AssertRenderedProvenance(window, viewModel, noRole, roleless: true);
+            AssertRenderedActivitySurface(window, viewModel, noRole, roleless: true);
 
             foreach (var ambiguousId in new[] { "job_e2e_ambiguous_a", "job_e2e_ambiguous_b" })
             {
@@ -253,37 +252,24 @@ public sealed class MainWindowEndToEndTests
         Assert.IsNotNull(tab);
         tab.SelectedIndex = 0;
         window.UpdateLayout();
+        var textBox = FindVisualChildren<TextBox>(tab)
+            .Single(candidate => candidate.Name == "SelectedActivityTextBox");
+        Assert.IsTrue(textBox.IsReadOnly, "Observed Activity must be read-only.");
+        Assert.IsTrue(textBox.AcceptsReturn, "Observed Activity must be multiline.");
         PumpUntil(
             window.Dispatcher,
             () =>
             {
                 window.UpdateLayout();
-                return HasBoundText(tab, job, "DoingText", expected) &&
-                       HasBoundText(tab, job, "DoneText", expected) &&
-                       HasBoundText(tab, job, "TaskText", job.TaskText);
+                return string.Equals(textBox.Text, expected, StringComparison.Ordinal);
             },
             TimeSpan.FromSeconds(5),
-            $"rendered live activity for {job.JobId}");
+            $"rendered selected activity for {job.JobId}");
 
-        var doing = FindBoundTextBlocks(tab, "DoingText")
-            .Where(block => ReferenceEquals(block.DataContext, job))
-            .ToArray();
-        var done = FindBoundTextBlocks(tab, "DoneText")
-            .Where(block => ReferenceEquals(block.DataContext, job))
-            .ToArray();
-        var task = FindBoundTextBlocks(tab, "TaskText")
-            .Where(block => ReferenceEquals(block.DataContext, job))
-            .ToArray();
-        Assert.IsTrue(doing.Length > 0, "Rendered Doing control was not found.");
-        Assert.IsTrue(done.Length > 0, "Rendered Done control was not found.");
-        Assert.IsTrue(task.Length > 0, "Rendered Task control was not found.");
-        Assert.IsTrue(doing.All(block => block.Text == expected));
-        Assert.IsTrue(done.All(block => block.Text == expected));
-        Assert.IsTrue(task.All(block => block.Text == job.TaskText));
-        StringAssert.Contains(job.TaskText, "N/A");
+        Assert.AreEqual(expected, textBox.Text);
     }
 
-    private static void AssertRenderedProvenance(
+    private static void AssertRenderedActivitySurface(
         MainWindow window,
         MainViewModel viewModel,
         JobRowViewModel job,
@@ -294,59 +280,44 @@ public sealed class MainWindowEndToEndTests
         Assert.IsNotNull(tab);
         tab.SelectedIndex = 0;
         window.UpdateLayout();
+        var headings = FindTextBlocks(tab);
+        Assert.IsTrue(headings.Any(block => block.Text == "Observed Activity"),
+            "Observed Activity heading was not rendered.");
+        Assert.IsTrue(headings.Any(block => block.Text == "Activity History"),
+            "Activity History heading was not rendered.");
+
+        foreach (var removed in new[]
+                 {
+                     "TaskText", "DoingText", "DoneText",
+                     "DoingProvenance", "DoneProvenance", "StatusProvenance"
+                 })
+        {
+            Assert.AreEqual(0, FindBoundTextBlocks(tab, removed).Count,
+                $"Removed technical activity binding '{removed}' is still rendered.");
+        }
+
+        var grid = FindVisualChildren<DataGrid>(tab)
+            .Single(candidate => candidate.Name == "LiveActivityHistoryGrid");
         PumpUntil(
             window.Dispatcher,
             () =>
             {
                 window.UpdateLayout();
-                return FindBoundTextBlocks(tab, "DoingProvenance")
-                           .Any(block => ReferenceEquals(block.DataContext, job) &&
-                                         !string.IsNullOrWhiteSpace(block.Text)) &&
-                       FindBoundTextBlocks(tab, "DoneProvenance")
-                           .Any(block => ReferenceEquals(block.DataContext, job) &&
-                                         !string.IsNullOrWhiteSpace(block.Text));
+                return grid.IsVisible &&
+                       ReferenceEquals(grid.SelectedItem, job.SelectedActivity);
             },
             TimeSpan.FromSeconds(5),
-            $"rendered provenance for {job.JobId}");
+            $"visible activity history for {job.JobId}");
 
-        var doingProvenance = FindBoundTextBlocks(tab, "DoingProvenance")
-            .Where(block => ReferenceEquals(block.DataContext, job))
-            .ToArray();
-        var doneProvenance = FindBoundTextBlocks(tab, "DoneProvenance")
-            .Where(block => ReferenceEquals(block.DataContext, job))
-            .ToArray();
-        Assert.IsTrue(doingProvenance.Length > 0, "Rendered Doing provenance was not found.");
-        Assert.IsTrue(doneProvenance.Length > 0, "Rendered Done provenance was not found.");
-
-        var heading = FindTextBlocks(tab)
-            .Where(block => block.Text.Contains("DONE ·", StringComparison.Ordinal))
-            .ToArray();
-        Assert.IsTrue(heading.Any(block => block.Text == DoneHeading), "Neutral Done heading was not rendered.");
-        Assert.IsFalse(
-            heading.Any(block => block.Text.Contains(
-                "AGENT-REPORTED", StringComparison.OrdinalIgnoreCase)),
-            "The static Done heading must not assert agent attribution.");
+        CollectionAssert.AreEqual(
+            new[] { "Started", "Duration", "Reported Status" },
+            grid.Columns.Select(column => column.Header?.ToString()).ToArray());
 
         if (roleless)
         {
-            Assert.IsTrue(doingProvenance.All(block =>
-                block.Text.Contains("Observed roleless text", StringComparison.Ordinal) &&
-                block.Text.Contains("unverified", StringComparison.Ordinal)));
-            Assert.IsTrue(doneProvenance.All(block =>
-                block.Text.Contains("Observed roleless result", StringComparison.Ordinal) &&
-                block.Text.Contains("unverified", StringComparison.Ordinal)));
-            Assert.IsFalse(doingProvenance.Any(block =>
-                block.Text.Contains("Assistant", StringComparison.Ordinal)));
-            Assert.IsFalse(doneProvenance.Any(block =>
-                block.Text.Contains("Agent-reported", StringComparison.Ordinal)));
-        }
-        else
-        {
-            Assert.IsTrue(doingProvenance.All(block =>
-                block.Text.Contains("Assistant-reported text", StringComparison.Ordinal)));
-            Assert.IsTrue(doneProvenance.All(block =>
-                block.Text.Contains("Agent-reported result", StringComparison.Ordinal) &&
-                block.Text.Contains("unverified", StringComparison.Ordinal)));
+            Assert.IsNotNull(job.SelectedActivity);
+            Assert.AreEqual("unverified prompt", job.SelectedActivity!.ReportedStatusText);
+            StringAssert.Contains(job.SelectedActivity.ReportedStatusTooltip, "unverified");
         }
     }
 
@@ -370,15 +341,6 @@ public sealed class MainWindowEndToEndTests
             }
         }
     }
-
-    private static bool HasBoundText(
-        DependencyObject root,
-        JobRowViewModel job,
-        string path,
-        string expected) =>
-        FindBoundTextBlocks(root, path).Any(block =>
-            ReferenceEquals(block.DataContext, job) &&
-            string.Equals(block.Text, expected, StringComparison.Ordinal));
 
     private static IReadOnlyList<TextBlock> FindBoundTextBlocks(
         DependencyObject root,
@@ -423,6 +385,28 @@ public sealed class MainWindowEndToEndTests
         }
 
         return null;
+    }
+
+    private static IReadOnlyList<T> FindVisualChildren<T>(DependencyObject parent)
+        where T : DependencyObject
+    {
+        var results = new List<T>();
+        Walk(parent);
+        return results;
+
+        void Walk(DependencyObject current)
+        {
+            for (var index = 0; index < VisualTreeHelper.GetChildrenCount(current); index++)
+            {
+                var child = VisualTreeHelper.GetChild(current, index);
+                if (child is T match)
+                {
+                    results.Add(match);
+                }
+
+                Walk(child);
+            }
+        }
     }
 
     private static void StopAndWait(MainWindow window, MainViewModel viewModel)

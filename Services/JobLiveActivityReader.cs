@@ -205,8 +205,11 @@ public static class JobLiveActivityReader
 
             ActivityExcerpt? doing = null;
             ActivityExcerpt? done = null;
+            long? doneEventByteOffset = null;
+            long? latestLifecycleByteOffset = null;
             ActivityExcerpt? latestText = null;
             var texts = new Dictionary<(string Session, string Message), (ActivityExcerpt Excerpt, bool VerifiedAssistant)>();
+            var historyRecords = new List<LiveActivityHistoryEntry>();
             var history = new Dictionary<(string Session, string Message, string PartId), LiveActivityHistoryEntry>();
             // Discard the first record when starting mid-file, even if it
             // happens to be complete. Never parse a possibly partial record.
@@ -247,6 +250,7 @@ public static class JobLiveActivityReader
                         continue;
                     }
 
+                    latestLifecycleByteOffset = offset;
                     if (!ForgeEventParser.TryParse(line, job.JobId, observedAt, out var parsed) ||
                         parsed is null)
                     {
@@ -322,6 +326,7 @@ public static class JobLiveActivityReader
                             return;
                         }
 
+                        historyRecords.Add(entry);
                         var historyKey = (entry.SessionId, entry.MessageId, entry.PartId);
                         if (!history.TryGetValue(historyKey, out var existing) ||
                             entry.ByteOffset >= existing.ByteOffset)
@@ -359,14 +364,19 @@ public static class JobLiveActivityReader
                     else if (isFinish &&
                              TryGetSingleString(part, "reason", out var finishReason, out var hasReason) &&
                              hasReason &&
-                             finishReason is "stop" or "end-turn" &&
-                             texts.TryGetValue(key, out var result))
+                             finishReason is "stop" or "end-turn")
                     {
-                        var verifiedResult = verifiedAssistant && result.VerifiedAssistant;
-                        done = result.Excerpt with
+                        // The terminal source event is evidence even when no
+                        // text result was captured in this bounded window.
+                        doneEventByteOffset = offset;
+                        if (texts.TryGetValue(key, out var result))
                         {
-                            Kind = verifiedResult ? AssistantResultKind : RolelessResultKind
-                        };
+                            var verifiedResult = verifiedAssistant && result.VerifiedAssistant;
+                            done = result.Excerpt with
+                            {
+                                Kind = verifiedResult ? AssistantResultKind : RolelessResultKind
+                            };
+                        }
                     }
                 }
                 catch (JsonException) { /* Malformed/overlong/partial records are unavailable. */ }
@@ -390,8 +400,11 @@ public static class JobLiveActivityReader
             {
                 Doing = doing,
                 Done = done,
+                DoneEventByteOffset = doneEventByteOffset,
+                LatestLifecycleByteOffset = latestLifecycleByteOffset,
                 LatestText = latestText,
                 History = LiveActivityHistoryPolicy.Order(history.Values),
+                HistoryRecords = historyRecords.ToArray(),
                 ReadWindowStart = start,
                 ReadWindowEnd = start + read,
                 Availability = "Bounded source re-read; timestamps describe source records, not execution liveness."
@@ -1412,10 +1425,20 @@ public static class JobLiveActivityReader
             return false;
         }
 
+        if (rootType == "step-start")
+        {
+            return partType is null or "step-start";
+        }
+
         var rootCategory = Category(rootType);
         if (rootType == "message-part")
         {
             if (partType is null) return false;
+            if (partType == "step-start")
+            {
+                return true;
+            }
+
             var wrappedCategory = Category(partType);
             if (wrappedCategory is null) return false;
             isText = wrappedCategory == "text";
@@ -1507,6 +1530,9 @@ public static class JobLiveActivityReader
         value.Length <= 256 && !value.Any(character => char.IsControl(character) ||
             char.GetUnicodeCategory(character) == UnicodeCategory.Format);
 
+    private static readonly long MaxUnixMilliseconds =
+        DateTimeOffset.MaxValue.ToUnixTimeMilliseconds();
+
     private static bool TryGetToolDuration(
         JsonElement part,
         out TimeSpan duration,
@@ -1524,14 +1550,19 @@ public static class JobLiveActivityReader
             return false;
         }
 
+        // Reject timestamps that are not representable Unix milliseconds
+        // before subtracting. Values near long.MaxValue otherwise lose
+        // precision as doubles and can appear as a zero-length duration.
         if (startMilliseconds < 0 ||
-            endMilliseconds < startMilliseconds)
+            startMilliseconds > MaxUnixMilliseconds ||
+            endMilliseconds < startMilliseconds ||
+            endMilliseconds > MaxUnixMilliseconds)
         {
             return false;
         }
 
-        var delta = (double)endMilliseconds - startMilliseconds;
-        if (delta < 0 || delta > TimeSpan.MaxValue.TotalMilliseconds)
+        var delta = endMilliseconds - startMilliseconds;
+        if (delta > TimeSpan.MaxValue.TotalMilliseconds)
         {
             return false;
         }
@@ -1567,7 +1598,14 @@ public static class JobLiveActivityReader
             var category = Rune.GetUnicodeCategory(rune);
             if (category is UnicodeCategory.Control or UnicodeCategory.Format or UnicodeCategory.Surrogate)
             {
-                if (rune.Value is '\n' or '\r' or '\t') builder.Append(' ');
+                if (rune.Value is '\n' or '\r' or '\t')
+                {
+                    // Control characters are replaced by one ASCII space, but
+                    // that replacement still consumes the same bounded budget.
+                    if (builder.Length + 1 > maxLength) break;
+                    builder.Append(' ');
+                }
+
                 continue;
             }
             if (builder.Length + rune.Utf16SequenceLength > maxLength) break;
