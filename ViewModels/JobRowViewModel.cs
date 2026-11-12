@@ -47,6 +47,8 @@ public sealed class JobRowViewModel : ObservableObject
     private string _rawLogText = string.Empty;
     private bool _hasWarnings;
     private bool _hasRawLog;
+    private IReadOnlyList<LiveActivityHistoryRowViewModel> _liveActivityHistory =
+        Array.Empty<LiveActivityHistoryRowViewModel>();
 
     public JobRowViewModel(ForgeJobSnapshot snapshot)
     {
@@ -172,6 +174,21 @@ public sealed class JobRowViewModel : ObservableObject
             ? sourceTime.ToLocalTime().ToString("MMM dd HH:mm:ss")
             : "Observed " + activity.ObservedAt.ToLocalTime().ToString("MMM dd HH:mm:ss")
         : "N/A";
+
+    /// <summary>
+    /// Bounded, job-isolated history rows ordered newest source timestamp first.
+    /// The value is transient and is replaced only from the selected job's own
+    /// snapshot; selection changes never share rows between jobs.
+    /// </summary>
+    public IReadOnlyList<LiveActivityHistoryRowViewModel> LiveActivityHistory =>
+        _liveActivityHistory;
+
+    public bool HasLiveActivityHistory => _liveActivityHistory.Count > 0;
+
+    public string LiveActivityHistoryNotice => LiveActivitySnapshot.HistoryRetentionNotice;
+
+    public string LiveActivityHistoryEmptyText =>
+        "N/A — no job-specific message or part has been safely observed in the bounded source window.";
     public string StatusProvenance => $"{ForgeStatusLabel}; Forge metadata {Snapshot.Metadata.MetadataPath}; observed {Snapshot.ObservedAt:O}";
 
     private static string FormatProvenance(ActivityExcerpt? activity) => activity is null
@@ -241,11 +258,13 @@ public sealed class JobRowViewModel : ObservableObject
         }
 
         MergeEvents(snapshot.Events);
+        UpdateLiveActivityHistory(snapshot);
         RefreshElapsed(now);
         OnPropertyChanged(nameof(Snapshot));
         foreach (var property in new[] { nameof(ChatText), nameof(TaskText), nameof(DoingText),
                      nameof(DoneText), nameof(DoingProvenance), nameof(DoneProvenance),
                      nameof(LiveActivityNotice), nameof(LiveUpdatedText), nameof(StatusProvenance),
+                     nameof(LiveActivityHistory), nameof(HasLiveActivityHistory),
                      nameof(ReportedStatusText), nameof(ReportedStatusTooltip),
                      nameof(ReportedStatusCellText), nameof(ReportedStatusCellTooltip) })
             OnPropertyChanged(property);
@@ -506,6 +525,47 @@ public sealed class JobRowViewModel : ObservableObject
             nameof(DurationSortSeconds));
         SetText("N/A", ref _durationText, nameof(DurationText));
         SetText(tooltip, ref _durationTooltip, nameof(DurationTooltip));
+    }
+
+    private void UpdateLiveActivityHistory(ForgeJobSnapshot snapshot)
+    {
+        var entries = LiveActivityHistoryPolicy.Order(
+            snapshot.LiveActivity.History.Where(entry =>
+                string.Equals(entry.JobId, snapshot.JobId, StringComparison.Ordinal)));
+        var doing = snapshot.LiveActivity.Doing;
+        _liveActivityHistory = entries
+            .Select(entry => new LiveActivityHistoryRowViewModel(
+                entry,
+                snapshot.ReportedStatus,
+                MatchesCurrentActiveTarget(snapshot, doing, entry)))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// The spinner is defensible only for the exact current Doing record from
+    /// the successful bounded read while Forge metadata explicitly reports
+    /// RUNNING. BLOCKED, UNKNOWN, and stale/carried-only rows show no spinner.
+    /// </summary>
+    private static bool MatchesCurrentActiveTarget(
+        ForgeJobSnapshot snapshot,
+        ActivityExcerpt? doing,
+        LiveActivityHistoryEntry entry)
+    {
+        if (snapshot.Status != ForgeJobStatus.Running || doing is null)
+        {
+            return false;
+        }
+
+        return string.Equals(doing.JobId, entry.JobId, StringComparison.Ordinal) &&
+               string.Equals(doing.SessionId, entry.SessionId, StringComparison.Ordinal) &&
+               string.Equals(doing.MessageId, entry.MessageId, StringComparison.Ordinal) &&
+               string.Equals(doing.PartId, entry.PartId, StringComparison.Ordinal) &&
+               string.Equals(doing.SourcePath, entry.SourcePath, StringComparison.Ordinal) &&
+               doing.ByteOffset == entry.ByteOffset &&
+               string.Equals(
+                   doing.RecordDigest,
+                   entry.RecordDigest,
+                   StringComparison.OrdinalIgnoreCase);
     }
 
     private void MergeEvents(IReadOnlyList<MonitoringEvent> incoming)

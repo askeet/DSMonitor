@@ -42,6 +42,8 @@ public static class JobLiveActivityReader
     public const int MaxReadBytes = 64 * 1024;
     public const int MaxFullReportBytes = 256 * 1024;
     public const int MaxExcerptLength = 600;
+    public const int MaxHistoryEntries = 64;
+    public const int MaxHistoryTextLength = 4_000;
     private const string AssistantTextKind = "Assistant-reported text";
     private const string RolelessTextKind = "Observed roleless text — unverified";
     private const string AssistantToolKind = "Observed tool activity";
@@ -205,6 +207,7 @@ public static class JobLiveActivityReader
             ActivityExcerpt? done = null;
             ActivityExcerpt? latestText = null;
             var texts = new Dictionary<(string Session, string Message), (ActivityExcerpt Excerpt, bool VerifiedAssistant)>();
+            var history = new Dictionary<(string Session, string Message, string PartId), LiveActivityHistoryEntry>();
             // Discard the first record when starting mid-file, even if it
             // happens to be complete. Never parse a possibly partial record.
             var lineStart = start == 0 ? 0 : Array.IndexOf(bytes, (byte)'\n', 0, read) + 1;
@@ -252,6 +255,7 @@ public static class JobLiveActivityReader
 
                     var key = (session!, message!);
                     var sourcePath = verifiedPath;
+                    var recordDigest = ComputeDigest(bytes, recordStart, index - recordStart);
                     ActivityExcerpt Excerpt(string text, string kind) => new(
                         Sanitize(text),
                         kind,
@@ -264,8 +268,67 @@ public static class JobLiveActivityReader
                         parsed.Event.Timestamp,
                         observedAt)
                     {
-                        RecordDigest = ComputeDigest(bytes, recordStart, index - recordStart)
+                        RecordDigest = recordDigest
                     };
+                    LiveActivityHistoryEntry? HistoryEntry(
+                        string text,
+                        string kind,
+                        bool toolRecord)
+                    {
+                        // History identity must be exact and displayable; a
+                        // missing/unsafe part id cannot be de-duplicated.
+                        if (!ValidId(partId))
+                        {
+                            return null;
+                        }
+
+                        TimeSpan? duration = null;
+                        long? durationStart = null;
+                        long? durationEnd = null;
+                        if (toolRecord &&
+                            TryGetToolDuration(
+                                part,
+                                out var observedDuration,
+                                out var start,
+                                out var end))
+                        {
+                            duration = observedDuration;
+                            durationStart = start;
+                            durationEnd = end;
+                        }
+
+                        return new LiveActivityHistoryEntry(
+                            job.JobId,
+                            session!,
+                            message!,
+                            partId!,
+                            kind,
+                            Sanitize(text, MaxHistoryTextLength),
+                            sourcePath,
+                            offset,
+                            parsed.Event.Timestamp,
+                            observedAt,
+                            recordDigest,
+                            duration)
+                        {
+                            DurationStartUnixMilliseconds = durationStart,
+                            DurationEndUnixMilliseconds = durationEnd
+                        };
+                    }
+                    void RememberHistory(LiveActivityHistoryEntry? entry)
+                    {
+                        if (entry is null)
+                        {
+                            return;
+                        }
+
+                        var historyKey = (entry.SessionId, entry.MessageId, entry.PartId);
+                        if (!history.TryGetValue(historyKey, out var existing) ||
+                            entry.ByteOffset >= existing.ByteOffset)
+                        {
+                            history[historyKey] = entry;
+                        }
+                    }
                     if (isText &&
                         TryGetSingleString(part, "text", out var text, out var hasText) &&
                         hasText &&
@@ -276,6 +339,10 @@ public static class JobLiveActivityReader
                             verifiedAssistant ? AssistantTextKind : RolelessTextKind);
                         latestText = doing;
                         texts[key] = (doing, verifiedAssistant);
+                        RememberHistory(HistoryEntry(
+                            text,
+                            verifiedAssistant ? AssistantTextKind : RolelessTextKind,
+                            toolRecord: false));
                     }
                     else if (isTool)
                     {
@@ -284,6 +351,10 @@ public static class JobLiveActivityReader
                         doing = Excerpt(
                             parsed.Event.Summary,
                             verifiedAssistant ? AssistantToolKind : RolelessToolKind);
+                        RememberHistory(HistoryEntry(
+                            parsed.Event.Summary,
+                            verifiedAssistant ? AssistantToolKind : RolelessToolKind,
+                            toolRecord: true));
                     }
                     else if (isFinish &&
                              TryGetSingleString(part, "reason", out var finishReason, out var hasReason) &&
@@ -320,6 +391,9 @@ public static class JobLiveActivityReader
                 Doing = doing,
                 Done = done,
                 LatestText = latestText,
+                History = LiveActivityHistoryPolicy.Order(history.Values),
+                ReadWindowStart = start,
+                ReadWindowEnd = start + read,
                 Availability = "Bounded source re-read; timestamps describe source records, not execution liveness."
             };
         }
@@ -1433,9 +1507,61 @@ public static class JobLiveActivityReader
         value.Length <= 256 && !value.Any(character => char.IsControl(character) ||
             char.GetUnicodeCategory(character) == UnicodeCategory.Format);
 
-    public static string Sanitize(string value)
+    private static bool TryGetToolDuration(
+        JsonElement part,
+        out TimeSpan duration,
+        out long startMilliseconds,
+        out long endMilliseconds)
     {
-        var builder = new StringBuilder(MaxExcerptLength);
+        duration = default;
+        startMilliseconds = 0;
+        endMilliseconds = 0;
+        if (!TryGetSingleObject(part, "state", out var state) ||
+            !TryGetSingleObject(state, "time", out var time) ||
+            !TryGetInt64(time, "start", out startMilliseconds) ||
+            !TryGetInt64(time, "end", out endMilliseconds))
+        {
+            return false;
+        }
+
+        if (startMilliseconds < 0 ||
+            endMilliseconds < startMilliseconds)
+        {
+            return false;
+        }
+
+        var delta = (double)endMilliseconds - startMilliseconds;
+        if (delta < 0 || delta > TimeSpan.MaxValue.TotalMilliseconds)
+        {
+            return false;
+        }
+
+        duration = TimeSpan.FromMilliseconds(delta);
+        return true;
+    }
+
+    private static bool TryGetInt64(JsonElement value, string name, out long result)
+    {
+        result = 0;
+        var count = 0;
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!property.NameEquals(name)) continue;
+            count++;
+            if (count > 1) return false;
+            if (property.Value.ValueKind != JsonValueKind.Number) return false;
+            if (!property.Value.TryGetInt64(out result)) return false;
+        }
+
+        return count == 1;
+    }
+
+    public static string Sanitize(string value) =>
+        Sanitize(value, MaxExcerptLength);
+
+    private static string Sanitize(string value, int maxLength)
+    {
+        var builder = new StringBuilder(maxLength);
         foreach (var rune in value.EnumerateRunes())
         {
             var category = Rune.GetUnicodeCategory(rune);
@@ -1444,7 +1570,7 @@ public static class JobLiveActivityReader
                 if (rune.Value is '\n' or '\r' or '\t') builder.Append(' ');
                 continue;
             }
-            if (builder.Length + rune.Utf16SequenceLength > MaxExcerptLength) break;
+            if (builder.Length + rune.Utf16SequenceLength > maxLength) break;
             builder.Append(rune.ToString());
         }
         return builder.ToString();

@@ -248,6 +248,8 @@ public sealed class ForgeMonitoringService
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        // A whole-scan fallback has no guarded job-source history proof.
+        state.LiveActivityHistories.Clear();
 
         var discovery = _discovery.Discover();
         var jobs = new List<ForgeJobSnapshot>();
@@ -406,6 +408,7 @@ public sealed class ForgeMonitoringService
             state.SeenKeyOrder.Remove(staleId);
             state.AcceptedEventCounts.Remove(staleId);
             state.ReportedStatuses.Remove(staleId);
+            state.LiveActivityHistories.Remove(staleId);
         }
 
         if (eventsToLog.Count > 0)
@@ -794,6 +797,20 @@ public sealed class ForgeMonitoringService
                     observedAt,
                     cancellationToken,
                     _options.MaxBytesPerPoll);
+                if (liveActivity.HasReadWindow)
+                {
+                    liveActivity = ApplyLiveActivityHistory(
+                        state,
+                        metadata,
+                        activityEvidence,
+                        primaryObservationForActivity,
+                        liveActivity);
+                }
+                else
+                {
+                    state.LiveActivityHistories.Remove(metadata.JobId);
+                }
+
                 reportedStatus = ResolveReportedStatus(
                     state,
                     metadata,
@@ -806,6 +823,7 @@ public sealed class ForgeMonitoringService
             else
             {
                 state.ReportedStatuses.Remove(metadata.JobId);
+                state.LiveActivityHistories.Remove(metadata.JobId);
             }
 
             jobs.Add(new ForgeJobSnapshot
@@ -839,6 +857,7 @@ public sealed class ForgeMonitoringService
             state.LastSessions.Remove(staleId);
             state.AcceptedEventCounts.Remove(staleId);
             state.ReportedStatuses.Remove(staleId);
+            state.LiveActivityHistories.Remove(staleId);
         }
 
         if (eventsToLog.Count > 0)
@@ -860,6 +879,27 @@ public sealed class ForgeMonitoringService
         state.LastJobs = jobs.ToDictionary(job => job.JobId, StringComparer.OrdinalIgnoreCase);
         state.LastWarnings = snapshot.Warnings;
         return snapshot;
+    }
+
+    private static LiveActivitySnapshot ApplyLiveActivityHistory(
+        RunState state,
+        ForgeJobMetadata metadata,
+        LiveActivitySourceEvidence evidence,
+        LedgerSourceObservation observation,
+        LiveActivitySnapshot read)
+    {
+        if (!state.LiveActivityHistories.TryGetValue(metadata.JobId, out var history))
+        {
+            history = new LiveActivityHistoryBuffer();
+            state.LiveActivityHistories[metadata.JobId] = history;
+        }
+
+        var entries = history.Apply(
+            read,
+            metadata.JobId,
+            evidence.VerifiedPath ?? string.Empty,
+            observation);
+        return read with { History = entries };
     }
 
     private ReportedStatusExtraction? ResolveReportedStatus(
@@ -999,6 +1039,8 @@ public sealed class ForgeMonitoringService
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        // A metadata-only whole-scan fallback cannot prove source continuity.
+        state.LiveActivityHistories.Clear();
         var discovery = _discovery.Discover();
         var jobs = new List<ForgeJobSnapshot>();
         var globalWarnings = new List<string>(state.StartupWarnings);
@@ -1105,6 +1147,8 @@ public sealed class ForgeMonitoringService
         public Dictionary<string, ForgeJobSnapshot> LastJobs { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, ReportedStatusCacheEntry> ReportedStatuses { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, LiveActivityHistoryBuffer> LiveActivityHistories { get; } =
             new(StringComparer.OrdinalIgnoreCase);
         public IReadOnlyList<string> LastWarnings { get; set; }
     }

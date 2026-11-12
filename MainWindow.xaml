@@ -234,6 +234,26 @@
             </Grid>
         </DataTemplate>
 
+        <DataTemplate x:Key="LiveActivityHistoryStatusCellTemplate">
+            <Grid VerticalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <ContentControl x:Name="LiveActivityHistorySpinner"
+                                Grid.Column="0"
+                                Margin="0,0,6,0"
+                                Style="{StaticResource ActivitySpinner}"
+                                ToolTip="Current activity for an explicitly RUNNING Forge job; not proof of worker liveness."
+                                Visibility="{Binding IsCurrentActiveTarget, Converter={StaticResource BoolToVisibility}}" />
+                <TextBlock Grid.Column="1"
+                           Text="{Binding ReportedStatusText}"
+                           Style="{StaticResource JobCellText}"
+                           ToolTip="{Binding ReportedStatusTooltip}" />
+            </Grid>
+        </DataTemplate>
+
+
         <Style x:Key="JobColumnHeaderStyle" TargetType="DataGridColumnHeader">
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
@@ -308,6 +328,15 @@
                     </Style>
                 </Setter.Value>
             </Setter>
+        </Style>
+
+        <Style x:Key="LiveActivityHistoryGrid" TargetType="DataGrid"
+               BasedOn="{StaticResource JobsGrid}">
+            <Setter Property="RowHeight" Value="30" />
+            <Setter Property="ColumnHeaderHeight" Value="24" />
+            <Setter Property="CanUserSortColumns" Value="False" />
+            <Setter Property="SelectionMode" Value="Single" />
+            <Setter Property="SelectionUnit" Value="FullRow" />
         </Style>
 
         <Style x:Key="TabItemStyle" TargetType="TabItem">
@@ -855,10 +884,129 @@
                             </StackPanel>
                         </Grid>
 
-                        <TabControl Grid.Row="1"
+                        <TabControl x:Name="SelectedJobTabs"
+                                    Grid.Row="1"
                                     Style="{StaticResource DashboardTabControl}"
                                     Margin="20,0,20,16"
                                     DataContext="{Binding SelectedJob}">
+                            <TabItem Header="Live Activity" Style="{StaticResource TabItemStyle}">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <Grid Margin="0,0,0,8">
+                                        <TextBlock Text="Job-specific activity history"
+                                                   Foreground="{StaticResource TextPrimary}"
+                                                   FontSize="12.5"
+                                                   FontWeight="SemiBold" />
+                                        <TextBlock Text="Newest source timestamp first · bounded"
+                                                   Foreground="{StaticResource TextMuted}"
+                                                   FontSize="10.5"
+                                                   HorizontalAlignment="Right" />
+                                    </Grid>
+
+                                    <Border Grid.Row="1"
+                                            Background="#0F141B"
+                                            BorderBrush="{StaticResource BorderSoft}"
+                                            BorderThickness="1"
+                                            CornerRadius="9"
+                                            Padding="10"
+                                            Margin="0,0,0,8"
+                                            MaxHeight="170">
+                                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                                      HorizontalScrollBarVisibility="Disabled"
+                                                      Padding="0,0,8,0">
+                                            <StackPanel>
+                                                <TextBlock Text="TASK" Style="{StaticResource CardLabel}" />
+                                                <TextBlock Text="{Binding TaskText}" Style="{StaticResource DetailValue}" Margin="0,4,0,8" />
+                                                <TextBlock Text="DOING · MOST RECENT OBSERVED ACTIVITY" Style="{StaticResource CardLabel}" />
+                                                <TextBlock Text="{Binding DoingText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
+                                                <TextBlock Text="{Binding DoingProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
+                                                <TextBlock Text="DONE · OBSERVED RESULT, UNVERIFIED" Style="{StaticResource CardLabel}" Margin="0,12,0,0" />
+                                                <TextBlock Text="{Binding DoneText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
+                                                <TextBlock Text="{Binding DoneProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
+                                                <TextBlock Text="{Binding StatusProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" Margin="0,10,0,0" />
+                                            </StackPanel>
+                                        </ScrollViewer>
+                                    </Border>
+
+                                    <Grid Grid.Row="2">
+                                        <DataGrid x:Name="LiveActivityHistoryGrid"
+                                                  Style="{StaticResource LiveActivityHistoryGrid}"
+                                                  ItemsSource="{Binding LiveActivityHistory}"
+                                                  AutomationProperties.Name="Live activity history">
+                                            <DataGrid.Columns>
+                                                <DataGridTemplateColumn Header="Started"
+                                                                        Width="150"
+                                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}">
+                                                    <DataGridTemplateColumn.CellTemplate>
+                                                        <DataTemplate>
+                                                            <TextBlock Text="{Binding StartedText}"
+                                                                       Style="{StaticResource JobCellText}"
+                                                                       ToolTip="{Binding StartedTooltip}" />
+                                                        </DataTemplate>
+                                                    </DataGridTemplateColumn.CellTemplate>
+                                                </DataGridTemplateColumn>
+
+                                                <DataGridTemplateColumn Header="Duration"
+                                                                        Width="90"
+                                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}">
+                                                    <DataGridTemplateColumn.CellTemplate>
+                                                        <DataTemplate>
+                                                            <TextBlock Text="{Binding DurationText}"
+                                                                       Style="{StaticResource JobCellText}"
+                                                                       ToolTip="{Binding DurationTooltip}" />
+                                                        </DataTemplate>
+                                                    </DataGridTemplateColumn.CellTemplate>
+                                                </DataGridTemplateColumn>
+
+                                                <DataGridTemplateColumn Header="Reported Status"
+                                                                        Width="*"
+                                                                        HeaderStyle="{StaticResource JobColumnHeaderStyle}"
+                                                                        CellTemplate="{StaticResource LiveActivityHistoryStatusCellTemplate}" />
+                                            </DataGrid.Columns>
+                                        </DataGrid>
+
+                                        <TextBlock Text="{Binding LiveActivityHistoryEmptyText}"
+                                                   Foreground="{StaticResource TextMuted}"
+                                                   FontSize="11"
+                                                   TextAlignment="Center"
+                                                   TextWrapping="Wrap"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"
+                                                   MaxWidth="330"
+                                                   IsHitTestVisible="False">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding HasLiveActivityHistory}" Value="False">
+                                                            <Setter Property="Visibility" Value="Visible" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                    </Grid>
+
+                                    <StackPanel Grid.Row="3" Margin="0,8,0,0">
+                                        <TextBlock Text="{Binding LiveActivityNotice}"
+                                                   Foreground="{StaticResource TextSecondary}"
+                                                   FontSize="10.5"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock Text="{Binding LiveActivityHistoryNotice}"
+                                                   Foreground="{StaticResource TextMuted}"
+                                                   FontSize="10"
+                                                   TextWrapping="Wrap"
+                                                   Margin="0,4,0,0" />
+                                    </StackPanel>
+                                </Grid>
+                            </TabItem>
+
                             <TabItem Header="Overview" Style="{StaticResource TabItemStyle}">
                                 <ScrollViewer VerticalScrollBarVisibility="Auto"
                                               HorizontalScrollBarVisibility="Disabled"
@@ -935,27 +1083,6 @@
                                                            Foreground="{StaticResource TextSecondary}"
                                                            FontSize="10.5"
                                                            TextWrapping="Wrap" />
-                                            </StackPanel>
-                                        </Border>
-
-                                        <Border Background="#0F141B"
-                                                BorderBrush="{StaticResource BorderSoft}"
-                                                BorderThickness="1"
-                                                CornerRadius="9"
-                                                Padding="12"
-                                                Margin="0,0,0,12">
-                                            <StackPanel>
-                                                <TextBlock Text="LIVE ACTIVITY · JOB CAPTURE" Style="{StaticResource CardLabel}" />
-                                                <TextBlock Text="TASK" Style="{StaticResource CardLabel}" Margin="0,12,0,4" />
-                                                <TextBlock Text="{Binding TaskText}" Style="{StaticResource DetailValue}" />
-                                                <TextBlock Text="DOING · MOST RECENT OBSERVED ACTIVITY" Style="{StaticResource CardLabel}" />
-                                                <TextBlock Text="{Binding DoingText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
-                                                <TextBlock Text="{Binding DoingProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
-                                                <TextBlock Text="DONE · OBSERVED RESULT, UNVERIFIED" Style="{StaticResource CardLabel}" Margin="0,14,0,0" />
-                                                <TextBlock Text="{Binding DoneText}" Style="{StaticResource DetailValue}" Margin="0,4,0,4" />
-                                                <TextBlock Text="{Binding DoneProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" />
-                                                <TextBlock Text="{Binding StatusProvenance}" Foreground="{StaticResource TextMuted}" FontSize="10" TextWrapping="Wrap" Margin="0,12,0,0" />
-                                                <TextBlock Text="{Binding LiveActivityNotice}" Foreground="{StaticResource TextSecondary}" FontSize="10.5" TextWrapping="Wrap" Margin="0,12,0,0" />
                                             </StackPanel>
                                         </Border>
 

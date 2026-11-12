@@ -38,7 +38,10 @@ public sealed class JobTableLayoutTests
             Assert.IsTrue(grid.Columns[1].Width.DisplayValue <= 100);
             Assert.IsTrue(grid.Columns[2].Width.DisplayValue <= 80);
             Assert.IsTrue(grid.Columns[3].Width.DisplayValue <= 120);
-            Assert.IsTrue(grid.Columns[4].Width.DisplayValue <= 150);
+            Assert.IsTrue(
+                grid.Columns[4].Width.IsStar,
+                "Reported Status must flex into the remaining table width; a star column has no measured width until the grid is arranged.");
+            Assert.AreEqual(1d, grid.Columns[4].Width.Value);
             Assert.AreEqual(44d, grid.RowHeight);
 
             Assert.AreEqual(DataGridSelectionMode.Single, grid.SelectionMode);
