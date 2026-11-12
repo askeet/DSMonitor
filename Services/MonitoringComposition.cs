@@ -67,7 +67,7 @@ public sealed class MonitoringComposition
                 "Logs"),
             LedgerStoragePaths.DefaultV3DatabasePath,
             LedgerStoragePaths.DefaultDataDirectory,
-            TimeSpan.FromSeconds(5)));
+            TimeSpan.FromSeconds(1)));
 
     /// <summary>
     /// Reads the explicit isolated configuration. When any isolated setting is
@@ -113,7 +113,7 @@ public sealed class MonitoringComposition
 
         try
         {
-            var refresh = TimeSpan.FromSeconds(5);
+            var refresh = TimeSpan.FromSeconds(1);
             if (environment.TryGetValue(IsolatedRefreshSecondsVariable, out var refreshValue) &&
                 !string.IsNullOrWhiteSpace(refreshValue))
             {

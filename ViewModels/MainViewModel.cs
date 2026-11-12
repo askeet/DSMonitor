@@ -50,7 +50,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _stateDetail = "Monitoring is stopped";
     private string _jobsSummaryText = "0 observed · 0 unknown";
     private string _openCodeStateText = "Not connected · Phase 2";
-    private string _refreshIntervalText = "5 s";
+    private string _refreshIntervalText = "1 s";
 
     public MainViewModel(
         Func<ForgeMonitoringService> serviceFactory,

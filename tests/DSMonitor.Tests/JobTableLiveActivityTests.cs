@@ -43,6 +43,91 @@ public sealed class JobTableLiveActivityTests
         StringAssert.Contains(row.DurationTooltip, "Frozen");
     }
 
+    [DataTestMethod]
+    [DataRow(ForgeJobStatus.Running)]
+    [DataRow(ForgeJobStatus.Blocked)]
+    public void DurationAndSpinnerShareRunningAndBlockedDecision(ForgeJobStatus status)
+    {
+        var row = new JobRowViewModel(Snapshot(
+            status,
+            Started,
+            Started.AddSeconds(4),
+            Started.AddSeconds(5)));
+
+        Assert.IsTrue(row.IsActive);
+        Assert.IsTrue(row.DurationUsesLiveClock);
+        Assert.AreEqual("5s", row.DurationText);
+
+        var activeNotified = false;
+        row.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(JobRowViewModel.IsActive))
+            {
+                activeNotified = true;
+            }
+        };
+        row.SetMonitoringActive(false);
+        var frozen = row.DurationText;
+        row.RefreshDuration(Started.AddMinutes(1));
+
+        Assert.IsTrue(activeNotified);
+        Assert.IsFalse(row.IsActive);
+        Assert.IsFalse(row.DurationUsesLiveClock);
+        Assert.AreEqual(frozen, row.DurationText);
+    }
+
+    [TestMethod]
+    public void DurationAndSpinnerShareFreshUnknownActivityAndClockExpiry()
+    {
+        var sourceTime = Started.AddMinutes(5);
+        var row = new JobRowViewModel(Snapshot(
+            ForgeJobStatus.Unknown,
+            Started,
+            sourceTime,
+            sourceTime.AddSeconds(1),
+            doing: TextActivity("tool call", 200, sourceTime)));
+
+        Assert.IsTrue(row.IsActive, "The first fresh job-specific activity is observed as active.");
+        Assert.IsTrue(row.DurationUsesLiveClock);
+        Assert.AreEqual(301d, row.DurationSortSeconds);
+
+        var activeNotified = false;
+        row.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(JobRowViewModel.IsActive))
+            {
+                activeNotified = true;
+            }
+        };
+        row.RefreshDuration(sourceTime.AddSeconds(31));
+
+        Assert.IsTrue(activeNotified);
+        Assert.IsFalse(row.IsActive);
+        Assert.IsFalse(row.DurationUsesLiveClock);
+        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual(300d, row.DurationSortSeconds);
+
+        var missingTimestamp = Snapshot(
+            ForgeJobStatus.Unknown,
+            Started,
+            lastActivity: null,
+            observedAt: sourceTime.AddSeconds(32));
+        row.Update(missingTimestamp, sourceTime.AddSeconds(32));
+        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual(300d, row.DurationSortSeconds);
+        StringAssert.Contains(row.DurationTooltip, "retained");
+
+        var invalidTimestamp = Snapshot(
+            ForgeJobStatus.Unknown,
+            Started,
+            Started.AddSeconds(-1),
+            sourceTime.AddSeconds(33));
+        row.Update(invalidTimestamp, sourceTime.AddSeconds(33));
+        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual(300d, row.DurationSortSeconds);
+        StringAssert.Contains(row.DurationTooltip, "retained");
+    }
+
     [TestMethod]
     public void Duration_UnknownJobUsesObservedSpanAndNeverTicksForever()
     {
@@ -100,7 +185,8 @@ public sealed class JobTableLiveActivityTests
             done: TextActivity("intermediate result", offset: 100, timestamp: Started.AddMinutes(5))));
 
         Assert.AreEqual("8m 0s", row.DurationText);
-        Assert.AreEqual(JobDurationBasis.ObservedSpan, row.DurationBasis);
+        Assert.AreEqual(JobDurationBasis.Live, row.DurationBasis);
+        Assert.IsTrue(row.IsActive);
         Assert.IsFalse(row.DurationHasHeuristicCompletion);
 
         row.RefreshDuration(Started.AddDays(1));
@@ -118,9 +204,15 @@ public sealed class JobTableLiveActivityTests
             doing: TextActivity("this job activity", offset: 100, timestamp: Started.AddMinutes(6)),
             done: TextActivity("another job result", offset: 100, timestamp: Started.AddMinutes(6), jobId: "other-job")));
 
+        Assert.AreEqual(JobDurationBasis.Live, row.DurationBasis);
+        Assert.IsTrue(row.IsActive);
+        Assert.IsFalse(row.DurationHasHeuristicCompletion);
+
+        row.RefreshDuration(Started.AddMinutes(6).AddSeconds(31));
+
+        Assert.IsFalse(row.IsActive);
         Assert.AreEqual(JobDurationBasis.ObservedSpan, row.DurationBasis);
         Assert.IsFalse(row.DurationHasHeuristicCompletion);
-        row.RefreshDuration(Started.AddDays(1));
         Assert.AreEqual("6m 0s", row.DurationText);
     }
 

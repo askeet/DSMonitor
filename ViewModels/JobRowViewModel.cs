@@ -24,6 +24,7 @@ internal enum JobDurationBasis
 public sealed class JobRowViewModel : ObservableObject
 {
     public const int MaxTimelineEvents = TimelineOrdering.DefaultCapacity;
+    private static readonly TimeSpan UnknownActivityFreshnessWindow = TimeSpan.FromSeconds(30);
 
     private ForgeJobStatus _status = ForgeJobStatus.Unknown;
     private string _projectText = "N/A";
@@ -48,6 +49,7 @@ public sealed class JobRowViewModel : ObservableObject
     private bool _hasWarnings;
     private bool _hasRawLog;
     private bool _monitoringActive = true;
+    private DateTimeOffset _currentTime;
     private IReadOnlyList<LiveActivityHistoryRowViewModel> _liveActivityHistory =
         Array.Empty<LiveActivityHistoryRowViewModel>();
     private LiveActivityHistoryRowViewModel? _selectedActivity;
@@ -147,16 +149,63 @@ public sealed class JobRowViewModel : ObservableObject
     }
 
     /// <summary>
-    /// True when Forge metadata reports an active job, monitoring is still
-    /// active, and no exact job-scoped terminal step-finish is at or after the
-    /// latest observed activity. A running job with no Doing record still
-    /// qualifies; a result/source terminal event stops the spinner without
-    /// inferring completion from activity text.
+    /// True when Forge metadata reports an active job, or recent job-scoped
+    /// activity supports a transient active indication for an UNKNOWN job,
+    /// while monitoring is active and no exact job-scoped terminal step-finish
+    /// is at or after the latest observed activity. A running job with no Doing
+    /// record still qualifies; activity text alone never establishes completion.
     /// </summary>
-    public bool IsActive =>
+    public bool IsActive => IsObservedActive(_currentTime);
+
+    private bool IsObservedActive(DateTimeOffset now) =>
         _monitoringActive &&
-        _status.IsActive() &&
+        (_status.IsActive() || HasFreshUnknownJobActivity(now) || HasFreshLifecycleEvidence(now)) &&
         !HasTerminalActivityEvidenceAtOrAfterLatestActivity();
+
+    private bool HasFreshUnknownJobActivity(DateTimeOffset now)
+    {
+        if (_status != ForgeJobStatus.Unknown ||
+            Snapshot.LiveActivity.Doing is not { } doing ||
+            !string.Equals(doing.JobId, JobId, StringComparison.Ordinal) ||
+            doing.SourceTimestamp is not { } sourceTimestamp)
+        {
+            return false;
+        }
+
+        var age = now - sourceTimestamp;
+        return age >= TimeSpan.Zero && age <= UnknownActivityFreshnessWindow;
+    }
+
+    private bool HasFreshLifecycleEvidence(DateTimeOffset now)
+    {
+        if (_status != ForgeJobStatus.Unknown ||
+            Snapshot.LiveActivity.LatestLifecycleByteOffset is not { } latestOffset)
+        {
+            return false;
+        }
+
+        // An offset alone proves ordering, not recency. Require a source-time
+        // stamped excerpt for the newest lifecycle offset before it can keep
+        // UNKNOWN active; old offsets cannot sustain activity across clock ticks.
+        var sourceTimestamp = Snapshot.LiveActivity.Doing is { } doing &&
+                              string.Equals(doing.JobId, JobId, StringComparison.Ordinal) &&
+                              doing.ByteOffset == latestOffset
+            ? doing.SourceTimestamp
+            : Snapshot.LiveActivity.History
+                .Where(entry => string.Equals(entry.JobId, JobId, StringComparison.Ordinal) &&
+                                entry.ByteOffset == latestOffset)
+                .Select(entry => entry.SourceTimestamp)
+                .FirstOrDefault(timestamp => timestamp is not null);
+
+        if (sourceTimestamp is not { } timestamp)
+        {
+            return false;
+        }
+
+        var age = now - timestamp;
+        return age >= TimeSpan.Zero && age <= UnknownActivityFreshnessWindow;
+    }
+
     public string ProjectText => _projectText;
     public string ProjectTooltip => _projectTooltip;
     public string ModelText => _modelText;
@@ -261,9 +310,15 @@ public sealed class JobRowViewModel : ObservableObject
             return;
         }
 
+        var wasActive = IsActive;
         _monitoringActive = active;
         UpdateLiveActivityHistory(Snapshot);
-        OnPropertyChanged(nameof(IsActive));
+        if (wasActive != IsActive)
+        {
+            OnPropertyChanged(nameof(IsActive));
+        }
+
+        RefreshDuration(_currentTime);
     }
 
     internal bool IsSelectedActivityTextKind =>
@@ -420,6 +475,7 @@ public sealed class JobRowViewModel : ObservableObject
 
     public void Update(ForgeJobSnapshot snapshot, DateTimeOffset now)
     {
+        _currentTime = now;
         Snapshot = snapshot;
         JobId = snapshot.JobId;
         StartedSort = snapshot.Metadata.Started ?? DateTimeOffset.MinValue;
@@ -534,13 +590,40 @@ public sealed class JobRowViewModel : ObservableObject
     /// </summary>
     public void RefreshDuration(DateTimeOffset now)
     {
-        if (_durationBasis != JobDurationBasis.Live ||
-            _durationStartedAt is not { } started)
+        var wasActive = IsActive;
+        _currentTime = now;
+        var isActive = IsActive;
+        if (wasActive != isActive)
+        {
+            OnPropertyChanged(nameof(IsActive));
+        }
+
+        if (_durationStartedAt is not { } started)
         {
             return;
         }
 
-        SetLiveDuration(started, now);
+        if (isActive)
+        {
+            _durationBasis = JobDurationBasis.Live;
+            SetLiveDuration(started, now);
+            return;
+        }
+
+        if (_durationBasis == JobDurationBasis.Live)
+        {
+            if (_status == ForgeJobStatus.Unknown)
+            {
+                UpdateDuration(Snapshot, now);
+            }
+            else
+            {
+                // Preserve the last supported duration at the moment the
+                // shared activity decision stops advancing it.
+                SetLiveDuration(started, now);
+                _durationBasis = JobDurationBasis.ObservedSpan;
+            }
+        }
     }
 
     public void RefreshElapsed(DateTimeOffset now)
@@ -573,6 +656,7 @@ public sealed class JobRowViewModel : ObservableObject
 
     private void UpdateDuration(ForgeJobSnapshot snapshot, DateTimeOffset now)
     {
+        var hadLiveDuration = _durationBasis == JobDurationBasis.Live;
         _durationStartedAt = snapshot.Metadata.Started;
         if (snapshot.Metadata.Started is not { } started)
         {
@@ -614,11 +698,24 @@ public sealed class JobRowViewModel : ObservableObject
 
             case ForgeJobStatus.Running:
             case ForgeJobStatus.Blocked:
+                if (!IsActive)
+                {
+                    SetObservedSpan(snapshot, started, hadLiveDuration, now);
+                    return;
+                }
+
                 _durationBasis = JobDurationBasis.Live;
                 SetLiveDuration(started, now);
                 return;
 
             default:
+                if (IsActive)
+                {
+                    _durationBasis = JobDurationBasis.Live;
+                    SetLiveDuration(started, now);
+                    return;
+                }
+
                 if (TryGetDoneActivityFinish(snapshot, out var doneAt))
                 {
                     SetFinishedDuration(
@@ -630,7 +727,7 @@ public sealed class JobRowViewModel : ObservableObject
                 }
                 else
                 {
-                    SetObservedSpan(snapshot, started);
+                    SetObservedSpan(snapshot, started, hadLiveDuration, now);
                 }
 
                 return;
@@ -693,11 +790,24 @@ public sealed class JobRowViewModel : ObservableObject
             nameof(DurationTooltip));
     }
 
-    private void SetObservedSpan(ForgeJobSnapshot snapshot, DateTimeOffset started)
+    private void SetObservedSpan(
+        ForgeJobSnapshot snapshot,
+        DateTimeOffset started,
+        bool preserveLiveDuration = false,
+        DateTimeOffset? now = null)
     {
         _durationBasis = JobDurationBasis.ObservedSpan;
         if (snapshot.LastActivity is not { } lastActivity)
         {
+            if (TryRetainPreviousDuration(
+                    started,
+                    now ?? snapshot.ObservedAt,
+                    preserveLiveDuration,
+                    "No activity timestamp is available."))
+            {
+                return;
+            }
+
             SetDurationUnavailable(
                 "N/A — started or last activity is unavailable; duration is not inferred.");
             return;
@@ -705,6 +815,15 @@ public sealed class JobRowViewModel : ObservableObject
 
         if (lastActivity < started)
         {
+            if (TryRetainPreviousDuration(
+                    started,
+                    now ?? snapshot.ObservedAt,
+                    preserveLiveDuration,
+                    "The latest activity timestamp precedes started."))
+            {
+                return;
+            }
+
             SetDurationUnavailable(
                 "N/A — last activity precedes started; duration is invalid and is not inferred.");
             return;
@@ -721,6 +840,32 @@ public sealed class JobRowViewModel : ObservableObject
             "observed span only, not proof of completion. No live timer.",
             ref _durationTooltip,
             nameof(DurationTooltip));
+    }
+
+    private bool TryRetainPreviousDuration(
+        DateTimeOffset started,
+        DateTimeOffset now,
+        bool wasLive,
+        string reason)
+    {
+        var hasPreviousValue = double.IsFinite(_durationSortSeconds) && _durationText != "N/A";
+        if (!wasLive && !hasPreviousValue)
+        {
+            return false;
+        }
+
+        if (wasLive)
+        {
+            SetLiveDuration(started, now);
+        }
+
+        _durationBasis = JobDurationBasis.ObservedSpan;
+        SetText(
+            $"Previously supported duration retained because {reason} " +
+            "It is frozen and is not proof of execution or completion.",
+            ref _durationTooltip,
+            nameof(DurationTooltip));
+        return true;
     }
 
     /// <summary>

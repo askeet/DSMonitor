@@ -52,6 +52,7 @@ public sealed class V3MonitoringCompositionTests
 
         var service = composition.CreateService();
         Assert.AreEqual(composition.Options.RunsRoot, service.RunsRoot);
+        Assert.AreEqual(TimeSpan.FromSeconds(1), composition.Options.RefreshInterval);
         Assert.AreEqual(composition.Options.RefreshInterval, service.RefreshInterval);
     }
 
@@ -63,6 +64,7 @@ public sealed class V3MonitoringCompositionTests
             MonitoringComposition.TryCreateIsolated(complete, out var composition, out var error),
             error);
         Assert.IsNotNull(composition);
+        Assert.AreEqual(TimeSpan.FromSeconds(1), composition!.Options.RefreshInterval);
         Assert.AreEqual(Path.GetFullPath(_workspace.RunsRoot), composition.Options.RunsRoot);
         Assert.AreEqual(Path.GetFullPath(_workspace.LogsRoot), composition.Options.LogsRoot);
         Assert.AreEqual(Path.GetFullPath(_databasePath), composition.Options.DatabasePath);

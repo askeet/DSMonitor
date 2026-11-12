@@ -7,5 +7,5 @@ public sealed record MonitoringOptions(
     long MaxLogLineBytes = 1024 * 1024)
 {
     public static MonitoringOptions Default { get; } =
-        new(TimeSpan.FromSeconds(5));
+        new(TimeSpan.FromSeconds(1));
 }

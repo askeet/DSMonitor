@@ -148,6 +148,69 @@ public sealed class LiveActivitySelectionTests
             latestActivityRow.LiveActivityHistory.Single().IsCurrentActiveTarget);
     }
 
+    [TestMethod]
+    public void Spinner_UsesFreshJobActivityForUnknownStatusAndRejectsStaleOrTerminalActivity()
+    {
+        var freshActivity = Snapshot(
+            [Entry("current", 400, Now, part: "p4")],
+            status: ForgeJobStatus.Unknown,
+            doing: Excerpt("current", "p4", 400) with
+            {
+                SourceTimestamp = Now.AddSeconds(-5)
+            });
+        var row = new JobRowViewModel(freshActivity);
+        Assert.IsTrue(row.IsActive);
+
+        var isActiveNotified = false;
+        row.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(JobRowViewModel.IsActive))
+            {
+                isActiveNotified = true;
+            }
+        };
+        row.Update(freshActivity with
+        {
+            ObservedAt = Now.AddSeconds(1),
+            LiveActivity = freshActivity.LiveActivity with
+            {
+                Doing = freshActivity.LiveActivity.Doing! with
+                {
+                    SourceTimestamp = Now.AddSeconds(-31)
+                }
+            }
+        }, Now.AddSeconds(1));
+
+        Assert.IsTrue(isActiveNotified);
+        Assert.IsFalse(row.IsActive, "Historical UNKNOWN activity must not keep the spinner visible.");
+
+        row.Update(freshActivity with
+        {
+            LiveActivity = freshActivity.LiveActivity with
+            {
+                DoneEventByteOffset = 500,
+                LatestLifecycleByteOffset = 400
+            }
+        }, Now);
+        Assert.IsFalse(row.IsActive, "A delayed progress excerpt must not override later terminal evidence.");
+
+        row.SetMonitoringActive(false);
+        Assert.IsFalse(row.IsActive, "Stopping monitoring must hide the spinner.");
+    }
+
+    [TestMethod]
+    public void Spinner_UsesFreshJobScopedLifecycleHistoryWhenDoingIsUnavailable()
+    {
+        var row = new JobRowViewModel(Snapshot(
+            [Entry("tool activity", 400, Now)],
+            status: ForgeJobStatus.Unknown,
+            latestLifecycleByteOffset: 400));
+
+        Assert.IsTrue(row.IsActive);
+        row.RefreshDuration(Now.AddSeconds(31));
+        Assert.IsFalse(row.IsActive, "An old lifecycle offset alone cannot keep UNKNOWN active.");
+    }
+
     [DataTestMethod]
     [DataRow("##Status: **DONE**", "DONE")]
     [DataRow("## Status: PASS", "PASS")]

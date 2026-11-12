@@ -24,6 +24,7 @@ public sealed class MonitoringCompositionWpfTests
         {
             Assert.AreSame(composition, window.Composition);
             Assert.IsInstanceOfType(window.DataContext, typeof(MainViewModel));
+            Assert.AreEqual("1 s", ((MainViewModel)window.DataContext).RefreshIntervalText);
             Assert.IsFalse(File.Exists(composition.Options.DatabasePath));
             Assert.IsFalse(Directory.GetFiles(
                 composition.Options.LogsRoot,

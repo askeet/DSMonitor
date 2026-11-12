@@ -70,6 +70,36 @@ public sealed class ForgeMonitoringServiceTests
     }
 
     [TestMethod]
+    public async Task Run_DoesNotOverlapScansWhenSnapshotHandlingExceedsRefreshInterval()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var callbacks = 0;
+        var activeCallbacks = 0;
+        var maxConcurrentCallbacks = 0;
+
+        await CreateService().RunAsync(async _ =>
+        {
+            var current = Interlocked.Increment(ref activeCallbacks);
+            int observed;
+            while (current > (observed = Volatile.Read(ref maxConcurrentCallbacks)) &&
+                   Interlocked.CompareExchange(ref maxConcurrentCallbacks, current, observed) != observed)
+            {
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(125));
+            if (Interlocked.Increment(ref callbacks) >= 3)
+            {
+                cancellation.Cancel();
+            }
+
+            Interlocked.Decrement(ref activeCallbacks);
+        }, cancellation.Token);
+
+        Assert.AreEqual(3, callbacks);
+        Assert.AreEqual(1, maxConcurrentCallbacks);
+    }
+
+    [TestMethod]
     public async Task Run_DetectsNewJobWithoutRestart()
     {
         await using var harness = new MonitoringHarness();
