@@ -7,31 +7,52 @@ namespace DSMonitor.ViewModels;
 /// One row in the Live Activity tab. The Started value is the record's own
 /// source timestamp (or a neutral unknown marker), Duration is only the
 /// same-part tool start/end duration when the source supplied a valid pair, and
-/// Reported Status shows the normalized first Markdown line for this row (with
-/// exact leading markers and paired bold removed), falling back to the existing
-/// reported text. Nothing here establishes completion, success, or liveness.
+/// Reported Status keeps the row's own exact/report-local value when usable.
+/// Otherwise it reuses the job-level value resolved once for the Forge jobs
+/// table cell, including a job-owned text fallback. Nothing here establishes
+/// completion, success, or liveness.
 /// </summary>
 public sealed class LiveActivityHistoryRowViewModel
 {
     private readonly ReportedStatusExtraction? _matchingReportedStatus;
-    private readonly string? _statusLineValue;
-    private readonly string? _fallbackStatusValue;
+    private readonly string _reportedStatusValue;
 
+    /// <param name="jobReportedStatus">
+    /// The job-level value resolved once by
+    /// <see cref="ReportedStatusPresentation.ResolveJobReportedStatus"/> for
+    /// this row's own job. A value owned by another job is never applied.
+    /// </param>
     public LiveActivityHistoryRowViewModel(
         LiveActivityHistoryEntry entry,
         ReportedStatusExtraction? reportedStatus,
-        bool isCurrentActiveTarget)
+        bool isCurrentActiveTarget,
+        ReportedStatusPresentation.JobReportedStatus? jobReportedStatus = null)
     {
         Entry = entry ?? throw new ArgumentNullException(nameof(entry));
         _matchingReportedStatus = Matches(reportedStatus, entry)
             ? reportedStatus
             : null;
-        var statusText = _matchingReportedStatus?.Source.Text;
-        _statusLineValue = LiveActivityStatusLinePolicy.Extract(
-            string.IsNullOrEmpty(statusText) ? entry.Text : statusText);
-        _fallbackStatusValue = _matchingReportedStatus is { HasValue: true } status
-            ? LiveActivityStatusLinePolicy.Extract(status.Value)
-            : null;
+        var rowStatus = ReportedStatusPresentation.ToDisplay(
+            _matchingReportedStatus,
+            _matchingReportedStatus?.Source.Text ?? entry.Text);
+        if (rowStatus != ReportedStatusPresentation.Unavailable)
+        {
+            _reportedStatusValue = rowStatus;
+        }
+        else if (jobReportedStatus is { } jobStatus &&
+                 string.Equals(jobStatus.JobId, entry.JobId, StringComparison.Ordinal))
+        {
+            _reportedStatusValue = jobStatus.Value;
+        }
+        else if (BelongsToSameJob(reportedStatus, entry))
+        {
+            _reportedStatusValue = ReportedStatusPresentation.ToDisplay(reportedStatus);
+        }
+        else
+        {
+            _reportedStatusValue = rowStatus;
+        }
+
         IsCurrentActiveTarget = isCurrentActiveTarget;
     }
 
@@ -70,24 +91,10 @@ public sealed class LiveActivityHistoryRowViewModel
     /// Complete bounded display text. WPF applies ellipsis from available width;
     /// this value is never character-truncated by presentation code.
     /// </summary>
-    public string ReportedStatusText =>
-        _statusLineValue is not null
-            ? _statusLineValue
-            : _fallbackStatusValue is not null
-                ? _fallbackStatusValue
-                : _matchingReportedStatus is { HasValue: true } status
-                    ? ReportedStatusPresentation.ToDisplay(status)
-                    : ReportedStatusPresentation.Unavailable;
+    public string ReportedStatusText => _reportedStatusValue;
 
-    /// <summary>Complete text or reported value for the full-text tooltip.</summary>
-    public string ReportedStatusTooltip =>
-        _statusLineValue is not null
-            ? LiveActivityStatusLinePolicy.Tooltip(_statusLineValue)
-            : _fallbackStatusValue is not null
-                ? LiveActivityStatusLinePolicy.Tooltip(_fallbackStatusValue)
-                : _matchingReportedStatus is { HasValue: true } status
-                    ? ReportedStatusPresentation.ToTooltip(status)
-                    : ReportedStatusPresentation.ToTooltip(null);
+    /// <summary>The same shared presentation value shown in the cell.</summary>
+    public string ReportedStatusTooltip => ReportedStatusText;
 
     public string Provenance =>
         $"{Entry.Kind}; job {Entry.JobId}; session {Entry.SessionId}; message {Entry.MessageId}; " +
@@ -131,6 +138,12 @@ public sealed class LiveActivityHistoryRowViewModel
                string.Equals(source.SourcePath, entry.SourcePath, StringComparison.Ordinal) &&
                source.ByteOffset == entry.ByteOffset;
     }
+
+    private static bool BelongsToSameJob(
+        ReportedStatusExtraction? extraction,
+        LiveActivityHistoryEntry entry) =>
+        extraction is not null &&
+        string.Equals(extraction.Source.JobId, entry.JobId, StringComparison.Ordinal);
 
     private static string FormatDuration(TimeSpan duration)
     {

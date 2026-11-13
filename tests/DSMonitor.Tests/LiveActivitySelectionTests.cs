@@ -95,13 +95,16 @@ public sealed class LiveActivitySelectionTests
     [DataRow(" ##Status: DONE", "DONE")]
     [DataRow("##status: DONE", "DONE")]
     [DataRow("##Statusish: DONE", "##Statusish: DONE")]
-    [DataRow("##Status:", null)]
-    [DataRow("\nnext line", null)]
+    [DataRow("##Status:", "N/A")]
+    [DataRow("\nnext line", "N/A")]
+    [DataRow("## Status", "N/A")]
+    [DataRow("## Status\n\n**INCOMPLETE** — continuing", "INCOMPLETE")]
+    [DataRow("## Result\n\n**FAILED**", "FAILED")]
     public void StatusLine_ShowsOnlyFirstLineAndNormalizesMarkersAndBold(
         string text,
         string? expected)
     {
-        Assert.AreEqual(expected, LiveActivityStatusLinePolicy.Extract(text));
+        Assert.AreEqual(expected, ReportedStatusPresentation.ToDisplay(null, text));
     }
 
     [TestMethod]
@@ -284,6 +287,161 @@ public sealed class LiveActivitySelectionTests
         Assert.AreEqual(
             jobRow.ReportedStatusCellTooltip,
             historyRow.ReportedStatusTooltip);
+    }
+
+    [TestMethod]
+    public void JobAndHistoryStatus_UseTheSameParsedStatusForBoldStatusResponse()
+    {
+        const string response = "**Status: INCOMPLETE — implementation and local validation completed; " +
+            "independent QA not performed.** The maximum steps for this agent have been reached, " +
+            "so no further tool calls or corrections were made.\n\n" +
+            "No files were staged or committed.\n\n## Changed paths";
+        const string expected = "INCOMPLETE — implementation and local validation completed; " +
+            "independent QA not performed.";
+
+        var entry = Entry(response, 100, Now.AddMinutes(-1), part: "p");
+        var extraction = ReportedStatusParser.Extract(Complete(response, response.Length));
+        Assert.AreEqual(ReportedStatusState.Reported, extraction.State);
+        Assert.AreEqual(expected, ReportedStatusPresentation.ToDisplay(extraction));
+
+        var jobRow = new JobRowViewModel(Snapshot([entry], reportedStatus: extraction));
+        var historyRow = jobRow.LiveActivityHistory.Single();
+
+        Assert.AreEqual(expected, jobRow.ReportedStatusText);
+        Assert.AreEqual(expected, jobRow.ReportedStatusCellText);
+        Assert.AreEqual(expected, historyRow.ReportedStatusText);
+        Assert.AreEqual("N/A", ReportedStatusPresentation.ToDisplay(null, null));
+    }
+
+    [TestMethod]
+    public void HistoryStatus_UsesSameJobParsedValueWhenItsMessageHasNoStatus()
+    {
+        const string response = "**Status: INCOMPLETE — implementation and local validation completed; " +
+            "independent QA not performed.** The maximum steps for this agent have been reached.";
+        const string expected = "INCOMPLETE — implementation and local validation completed; " +
+            "independent QA not performed.";
+        var extraction = ReportedStatusParser.Extract(Complete(response, response.Length));
+        var entry = Entry(string.Empty, 240, Now.AddMinutes(-1), part: "other-part") with
+        {
+            MessageId = "other-message"
+        };
+
+        var row = new LiveActivityHistoryRowViewModel(entry, extraction, false);
+
+        Assert.AreEqual(expected, row.ReportedStatusText);
+        Assert.AreEqual(expected, row.ReportedStatusTooltip);
+    }
+
+    [TestMethod]
+    public void HistoryStatus_DoesNotUseAnotherJobsParsedValueAsFallback()
+    {
+        const string response = "**Status: INCOMPLETE — synthetic report.**";
+        var extraction = ReportedStatusParser.Extract(Complete(response, response.Length));
+        var foreignEntry = Entry(string.Empty, 240, Now.AddMinutes(-1), jobId: "job-other");
+
+        var row = new LiveActivityHistoryRowViewModel(foreignEntry, extraction, false);
+
+        Assert.AreEqual("N/A", row.ReportedStatusText);
+    }
+
+    [TestMethod]
+    public void JobAndHistoryStatus_ShareJobFallbackWhenHistoryExcerptIsHeadingOnly()
+    {
+        const string response = "## Status\n\n**INCOMPLETE** — implementation and local validation " +
+            "completed; independent QA not performed.";
+        var extraction = new ReportedStatusExtraction(
+            ReportedStatusState.Unavailable,
+            null,
+            Array.Empty<ReportedStatusDeclaration>(),
+            "synthetic unsupported Markdown context",
+            Complete(response, response.Length));
+        var entry = Entry("## Status", 240, Now.AddMinutes(-1), part: "history-part") with
+        {
+            MessageId = "history-message"
+        };
+
+        var jobRow = new JobRowViewModel(Snapshot([entry], reportedStatus: extraction));
+        var historyRow = jobRow.LiveActivityHistory.Single();
+
+        Assert.AreEqual("INCOMPLETE", jobRow.ReportedStatusCellText);
+        Assert.AreEqual(jobRow.ReportedStatusCellText, historyRow.ReportedStatusText);
+        Assert.AreEqual(
+            jobRow.ReportedStatusCellTooltip,
+            historyRow.ReportedStatusTooltip);
+    }
+
+    [TestMethod]
+    public void HistoryStatus_UsesJobFallbackFromJobOwnedActivityWhenExtractionIsAbsent()
+    {
+        const string response = "## Status\n\n**INCOMPLETE**";
+        var entry = Entry("## Status", 240, Now.AddMinutes(-1), part: "history-part");
+        var doing = Excerpt(response, "doing-part", 240);
+
+        var jobRow = new JobRowViewModel(Snapshot([entry], doing: doing));
+        var historyRow = jobRow.LiveActivityHistory.Single();
+
+        Assert.AreEqual("INCOMPLETE", jobRow.ReportedStatusCellText);
+        Assert.AreEqual("INCOMPLETE", historyRow.ReportedStatusText);
+    }
+
+    [TestMethod]
+    public void HistoryStatus_RefreshRebuildsTheSharedJobValue()
+    {
+        var entry = Entry("## Status", 240, Now.AddMinutes(-1), part: "history-part");
+        var row = new JobRowViewModel(Snapshot([entry]));
+
+        Assert.AreEqual("N/A", row.ReportedStatusCellText);
+        Assert.AreEqual("N/A", row.LiveActivityHistory.Single().ReportedStatusText);
+
+        const string response = "## Status\n\n**INCOMPLETE**";
+        row.Update(
+            Snapshot([entry], doing: Excerpt(response, "doing-part", 240)),
+            Now.AddMinutes(1));
+
+        Assert.AreEqual("INCOMPLETE", row.ReportedStatusCellText);
+        Assert.AreEqual("INCOMPLETE", row.LiveActivityHistory.Single().ReportedStatusText);
+    }
+
+    [TestMethod]
+    public void HistoryStatus_PrefersUsableRowLocalValueOverTheJobFallback()
+    {
+        var jobStatus = new ReportedStatusPresentation.JobReportedStatus("job", "INCOMPLETE");
+        var row = new LiveActivityHistoryRowViewModel(
+            Entry("**Status: DONE**", 100, Now.AddMinutes(-1), part: "p"),
+            null,
+            false,
+            jobStatus);
+
+        Assert.AreEqual("DONE", row.ReportedStatusText);
+        Assert.AreEqual("DONE", row.ReportedStatusTooltip);
+    }
+
+    [TestMethod]
+    public void HistoryStatus_DoesNotApplyAnotherJobsJobFallback()
+    {
+        var foreignJobStatus =
+            new ReportedStatusPresentation.JobReportedStatus("job-other", "INCOMPLETE");
+        var row = new LiveActivityHistoryRowViewModel(
+            Entry("## Status", 100, Now.AddMinutes(-1), part: "p"),
+            null,
+            false,
+            foreignJobStatus);
+
+        Assert.AreEqual("N/A", row.ReportedStatusText);
+    }
+
+    [TestMethod]
+    public void HistoryStatus_UsesJobFallbackForBlankRowText()
+    {
+        var jobStatus = new ReportedStatusPresentation.JobReportedStatus("job", "INCOMPLETE");
+        var row = new LiveActivityHistoryRowViewModel(
+            Entry(string.Empty, 100, Now.AddMinutes(-1), part: "p"),
+            null,
+            false,
+            jobStatus);
+
+        Assert.AreEqual("INCOMPLETE", row.ReportedStatusText);
+        Assert.AreEqual("INCOMPLETE", row.ReportedStatusTooltip);
     }
 
     [TestMethod]

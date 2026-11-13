@@ -87,72 +87,19 @@ public sealed class JobRowViewModel : ObservableObject
     public string ReportedStatusTooltip => ReportedStatusPresentation.ToTooltip(Snapshot.ReportedStatus);
 
     /// <summary>
-    /// Table cell value. It uses the same normalized first-line policy as the
-    /// activity history: the job's owned reported source text when available,
-    /// then its owned reported value, then its owned text activity. The result
-    /// remains unverified and never establishes execution status.
+    /// Table cell value. It uses the same shared job-level resolution as the
+    /// job's Live Activity history rows: the parsed reported value, then a
+    /// job-owned text fallback, or the neutral placeholder. It remains
+    /// observational only.
     /// </summary>
     public string ReportedStatusCellText =>
-        TryGetNormalizedReportedStatus(out var value)
-            ? value
-            : ReportedStatusPresentation.Unavailable;
+        ReportedStatusPresentation.ResolveJobReportedStatus(Snapshot).Value;
 
     /// <summary>
-    /// Table cell tooltip. It uses the same normalized first-line value as the
+    /// Table cell tooltip. It uses the same normalized value as the
     /// corresponding activity history row.
     /// </summary>
-    public string ReportedStatusCellTooltip =>
-        TryGetNormalizedReportedStatus(out var value)
-            ? LiveActivityStatusLinePolicy.Tooltip(value)
-            : ReportedStatusPresentation.ToTooltip(null);
-
-    private bool TryGetNormalizedReportedStatus(out string value)
-    {
-        value = string.Empty;
-        var status = Snapshot.ReportedStatus;
-
-        // Prefer the raw complete report only when it is owned by this job.
-        // This keeps the normalized first line identical to the corresponding
-        // activity history row without mixing another job's text.
-        if (status?.Source is { } source &&
-            string.Equals(source.JobId, Snapshot.JobId, StringComparison.Ordinal) &&
-            !string.IsNullOrWhiteSpace(source.Text) &&
-            LiveActivityStatusLinePolicy.Extract(source.Text) is { } sourceValue)
-        {
-            value = sourceValue;
-            return true;
-        }
-
-        if (status is { HasValue: true, Value: not null } &&
-            LiveActivityStatusLinePolicy.Extract(status.Value) is { } reportedValue)
-        {
-            value = reportedValue;
-            return true;
-        }
-
-        if (TryGetJobActivity(out var activity) &&
-            activity.Kind.Contains("text", StringComparison.OrdinalIgnoreCase) &&
-            LiveActivityStatusLinePolicy.Extract(activity.Text) is { } activityValue)
-        {
-            value = activityValue;
-            return true;
-        }
-
-        return false;
-    }
-
-    private bool TryGetJobActivity(out ActivityExcerpt activity)
-    {
-        if (Snapshot.LiveActivity.Doing is { } doing &&
-            string.Equals(doing.JobId, Snapshot.JobId, StringComparison.Ordinal))
-        {
-            activity = doing;
-            return true;
-        }
-
-        activity = null!;
-        return false;
-    }
+    public string ReportedStatusCellTooltip => ReportedStatusCellText;
 
     /// <summary>
     /// True when Forge metadata reports an active job, or recent job-scoped
@@ -1027,11 +974,16 @@ public sealed class JobRowViewModel : ObservableObject
             snapshot.LiveActivity.History.Where(entry =>
                 string.Equals(entry.JobId, snapshot.JobId, StringComparison.Ordinal)));
         var doing = snapshot.LiveActivity.Doing;
+        // Resolve the job-level value once from this snapshot and reuse it for
+        // every row; rows still prefer their own exact/report-local value.
+        var jobReportedStatus =
+            ReportedStatusPresentation.ResolveJobReportedStatus(snapshot);
         var rows = entries
             .Select(entry => new LiveActivityHistoryRowViewModel(
                 entry,
                 snapshot.ReportedStatus,
-                _monitoringActive && MatchesCurrentActiveTarget(snapshot, doing, entry)))
+                _monitoringActive && MatchesCurrentActiveTarget(snapshot, doing, entry),
+                jobReportedStatus))
             .ToArray();
         _liveActivityHistory = rows;
         // Reset the ItemsSource before restoring selection so a DataGrid that

@@ -374,8 +374,8 @@ public sealed class LiveActivityHistoryTests
         StringAssert.Contains(olderRow.DurationTooltip, "no reliable same-part");
         Assert.AreEqual("—", unknownRow.StartedText);
 
-        // The history status now shows the normalized first line for this row.
-        Assert.AreEqual("DONE but older", olderRow.ReportedStatusText);
+        // An exact matching parsed report supplies the same value shown in the jobs table.
+        Assert.AreEqual("DONE", olderRow.ReportedStatusText);
         Assert.AreEqual(olderRow.ReportedStatusText, olderRow.ReportedStatusTooltip);
         Assert.AreEqual("current text", newerRow.ReportedStatusText);
         Assert.AreEqual(newerRow.ReportedStatusText, newerRow.ReportedStatusTooltip);
