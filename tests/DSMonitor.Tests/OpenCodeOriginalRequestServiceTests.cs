@@ -539,6 +539,98 @@ public sealed class OpenCodeOriginalRequestServiceTests
         Assert.AreEqual(2, executor.CallCount);
     }
 
+    [DataTestMethod]
+    [DataRow(1)]
+    [DataRow(2)]
+    [DataRow(3)]
+    [DataRow(6)]
+    public async Task ObservedCorrelation_ManyJobsAcrossPages_SelectsEachRequest(int jobCount)
+    {
+        var pages = new List<string>();
+        for (var i = 0; i < jobCount; i++)
+        {
+            pages.Add(StreamPage(
+                i + 1 < jobCount ? $"cursor_{i + 1}" : null,
+                ($"msg_user_{i}", "user", $"request {i}\nтест"),
+                ($"msg_assistant_{i}_a", "assistant", null),
+                ($"msg_assistant_{i}_b", "assistant", null)));
+        }
+
+        var executor = new FakeExecutor((request, _) =>
+        {
+            var query = request.ArgumentList[2];
+            var index = 0;
+            for (var i = 1; i < jobCount; i++)
+            {
+                if (query.Contains($"cursor=cursor_{i}", StringComparison.Ordinal))
+                {
+                    index = i;
+                    break;
+                }
+            }
+            return Task.FromResult(Execution(pages[index]));
+        });
+        using var service = CreateService(executor, maxPages: jobCount + 1);
+
+        for (var i = 0; i < jobCount; i++)
+        {
+            var result = await service.GetOriginalRequestAsync(
+                $"job_{i}", "ses_many", null, CancellationToken.None,
+                observedAssistantMessageIds: new[]
+                {
+                    $"msg_assistant_{i}_a", $"msg_assistant_{i}_b"
+                });
+            Assert.AreEqual(OriginalRequestStatus.ObservedJobCorrelation, result.Status, $"Job {i}");
+            Assert.AreEqual($"request {i}\nтест", result.Text, $"Job {i}");
+        }
+    }
+
+    [DataTestMethod]
+    [DataRow(2)]
+    [DataRow(3)]
+    [DataRow(6)]
+    public async Task ObservedCorrelation_InterleavedJobAcrossRequests_IsAmbiguous(int requestCount)
+    {
+        var messages = new List<(string Id, string Type, string? Text)>();
+        for (var i = 0; i < requestCount; i++)
+        {
+            messages.Add(($"msg_user_{i}", "user", $"request {i}"));
+            messages.Add(($"msg_assistant_{i}", "assistant", null));
+        }
+        messages.Add(("msg_assistant_late", "assistant", null));
+        var executor = new FakeExecutor((_, _) =>
+            Task.FromResult(Execution(StreamPage(null, messages.ToArray()))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_overlap", "ses_overlap", null, CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant_0", "msg_assistant_late" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    [Ignore("Known V1 limitation: ownership claims are evaluated per job; the service does not yet coordinate assistant message IDs claimed by different jobs in the same session.")]
+    public async Task ObservedCorrelation_SameAssistantClaimedByTwoJobs_IsAmbiguous()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(null,
+                ("msg_user_shared", "user", "request"),
+                ("msg_assistant_shared", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        await service.GetOriginalRequestAsync(
+            "job_first", "ses_shared", null, CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant_shared" });
+        var second = await service.GetOriginalRequestAsync(
+            "job_second", "ses_shared", null, CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant_shared" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, second.Status);
+        Assert.AreEqual(string.Empty, second.Text);
+    }
+
     [TestMethod]
     public async Task MultipleUserMessages_AreAmbiguousRegardlessOfJobStart()
     {
