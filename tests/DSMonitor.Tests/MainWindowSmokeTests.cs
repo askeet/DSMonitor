@@ -154,6 +154,101 @@ public sealed class MainWindowSmokeTests
         }
     }
 
+    [TestMethod]
+    public void LiveActivity_CollapseStatesAreIndependentAndRemainAcrossJobChanges()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var jobA = "job_mw8vbgms_9e9j";
+        var jobB = "job_mw720wzm_4xgv";
+        _workspace.WriteMetadata(jobA, now.AddMinutes(-2).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds());
+        _workspace.WriteMetadata(jobB, now.AddMinutes(-1).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds());
+
+        var window = CreateWindow();
+        try
+        {
+            var viewModel = (MainViewModel)window.DataContext;
+            viewModel.ApplySnapshot(new MonitoringSnapshot
+            {
+                ObservedAt = now,
+                State = MonitoringState.Monitoring,
+                ForgeDirectoryAvailable = true,
+                Jobs = new[]
+                {
+                    CreateJobSnapshot(jobA, ForgeJobStatus.Running, now),
+                    CreateJobSnapshot(jobB, ForgeJobStatus.Done, now)
+                },
+                Warnings = Array.Empty<string>()
+            });
+            ShowAndLayout(window);
+
+            var originalToggle = (Button)window.FindName("OriginalRequestCollapseButton");
+            var selectedToggle = (Button)window.FindName("SelectedMessageCollapseButton");
+            var originalText = (TextBox)window.FindName("OriginalRequestTextBox");
+            var selectedText = (TextBox)window.FindName("SelectedActivityTextBox");
+            var liveGrid = (Grid)window.FindName("LiveActivityGrid");
+
+            Assert.AreEqual(Visibility.Visible, originalText.Visibility);
+            Assert.AreEqual(Visibility.Visible, selectedText.Visibility);
+
+            originalToggle.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert.AreEqual(Visibility.Collapsed, originalText.Visibility);
+            Assert.AreEqual(Visibility.Visible, selectedText.Visibility);
+            Assert.AreEqual(GridUnitType.Star, liveGrid.RowDefinitions[3].Height.GridUnitType);
+
+            selectedToggle.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert.AreEqual(Visibility.Collapsed, selectedText.Visibility);
+            Assert.AreEqual(GridUnitType.Star, liveGrid.RowDefinitions[3].Height.GridUnitType);
+            Assert.IsTrue(liveGrid.RowDefinitions[3].ActualHeight >= 120);
+
+            viewModel.SelectedJob = viewModel.Jobs.Single(job => job.JobId == jobA);
+            Assert.AreEqual(Visibility.Collapsed, originalText.Visibility);
+            Assert.AreEqual(Visibility.Collapsed, selectedText.Visibility);
+            viewModel.SelectedJob = viewModel.Jobs.Single(job => job.JobId == jobB);
+            Assert.AreEqual(Visibility.Collapsed, originalText.Visibility);
+            Assert.AreEqual(Visibility.Collapsed, selectedText.Visibility);
+
+            originalToggle.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert.AreEqual(Visibility.Visible, originalText.Visibility);
+            Assert.AreEqual(Visibility.Collapsed, selectedText.Visibility);
+            Assert.AreEqual(GridUnitType.Star, liveGrid.RowDefinitions[1].Height.GridUnitType);
+
+            selectedToggle.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert.AreEqual(Visibility.Visible, selectedText.Visibility);
+            Assert.AreEqual(new GridLength(76), liveGrid.RowDefinitions[1].Height);
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    [TestMethod]
+    public void FullTextDialog_PreservesExactTextAndCopyAllUsesCompleteSource()
+    {
+        const string source = "First line\r\n  indented \u03bb\nlast line  ";
+        string? copied = null;
+        var dialog = FullTextDialog.Create("Response", source, 12, value => copied = value);
+        var textBox = (TextBox)dialog.FindName("FullTextDialogTextBox");
+        var fontPicker = (ComboBox)dialog.FindName("FullTextDialogFontPicker");
+        var copyButton = (Button)dialog.FindName("FullTextDialogCopyAllButton");
+        var sectionTitle = (TextBlock)dialog.FindName("FullTextDialogTitle");
+
+        Assert.AreEqual("Response", dialog.Title);
+        Assert.AreEqual(dialog.Title, sectionTitle.Text);
+        Assert.AreEqual(source, textBox.Text);
+        Assert.IsTrue(textBox.IsReadOnly);
+        Assert.AreEqual(TextWrapping.Wrap, textBox.TextWrapping);
+        Assert.AreEqual(ScrollBarVisibility.Disabled, textBox.HorizontalScrollBarVisibility);
+        Assert.AreEqual(12, textBox.FontSize);
+        Assert.AreEqual(12, fontPicker.Items[0]);
+
+        fontPicker.SelectedItem = 16d;
+        Assert.AreEqual(16d, textBox.FontSize);
+
+        copyButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Assert.AreEqual(source, copied);
+    }
+
     private ForgeJobSnapshot CreateJobSnapshot(
         string jobId,
         ForgeJobStatus status,

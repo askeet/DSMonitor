@@ -908,7 +908,7 @@ public sealed class JobLiveActivityTests
         var initialRow1 = new JobRowViewModel(initial1);
         Assert.AreEqual("DONE", initialRow0.ReportedStatusText);
         Assert.AreEqual("RUNNING", initialRow1.ReportedStatusText);
-        StringAssert.Contains(initialRow0.ReportedStatusTooltip, "unverified agent-reported");
+        Assert.AreEqual(initialRow0.ReportedStatusText, initialRow0.ReportedStatusTooltip);
 
         // Refresh only job0; job1 must keep its own message-bound value.
         workspace.AppendLog(

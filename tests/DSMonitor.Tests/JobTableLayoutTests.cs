@@ -139,9 +139,10 @@ public sealed class JobTableLayoutTests
             Assert.IsNotNull(label);
             Assert.AreEqual("elapsed / observed span", label.Text);
 
-            var projectPath = window.FindName("SelectedJobProjectPath") as TextBlock;
+            var projectPath = window.FindName("SelectedJobProjectPath") as TextBox;
             Assert.IsNotNull(projectPath, "The details project path must remain present.");
-            var projectBinding = BindingOperations.GetBinding(projectPath, TextBlock.TextProperty);
+            Assert.IsTrue(projectPath.IsReadOnly, "Overview values must remain selectable without being editable.");
+            var projectBinding = BindingOperations.GetBinding(projectPath, TextBox.TextProperty);
             Assert.IsNotNull(projectBinding);
             Assert.AreEqual("ProjectTooltip", projectBinding.Path.Path);
         }

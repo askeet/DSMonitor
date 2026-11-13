@@ -20,13 +20,6 @@ public static class ReportedStatusPresentation
 {
     public const string Unavailable = "N/A";
 
-    private const string UnverifiedTooltipSuffix =
-        " — unverified agent-reported text; not authoritative Forge execution status.";
-
-    private const string UnavailableTooltip =
-        "N/A — unverified agent-reported status text is unavailable or not unambiguous; " +
-        "not authoritative Forge execution status.";
-
     /// <summary>
     /// Runtime display: the complete reported value, or the neutral
     /// placeholder. The view applies ellipsis; no character limit is imposed.
@@ -37,13 +30,10 @@ public static class ReportedStatusPresentation
             : Unavailable;
 
     /// <summary>
-    /// Runtime tooltip: the complete, untruncated reported value with a clear
-    /// unverified-agent-reported label, or a neutral placeholder explanation.
+    /// Runtime tooltip: the complete reported value or the same neutral
+    /// placeholder shown in the cell.
     /// </summary>
-    public static string ToTooltip(ReportedStatusExtraction? extraction) =>
-        TryGetReportedValue(extraction, out var value)
-            ? value + UnverifiedTooltipSuffix
-            : UnavailableTooltip;
+    public static string ToTooltip(ReportedStatusExtraction? extraction) => ToDisplay(extraction);
 
     /// <summary>
     /// Returns one unambiguous non-empty reported value. The value is still

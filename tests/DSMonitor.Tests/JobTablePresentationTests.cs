@@ -215,17 +215,14 @@ public sealed class JobTablePresentationTests
     }
 
     [TestMethod]
-    public void ReportedStatus_ReportedValueIsDisplayedWithUnverifiedTooltip()
+    public void ReportedStatus_TooltipContainsOnlyTheReportedValue()
     {
         var extraction = Extract("Status: DONE");
         Assert.AreEqual(ReportedStatusState.Reported, extraction.State);
 
         Assert.AreEqual("DONE", ReportedStatusPresentation.ToDisplay(extraction));
         var tooltip = ReportedStatusPresentation.ToTooltip(extraction);
-        StringAssert.StartsWith(tooltip, "DONE");
-        StringAssert.Contains(tooltip, "unverified agent-reported");
-        StringAssert.Contains(tooltip, "not authoritative");
-        Assert.IsFalse(tooltip.Contains("deferred", StringComparison.OrdinalIgnoreCase));
+        Assert.AreEqual("DONE", tooltip);
 
         var row = new JobRowViewModel(Snapshot(reportedStatus: extraction));
         Assert.AreEqual("DONE", row.ReportedStatusText);
@@ -266,13 +263,12 @@ public sealed class JobTablePresentationTests
         {
             Assert.AreEqual("N/A", ReportedStatusPresentation.ToDisplay(extraction));
             var tooltip = ReportedStatusPresentation.ToTooltip(extraction);
-            StringAssert.Contains(tooltip, "N/A");
-            StringAssert.Contains(tooltip, "unverified");
+            Assert.AreEqual("N/A", tooltip);
         }
     }
 
     [TestMethod]
-    public void ReportedStatus_RolelessValueIsDisplayedAsUnverified()
+    public void ReportedStatus_RolelessValueTooltipContainsOnlyTheReportedValue()
     {
         var roleless = ReportedStatusParser.Extract(
             Complete("Status: DONE", "Observed roleless text — unverified"));
@@ -280,9 +276,7 @@ public sealed class JobTablePresentationTests
         Assert.IsFalse(roleless.IsRoleVerified);
 
         Assert.AreEqual("DONE", ReportedStatusPresentation.ToDisplay(roleless));
-        StringAssert.Contains(
-            ReportedStatusPresentation.ToTooltip(roleless),
-            "unverified agent-reported");
+        Assert.AreEqual("DONE", ReportedStatusPresentation.ToTooltip(roleless));
     }
 
     [TestMethod]
@@ -295,9 +289,7 @@ public sealed class JobTablePresentationTests
         var display = ReportedStatusPresentation.ToDisplay(extraction);
 
         Assert.AreEqual(longValue, display);
-        Assert.AreEqual(
-            longValue + " — unverified agent-reported text; not authoritative Forge execution status.",
-            ReportedStatusPresentation.ToTooltip(extraction));
+        Assert.AreEqual(longValue, ReportedStatusPresentation.ToTooltip(extraction));
     }
 
     [TestMethod]
@@ -308,9 +300,7 @@ public sealed class JobTablePresentationTests
         var extraction = Extract("Status: **" + exact + "**");
 
         Assert.AreEqual(exact, ReportedStatusPresentation.ToDisplay(extraction));
-        Assert.AreEqual(
-            exact + " — unverified agent-reported text; not authoritative Forge execution status.",
-            ReportedStatusPresentation.ToTooltip(extraction));
+        Assert.AreEqual(exact, ReportedStatusPresentation.ToTooltip(extraction));
     }
 
     [TestMethod]
@@ -391,10 +381,7 @@ public sealed class JobTablePresentationTests
         StringAssert.StartsWith(
             row.ReportedStatusCellTooltip,
             "Inspecting the bounded synthetic source and preparing the next step");
-        StringAssert.Contains(
-            row.ReportedStatusCellTooltip,
-            "unverified first-line activity text");
-        StringAssert.Contains(row.ReportedStatusCellTooltip, "not authoritative");
+        Assert.AreEqual(row.ReportedStatusCellText, row.ReportedStatusCellTooltip);
     }
 
     [TestMethod]
@@ -405,9 +392,7 @@ public sealed class JobTablePresentationTests
             liveActivity: Activity("Still working on another step.")));
 
         Assert.AreEqual("DONE", row.ReportedStatusCellText);
-        Assert.AreEqual(
-            LiveActivityStatusLinePolicy.Tooltip("DONE"),
-            row.ReportedStatusCellTooltip);
+        Assert.AreEqual("DONE", row.ReportedStatusCellTooltip);
     }
 
     [TestMethod]

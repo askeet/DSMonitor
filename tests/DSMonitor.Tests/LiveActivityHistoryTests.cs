@@ -376,11 +376,9 @@ public sealed class LiveActivityHistoryTests
 
         // The history status now shows the normalized first line for this row.
         Assert.AreEqual("DONE but older", olderRow.ReportedStatusText);
-        StringAssert.Contains(
-            olderRow.ReportedStatusTooltip,
-            "unverified first-line activity text");
+        Assert.AreEqual(olderRow.ReportedStatusText, olderRow.ReportedStatusTooltip);
         Assert.AreEqual("current text", newerRow.ReportedStatusText);
-        StringAssert.Contains(newerRow.ReportedStatusTooltip, "not authoritative");
+        Assert.AreEqual(newerRow.ReportedStatusText, newerRow.ReportedStatusTooltip);
         Assert.AreEqual("unknown text", unknownRow.ReportedStatusText);
 
         // Only the exact current Doing target is a defensible spinner.

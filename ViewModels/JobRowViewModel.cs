@@ -83,7 +83,7 @@ public sealed class JobRowViewModel : ObservableObject
     /// </summary>
     public string ReportedStatusText => ReportedStatusPresentation.ToDisplay(Snapshot.ReportedStatus);
 
-    /// <summary>Unverified agent-reported text with the complete untruncated value.</summary>
+    /// <summary>The complete untruncated agent-reported value shown in the cell.</summary>
     public string ReportedStatusTooltip => ReportedStatusPresentation.ToTooltip(Snapshot.ReportedStatus);
 
     /// <summary>
@@ -98,8 +98,8 @@ public sealed class JobRowViewModel : ObservableObject
             : ReportedStatusPresentation.Unavailable;
 
     /// <summary>
-    /// Table cell tooltip. It uses the same normalized first-line value and
-    /// unverified wording as the corresponding activity history row.
+    /// Table cell tooltip. It uses the same normalized first-line value as the
+    /// corresponding activity history row.
     /// </summary>
     public string ReportedStatusCellTooltip =>
         TryGetNormalizedReportedStatus(out var value)

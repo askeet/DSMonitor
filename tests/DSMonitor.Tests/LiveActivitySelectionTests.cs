@@ -230,10 +230,7 @@ public sealed class LiveActivitySelectionTests
             false);
 
         Assert.AreEqual(expected, row.ReportedStatusText);
-        StringAssert.StartsWith(row.ReportedStatusTooltip, expected);
-        StringAssert.Contains(
-            row.ReportedStatusTooltip,
-            "unverified first-line activity text");
+        Assert.AreEqual(expected, row.ReportedStatusTooltip);
     }
 
     [DataTestMethod]
@@ -303,9 +300,7 @@ public sealed class LiveActivitySelectionTests
         var row = new LiveActivityHistoryRowViewModel(entry, extraction, false);
 
         Assert.AreEqual("DONE", row.ReportedStatusText);
-        StringAssert.Contains(
-            row.ReportedStatusTooltip,
-            "unverified first-line activity text");
+        Assert.AreEqual("DONE", row.ReportedStatusTooltip);
     }
 
     [TestMethod]

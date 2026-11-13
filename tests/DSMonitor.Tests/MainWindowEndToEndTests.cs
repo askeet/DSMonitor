@@ -319,7 +319,9 @@ public sealed class MainWindowEndToEndTests
         {
             Assert.IsNotNull(job.SelectedActivity);
             Assert.AreEqual("unverified prompt", job.SelectedActivity!.ReportedStatusText);
-            StringAssert.Contains(job.SelectedActivity.ReportedStatusTooltip, "unverified");
+            Assert.AreEqual(
+                job.SelectedActivity.ReportedStatusText,
+                job.SelectedActivity.ReportedStatusTooltip);
         }
     }
 

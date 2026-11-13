@@ -79,11 +79,21 @@
             <Setter Property="VerticalAlignment" Value="Top" />
         </Style>
 
-        <Style x:Key="DetailValue" TargetType="TextBlock">
+        <Style x:Key="CopyableDetailValue" TargetType="TextBox">
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
             <Setter Property="FontSize" Value="12.5" />
             <Setter Property="TextWrapping" Value="Wrap" />
             <Setter Property="Margin" Value="0,0,0,12" />
+            <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="IsReadOnlyCaretVisible" Value="True" />
+            <Setter Property="AcceptsReturn" Value="True" />
+            <Setter Property="VerticalScrollBarVisibility" Value="Disabled" />
+            <Setter Property="HorizontalScrollBarVisibility" Value="Disabled" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Cursor" Value="IBeam" />
         </Style>
 
         <Style x:Key="DashboardButton" TargetType="Button">
@@ -890,7 +900,7 @@
                                     Margin="20,0,20,16"
                                     DataContext="{Binding SelectedJob}">
                             <TabItem Header="Live Activity" Style="{StaticResource TabItemStyle}">
-                                <Grid>
+                                <Grid x:Name="LiveActivityGrid">
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
@@ -900,12 +910,35 @@
                                         <RowDefinition Height="2*" />
                                     </Grid.RowDefinitions>
 
-                                    <TextBlock Text="Original Request"
-                                               Foreground="{StaticResource TextPrimary}"
-                                               FontSize="12.5"
-                                               FontWeight="SemiBold"
-                                               VerticalAlignment="Center"
-                                               Margin="0,0,0,6" />
+                                    <Grid Grid.Row="0" Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                            <Button x:Name="OriginalRequestCollapseButton"
+                                                    Content="−"
+                                                    Style="{StaticResource GhostButton}"
+                                                    Padding="5,0"
+                                                    MinWidth="22"
+                                                    Height="22"
+                                                    Margin="0,0,6,0"
+                                                    Click="OriginalRequestCollapseButton_Click"
+                                                    AutomationProperties.Name="Collapse original request" />
+                                            <TextBlock Text="Original Request"
+                                                       Foreground="{StaticResource TextPrimary}"
+                                                       FontSize="12.5"
+                                                       FontWeight="SemiBold"
+                                                       VerticalAlignment="Center" />
+                                        </StackPanel>
+                                        <Button x:Name="OriginalRequestShowAllButton"
+                                                Grid.Column="2"
+                                                Content="Show All"
+                                                Style="{StaticResource GhostButton}"
+                                                Padding="8,2"
+                                                Click="OriginalRequestShowAllButton_Click" />
+                                    </Grid>
 
                                     <TextBox x:Name="OriginalRequestTextBox"
                                              Grid.Row="1"
@@ -918,7 +951,6 @@
                                              VerticalScrollBarVisibility="Auto"
                                              HorizontalScrollBarVisibility="Disabled"
                                              MinHeight="56"
-                                             MaxHeight="88"
                                              Background="#0F141B"
                                              Foreground="{StaticResource TextPrimary}"
                                              BorderBrush="{StaticResource BorderSoft}"
@@ -926,7 +958,7 @@
                                              Padding="8"
                                              Margin="0,0,0,10"
                                              FontFamily="Cascadia Mono, Consolas"
-                                             FontSize="11.5"
+                                             FontSize="12"
                                              AutomationProperties.Name="Original request" />
 
                                     <Grid Grid.Row="2" Margin="0,0,0,6">
@@ -947,7 +979,6 @@
                                                   Style="{StaticResource LiveActivityHistoryGrid}"
                                                   ItemsSource="{Binding LiveActivityHistory}"
                                                   SelectedItem="{Binding SelectedActivity, Mode=TwoWay}"
-                                                  MinHeight="120"
                                                   AutomationProperties.Name="Live activity history">
                                             <DataGrid.Columns>
                                                 <DataGridTemplateColumn Header="Started"
@@ -1007,12 +1038,24 @@
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="Auto" />
                                             <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
-                                        <TextBlock Text="Selected Message"
-                                                   Foreground="{StaticResource TextPrimary}"
-                                                   FontSize="12.5"
-                                                   FontWeight="SemiBold"
-                                                   VerticalAlignment="Center" />
+                                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                            <Button x:Name="SelectedMessageCollapseButton"
+                                                    Content="−"
+                                                    Style="{StaticResource GhostButton}"
+                                                    Padding="5,0"
+                                                    MinWidth="22"
+                                                    Height="22"
+                                                    Margin="0,0,6,0"
+                                                    Click="SelectedMessageCollapseButton_Click"
+                                                    AutomationProperties.Name="Collapse response" />
+                                            <TextBlock Text="Response"
+                                                       Foreground="{StaticResource TextPrimary}"
+                                                       FontSize="12.5"
+                                                       FontWeight="SemiBold"
+                                                       VerticalAlignment="Center" />
+                                        </StackPanel>
                                         <TextBlock Grid.Column="1"
                                                    Text="{Binding SelectedActivityCompletenessText}"
                                                    Foreground="{StaticResource TextMuted}"
@@ -1022,6 +1065,12 @@
                                                    Margin="12,0,0,0"
                                                    TextTrimming="CharacterEllipsis"
                                                    Visibility="{Binding SelectedActivityTextIsComplete, Converter={StaticResource InverseBoolToVisibility}}" />
+                                        <Button x:Name="SelectedMessageShowAllButton"
+                                                Grid.Column="2"
+                                                Content="Show All"
+                                                Style="{StaticResource GhostButton}"
+                                                Padding="8,2"
+                                                Click="SelectedMessageShowAllButton_Click" />
                                     </Grid>
 
                                     <TextBox x:Name="SelectedActivityTextBox"
@@ -1040,8 +1089,8 @@
                                              BorderThickness="1"
                                              Padding="8"
                                              FontFamily="Cascadia Mono, Consolas"
-                                             FontSize="11.5"
-                                             AutomationProperties.Name="Selected message" />
+                                             FontSize="12"
+                                             AutomationProperties.Name="Response" />
                                 </Grid>
                             </TabItem>
 
@@ -1067,39 +1116,42 @@
                                             </Grid.RowDefinitions>
 
                                             <TextBlock Text="Job ID" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Column="1" Text="{Binding JobId}" Style="{StaticResource DetailValue}"
-                                                       FontFamily="Cascadia Mono, Consolas" />
+                                            <TextBox Grid.Column="1" Text="{Binding JobId, Mode=OneWay}" Style="{StaticResource CopyableDetailValue}"
+                                                     FontFamily="Cascadia Mono, Consolas" />
 
                                             <TextBlock Grid.Row="1" Text="OpenCode session" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SessionText}" Style="{StaticResource DetailValue}"
-                                                       FontFamily="Cascadia Mono, Consolas" />
+                                            <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding SessionText, Mode=OneWay}" Style="{StaticResource CopyableDetailValue}"
+                                                     FontFamily="Cascadia Mono, Consolas" />
 
                                             <TextBlock Grid.Row="2" Text="Project path" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Row="2" Grid.Column="1" x:Name="SelectedJobProjectPath" Text="{Binding ProjectTooltip}" Style="{StaticResource DetailValue}" />
+                                            <TextBox Grid.Row="2" Grid.Column="1" x:Name="SelectedJobProjectPath" Text="{Binding ProjectTooltip, Mode=OneWay}" Style="{StaticResource CopyableDetailValue}" />
 
                                             <TextBlock Grid.Row="3" Text="Model / agent" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ModelText}" Style="{StaticResource DetailValue}" />
+                                            <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding ModelText, Mode=OneWay}" Style="{StaticResource CopyableDetailValue}" />
 
                                             <TextBlock Grid.Row="4" Text="Started" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding StartedText}" Style="{StaticResource DetailValue}" />
+                                            <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding StartedText, Mode=OneWay}" Style="{StaticResource CopyableDetailValue}" />
 
                                             <TextBlock Grid.Row="5" Text="Forge status" Style="{StaticResource DetailLabel}" />
                                             <StackPanel Grid.Row="5" Grid.Column="1" Margin="0,0,0,12">
-                                                <TextBlock Text="{Binding StatusText}"
-                                                           Foreground="{Binding Snapshot.Status, Converter={StaticResource ForgeStatusBrush}}"
-                                                           FontSize="12.5"
-                                                           FontWeight="SemiBold" />
-                                                <TextBlock Text="{Binding ForgeStatusLabel}"
-                                                           Foreground="{StaticResource TextMuted}"
-                                                           FontSize="10.5"
-                                                           Margin="0,2,0,0" />
+                                                <TextBox Text="{Binding StatusText, Mode=OneWay}"
+                                                         Foreground="{Binding Snapshot.Status, Converter={StaticResource ForgeStatusBrush}}"
+                                                         FontSize="12.5"
+                                                         FontWeight="SemiBold"
+                                                         Style="{StaticResource CopyableDetailValue}"
+                                                         Margin="0" />
+                                                <TextBox Text="{Binding ForgeStatusLabel, Mode=OneWay}"
+                                                         Foreground="{StaticResource TextMuted}"
+                                                         FontSize="10.5"
+                                                         Style="{StaticResource CopyableDetailValue}"
+                                                         Margin="0,2,0,0" />
                                             </StackPanel>
 
                                             <TextBlock Grid.Row="6" Text="Last activity" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding LastActivityText}" Style="{StaticResource DetailValue}" />
+                                            <TextBox Grid.Row="6" Grid.Column="1" Text="{Binding LastActivityText, Mode=OneWay}" Style="{StaticResource CopyableDetailValue}" />
 
                                             <TextBlock Grid.Row="7" Text="Observed events" Style="{StaticResource DetailLabel}" />
-                                            <TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding EventCountText}" Style="{StaticResource DetailValue}" />
+                                            <TextBox Grid.Row="7" Grid.Column="1" Text="{Binding EventCountText, Mode=OneWay}" Style="{StaticResource CopyableDetailValue}" />
                                         </Grid>
 
                                         <Border Background="#0F141B"
@@ -1113,14 +1165,17 @@
                                                            Foreground="{StaticResource TextMuted}"
                                                            FontSize="10"
                                                            FontWeight="SemiBold" />
-                                                <TextBlock Text="{Binding DeadlineText}"
-                                                           Foreground="{StaticResource TextPrimary}"
-                                                           FontSize="12"
-                                                           Margin="0,4,0,2" />
-                                                <TextBlock Text="{Binding DeadlineDetail}"
-                                                           Foreground="{StaticResource TextSecondary}"
-                                                           FontSize="10.5"
-                                                           TextWrapping="Wrap" />
+                                                <TextBox Text="{Binding DeadlineText, Mode=OneWay}"
+                                                         Foreground="{StaticResource TextPrimary}"
+                                                         FontSize="12"
+                                                         Margin="0,4,0,2"
+                                                         Style="{StaticResource CopyableDetailValue}" />
+                                                <TextBox Text="{Binding DeadlineDetail, Mode=OneWay}"
+                                                         Foreground="{StaticResource TextSecondary}"
+                                                         FontSize="10.5"
+                                                         TextWrapping="Wrap"
+                                                         Style="{StaticResource CopyableDetailValue}"
+                                                         Margin="0" />
                                             </StackPanel>
                                         </Border>
 
@@ -1136,11 +1191,12 @@
                                                            Foreground="#8AD3A6"
                                                            FontSize="10"
                                                            FontWeight="SemiBold" />
-                                                <TextBlock Text="{Binding WarningsText}"
-                                                           Foreground="{StaticResource TextSecondary}"
-                                                           FontSize="10.5"
-                                                           TextWrapping="Wrap"
-                                                           Margin="0,4,0,0" />
+                                                <TextBox Text="{Binding WarningsText, Mode=OneWay}"
+                                                         Foreground="{StaticResource TextSecondary}"
+                                                         FontSize="10.5"
+                                                         TextWrapping="Wrap"
+                                                         Style="{StaticResource CopyableDetailValue}"
+                                                         Margin="0,4,0,0" />
                                             </StackPanel>
                                         </Border>
 

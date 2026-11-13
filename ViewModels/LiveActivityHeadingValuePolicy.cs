@@ -13,10 +13,7 @@ namespace DSMonitor.ViewModels;
 /// </summary>
 internal static class LiveActivityStatusLinePolicy
 {
-    public const string UnverifiedSuffix =
-        " — unverified first-line activity text; not authoritative Forge execution status or completion.";
-
-    public static string Tooltip(string value) => value + UnverifiedSuffix;
+    public static string Tooltip(string value) => value;
 
     /// <summary>
     /// Returns the unverified first-line value, or null when no non-empty first
