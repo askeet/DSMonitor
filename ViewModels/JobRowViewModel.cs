@@ -57,6 +57,11 @@ public sealed class JobRowViewModel : ObservableObject
     private bool _selectedActivityTextIsComplete;
     private string _selectedActivityCompletenessText = "No activity selected.";
     private LiveActivityLoadKey? _selectedActivityLoadKey;
+    private string _originalRequestText = string.Empty;
+    private string _originalRequestAttributionText = string.Empty;
+    private string? _originalRequestSessionId;
+    private long? _originalRequestStartTicks;
+    private bool _originalRequestIsSuccess;
 
     public JobRowViewModel(ForgeJobSnapshot snapshot)
     {
@@ -451,6 +456,68 @@ public sealed class JobRowViewModel : ObservableObject
         OnPropertyChanged(nameof(SelectedActivityCompletenessText));
     }
 
+    /// <summary>
+    /// Exact, untruncated original-request text for the selected job. It is
+    /// empty when the request is unavailable, ambiguous, or not yet loaded.
+    /// A successful singleton or timestamp result remains explicitly
+    /// best-effort; only an explicitly verified correlation is job-specific.
+    /// </summary>
+    public string OriginalRequestText => _originalRequestText;
+
+    /// <summary>
+    /// Short attribution label for the request. It is never a substitute for
+    /// the exact text and is empty for unavailable or absent results.
+    /// </summary>
+    public string OriginalRequestAttributionText => _originalRequestAttributionText;
+
+    internal bool HasOriginalRequestFor(
+        string sessionId,
+        DateTimeOffset? startedAt) =>
+        _originalRequestIsSuccess &&
+        string.Equals(_originalRequestSessionId, sessionId, StringComparison.Ordinal) &&
+        _originalRequestStartTicks == StartTicks(startedAt);
+
+    internal void ApplyOriginalRequestResult(
+        string sessionId,
+        DateTimeOffset? startedAt,
+        OpenCodeOriginalRequestResult result)
+    {
+        if (!string.Equals(Snapshot.SessionId, sessionId, StringComparison.Ordinal) ||
+            StartTicks(Snapshot.Metadata.Started) != StartTicks(startedAt))
+        {
+            return;
+        }
+
+        var text = result.IsSuccess ? result.Text : string.Empty;
+        var label = result.Status is OriginalRequestStatus.BestEffortSingleton or
+            OriginalRequestStatus.VerifiedJobCorrelation or
+            OriginalRequestStatus.BestEffortTimeCorrelation or
+            OriginalRequestStatus.Ambiguous
+            ? result.Label
+            : string.Empty;
+
+        _originalRequestSessionId = result.IsSuccess ? sessionId : null;
+        _originalRequestStartTicks = result.IsSuccess ? StartTicks(startedAt) : null;
+        _originalRequestIsSuccess = result.IsSuccess;
+        SetText(text, ref _originalRequestText, nameof(OriginalRequestText));
+        SetText(
+            label,
+            ref _originalRequestAttributionText,
+            nameof(OriginalRequestAttributionText));
+    }
+
+    internal void ClearOriginalRequest()
+    {
+        _originalRequestSessionId = null;
+        _originalRequestStartTicks = null;
+        _originalRequestIsSuccess = false;
+        SetText(string.Empty, ref _originalRequestText, nameof(OriginalRequestText));
+        SetText(
+            string.Empty,
+            ref _originalRequestAttributionText,
+            nameof(OriginalRequestAttributionText));
+    }
+
     public string LiveActivityHistoryNotice => LiveActivitySnapshot.HistoryRetentionNotice;
 
     public string LiveActivityHistoryEmptyText => "No activity observed.";
@@ -476,6 +543,16 @@ public sealed class JobRowViewModel : ObservableObject
     public void Update(ForgeJobSnapshot snapshot, DateTimeOffset now)
     {
         _currentTime = now;
+        var previousSessionId = Snapshot is { } previous ? previous.SessionId : null;
+        var previousStartTicks = Snapshot is { } prior
+            ? StartTicks(prior.Metadata.Started)
+            : null;
+        if (!string.Equals(previousSessionId, snapshot.SessionId, StringComparison.Ordinal) ||
+            previousStartTicks != StartTicks(snapshot.Metadata.Started))
+        {
+            ClearOriginalRequest();
+        }
+
         Snapshot = snapshot;
         JobId = snapshot.JobId;
         StartedSort = snapshot.Metadata.Started ?? DateTimeOffset.MinValue;
@@ -1141,6 +1218,9 @@ public sealed class JobRowViewModel : ObservableObject
 
         return path[..end];
     }
+
+    private static long? StartTicks(DateTimeOffset? startedAt) =>
+        startedAt?.ToUniversalTime().Ticks;
 
     private static string FormatJobDisplay(string jobId)
     {

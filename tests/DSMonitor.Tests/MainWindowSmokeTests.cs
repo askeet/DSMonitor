@@ -5,6 +5,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using DSMonitor.Models;
 using DSMonitor.Parsing;
+using DSMonitor.Services;
 using DSMonitor.ViewModels;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -198,7 +199,7 @@ public sealed class MainWindowSmokeTests
     }
 
     private static MainWindow CreateWindow() =>
-        new()
+        new(MonitoringComposition.CreateForStartup())
         {
             ShowInTaskbar = false,
             WindowStartupLocation = WindowStartupLocation.Manual,

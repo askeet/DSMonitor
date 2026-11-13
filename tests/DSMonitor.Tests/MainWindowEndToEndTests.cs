@@ -281,10 +281,12 @@ public sealed class MainWindowEndToEndTests
         tab.SelectedIndex = 0;
         window.UpdateLayout();
         var headings = FindTextBlocks(tab);
-        Assert.IsTrue(headings.Any(block => block.Text == "Observed Activity"),
-            "Observed Activity heading was not rendered.");
+        Assert.IsTrue(headings.Any(block => block.Text == "Original Request"),
+            "Original Request heading was not rendered.");
         Assert.IsTrue(headings.Any(block => block.Text == "Activity History"),
             "Activity History heading was not rendered.");
+        Assert.IsTrue(headings.Any(block => block.Text == "Selected Message"),
+            "Selected Message heading was not rendered.");
 
         foreach (var removed in new[]
                  {

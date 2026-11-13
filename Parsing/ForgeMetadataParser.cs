@@ -185,6 +185,27 @@ public static class ForgeMetadataParser
                 return FromUnixMilliseconds(milliseconds, propertyName, warnings);
             }
 
+            if (string.Equals(propertyName, "started", StringComparison.Ordinal))
+            {
+                // Preserve fractional job-start milliseconds only when they map
+                // exactly to a DateTimeOffset tick. Unsupported precision or
+                // range is rejected rather than truncated or rounded into a
+                // different timestamp.
+                if (!ExactUnixMillisecondTimestamp.TryParse(value, out var exact))
+                {
+                    warnings.Add($"Metadata field '{propertyName}' could not be parsed exactly.");
+                    return null;
+                }
+
+                if (exact.ToUnixTimeMilliseconds() <= 0)
+                {
+                    warnings.Add($"Metadata field '{propertyName}' is outside the supported range.");
+                    return null;
+                }
+
+                return exact;
+            }
+
             if (value.TryGetDouble(out var fractionalMilliseconds))
             {
                 return FromUnixMilliseconds((long)fractionalMilliseconds, propertyName, warnings);

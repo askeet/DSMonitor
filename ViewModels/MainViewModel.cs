@@ -20,6 +20,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly Dispatcher _dispatcher;
     private readonly string _runsRoot;
     private readonly DispatcherTimer _clockTimer;
+    private readonly IOriginalRequestService _originalRequestService;
     private readonly Dictionary<string, JobRowViewModel> _jobsById =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -27,6 +28,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private Task? _monitoringTask;
     private CancellationTokenSource? _rawLogCts;
     private CancellationTokenSource? _selectedActivityCts;
+    private CancellationTokenSource? _originalRequestCts;
     private bool _disposed;
 
     private MonitoringState _monitoringState = MonitoringState.Stopped;
@@ -56,11 +58,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Func<ForgeMonitoringService> serviceFactory,
         Dispatcher dispatcher,
         string runsRoot,
-        TimeSpan? refreshInterval = null)
+        TimeSpan? refreshInterval = null,
+        IOriginalRequestService? originalRequestService = null)
     {
         _serviceFactory = serviceFactory ?? throw new ArgumentNullException(nameof(serviceFactory));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _runsRoot = runsRoot;
+        _originalRequestService =
+            originalRequestService ?? DisabledOriginalRequestService.Instance;
 
         Jobs = new ObservableCollection<JobRowViewModel>();
         JobsView = CollectionViewSource.GetDefaultView(Jobs);
@@ -235,6 +240,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(IsSelectionEmpty));
                 BeginRawLogLoad(value);
                 BeginSelectedActivityLoad(value);
+                BeginOriginalRequestLoad(value);
             }
         }
     }
@@ -331,6 +337,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // as monitoring stops, even if no further snapshot is applied.
         SetRowsMonitoringActive(false);
         CancelSelectedActivityLoad();
+        CancelOriginalRequestLoad();
 
         if (cts is null && !IsMonitoring)
         {
@@ -397,6 +404,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         var previousSelectedCount = _selectedJob?.Snapshot.ParsedEventCount;
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var selectedIdentityChanged = false;
 
         foreach (var jobSnapshot in snapshot.Jobs)
         {
@@ -410,11 +418,33 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
             else
             {
+                var previousSessionId = row.Snapshot.SessionId;
+                var previousStartTicks = StartTicks(row.Snapshot.Metadata.Started);
                 row.Update(jobSnapshot, snapshot.ObservedAt);
+                var sessionChanged = !string.Equals(
+                    previousSessionId,
+                    jobSnapshot.SessionId,
+                    StringComparison.Ordinal);
+                var startChanged = previousStartTicks !=
+                    StartTicks(jobSnapshot.Metadata.Started);
+                if (sessionChanged || startChanged)
+                {
+                    _originalRequestService.InvalidateJob(jobSnapshot.JobId);
+                    if (ReferenceEquals(_selectedJob, row))
+                    {
+                        CancelOriginalRequestLoad();
+                        selectedIdentityChanged = true;
+                    }
+                }
             }
 
             row.SetMonitoringActive(
                 snapshot.State is MonitoringState.Monitoring or MonitoringState.Idle);
+        }
+
+        if (selectedIdentityChanged)
+        {
+            BeginOriginalRequestLoad(_selectedJob);
         }
 
         foreach (var removedId in _jobsById.Keys.Where(id => !seenIds.Contains(id)).ToArray())
@@ -422,6 +452,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (_jobsById.Remove(removedId, out var removed))
             {
                 removed.SelectedActivityChanged -= OnJobSelectedActivityChanged;
+                _originalRequestService.InvalidateJob(removedId);
                 Jobs.Remove(removed);
                 if (ReferenceEquals(_selectedJob, removed))
                 {
@@ -516,6 +547,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _rawLogCts?.Dispose();
         _rawLogCts = null;
         CancelSelectedActivityLoad();
+        CancelOriginalRequestLoad();
+        _originalRequestService.Dispose();
         _monitoringCts?.Dispose();
         _monitoringCts = null;
     }
@@ -558,6 +591,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         IsMonitoring = false;
         SetRowsMonitoringActive(false);
+        CancelOriginalRequestLoad();
         MonitoringState = MonitoringState.Error;
         StateDetail = "Monitoring stopped after an unexpected error.";
         HasWarnings = true;
@@ -594,6 +628,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _rawLogCts?.Dispose();
         _rawLogCts = null;
         CancelSelectedActivityLoad();
+        CancelOriginalRequestLoad();
+        _originalRequestService.ClearCache();
 
         SelectedJob = null;
         Jobs.Clear();
@@ -767,6 +803,108 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         cts.Cancel();
         cts.Dispose();
     }
+
+    private void BeginOriginalRequestLoad(JobRowViewModel? job)
+    {
+        CancelOriginalRequestLoad();
+        if (job is null)
+        {
+            return;
+        }
+
+        var sessionId = job.Snapshot.SessionId;
+        if (!OpenCodeIdentifiers.IsSafeSessionId(sessionId))
+        {
+            job.ClearOriginalRequest();
+            return;
+        }
+
+        var startedAt = job.Snapshot.Metadata.Started;
+        if (job.HasOriginalRequestFor(sessionId!, startedAt))
+        {
+            return;
+        }
+
+        // Never leave another association's or start time's text visible while
+        // the new query is running. Successes are retained per job, session,
+        // and exact start time; ambiguous and transient results are re-queried
+        // on a later selection.
+        job.ClearOriginalRequest();
+        var cts = new CancellationTokenSource();
+        _originalRequestCts = cts;
+        _ = LoadOriginalRequestSafelyAsync(job, sessionId!, startedAt, cts);
+    }
+
+    private async Task LoadOriginalRequestSafelyAsync(
+        JobRowViewModel job,
+        string sessionId,
+        DateTimeOffset? startedAt,
+        CancellationTokenSource cts)
+    {
+        try
+        {
+            var result = await _originalRequestService.GetOriginalRequestAsync(
+                job.JobId,
+                sessionId,
+                verifiedUserMessageId: null,
+                cts.Token,
+                jobStartedAt: startedAt).ConfigureAwait(true);
+
+            if (cts.IsCancellationRequested ||
+                !ReferenceEquals(_selectedJob, job) ||
+                !string.Equals(job.Snapshot.SessionId, sessionId, StringComparison.Ordinal) ||
+                StartTicks(job.Snapshot.Metadata.Started) != StartTicks(startedAt))
+            {
+                return;
+            }
+
+            job.ApplyOriginalRequestResult(sessionId, startedAt, result);
+        }
+        catch (OperationCanceledException)
+        {
+            // Selection, association, start time, or monitoring changed.
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // Never surface exception or CLI output text. The field stays empty.
+            if (!cts.IsCancellationRequested &&
+                ReferenceEquals(_selectedJob, job) &&
+                string.Equals(job.Snapshot.SessionId, sessionId, StringComparison.Ordinal) &&
+                StartTicks(job.Snapshot.Metadata.Started) == StartTicks(startedAt))
+            {
+                job.ApplyOriginalRequestResult(
+                    sessionId,
+                    startedAt,
+                    OpenCodeOriginalRequestResult.Unavailable(
+                        OriginalRequestUnavailableReason.UnexpectedFailure));
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_originalRequestCts, cts))
+            {
+                _originalRequestCts = null;
+            }
+
+            cts.Dispose();
+        }
+    }
+
+    private void CancelOriginalRequestLoad()
+    {
+        var cts = _originalRequestCts;
+        _originalRequestCts = null;
+        if (cts is null)
+        {
+            return;
+        }
+
+        cts.Cancel();
+        cts.Dispose();
+    }
+
+    private static long? StartTicks(DateTimeOffset? startedAt) =>
+        startedAt?.ToUniversalTime().Ticks;
 
     private void BeginRawLogLoad(JobRowViewModel? job)
     {

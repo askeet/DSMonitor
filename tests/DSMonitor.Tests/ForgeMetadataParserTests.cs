@@ -42,6 +42,35 @@ public sealed class ForgeMetadataParserTests
     }
 
     [TestMethod]
+    public void Parse_FractionalNumericStarted_PreservesExactTicks()
+    {
+        var path = _workspace.WriteRawMetadata(
+            "job_precise_start.json",
+            """{"id":"job_precise_start","pid":1,"started":1794084044805.0002,"deadline":1794084044905}""");
+
+        var metadata = ForgeMetadataParser.ParseFile(path, _workspace.RunsRoot);
+
+        var expected = DateTimeOffset.UnixEpoch.AddTicks(
+            (1_794_084_044_805 * TimeSpan.TicksPerMillisecond) + 2);
+        Assert.AreEqual(expected, metadata.Started);
+        Assert.AreEqual(expected.UtcTicks, metadata.Started!.Value.UtcTicks);
+    }
+
+    [TestMethod]
+    public void Parse_SubTickNumericStarted_IsRejected()
+    {
+        var path = _workspace.WriteRawMetadata(
+            "job_sub_tick_start.json",
+            """{"id":"job_sub_tick_start","pid":1,"started":1794084044805.00005,"deadline":1794084044905}""");
+
+        var metadata = ForgeMetadataParser.ParseFile(path, _workspace.RunsRoot);
+
+        Assert.IsNull(metadata.Started);
+        Assert.IsTrue(metadata.Warnings.Any(warning =>
+            warning.Contains("could not be parsed exactly", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
     public void Parse_MalformedJson_ReturnsUnknownPlaceholder()
     {
         var path = _workspace.WriteRawMetadata("job_broken_0001.json", "{ definitely not json");
