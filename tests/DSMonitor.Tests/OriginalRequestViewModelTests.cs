@@ -202,6 +202,323 @@ public sealed class OriginalRequestViewModelTests
     }
 
     [TestMethod]
+    public void EvidenceChange_ClearsImmediatelyInvalidatesAndRestarts()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_a"));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request =>
+                request.SessionId == "ses_a" &&
+                request.ObservedAssistantMessageIds.SequenceEqual(new[] { "msg_a" })),
+            "the initial evidence request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            null,
+            new[] { "msg_a" },
+            OpenCodeOriginalRequestResult.ObservedJobCorrelation("first"));
+        PumpUntil(() => job.OriginalRequestText == "first", "the first evidence result");
+
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_b"));
+
+        Assert.AreEqual(string.Empty, job.OriginalRequestText,
+            "Prior evidence's request must clear immediately.");
+        CollectionAssert.Contains(service.InvalidatedJobs, "job_a");
+        PumpUntil(
+            () => service.Requests.Any(request =>
+                request.SessionId == "ses_a" &&
+                request.ObservedAssistantMessageIds.SequenceEqual(new[] { "msg_b" })),
+            "the replacement evidence request");
+
+        service.Complete(
+            "job_a",
+            "ses_a",
+            null,
+            new[] { "msg_b" },
+            OpenCodeOriginalRequestResult.ObservedJobCorrelation("second"));
+        PumpUntil(() => job.OriginalRequestText == "second", "the new evidence result");
+    }
+
+    [TestMethod]
+    public void ChangedEvidence_DiscardsLateResultForPriorEvidence()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_a"));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request =>
+                request.SessionId == "ses_a" &&
+                request.ObservedAssistantMessageIds.SequenceEqual(new[] { "msg_a" })),
+            "the first evidence request");
+
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_b"));
+        PumpUntil(
+            () => service.Requests.Any(request =>
+                request.SessionId == "ses_a" &&
+                request.ObservedAssistantMessageIds.SequenceEqual(new[] { "msg_b" })),
+            "the second evidence request");
+
+        service.Complete(
+            "job_a",
+            "ses_a",
+            null,
+            new[] { "msg_a" },
+            OpenCodeOriginalRequestResult.ObservedJobCorrelation("stale"));
+        PumpOnce();
+
+        Assert.AreEqual(string.Empty, job.OriginalRequestText,
+            "A late result for prior evidence must be discarded.");
+
+        service.Complete(
+            "job_a",
+            "ses_a",
+            null,
+            new[] { "msg_b" },
+            OpenCodeOriginalRequestResult.ObservedJobCorrelation("fresh"));
+        PumpUntil(() => job.OriginalRequestText == "fresh", "the current evidence result");
+    }
+
+    [TestMethod]
+    public void SameEvidenceRefresh_DoesNotClearOrRestartTheRequest()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_a"));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request =>
+                request.SessionId == "ses_a" &&
+                request.ObservedAssistantMessageIds.SequenceEqual(new[] { "msg_a" })),
+            "the initial evidence request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            null,
+            new[] { "msg_a" },
+            OpenCodeOriginalRequestResult.ObservedJobCorrelation("stable"));
+        PumpUntil(() => job.OriginalRequestText == "stable", "the first evidence result");
+
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_a"));
+        PumpOnce();
+
+        Assert.AreEqual("stable", job.OriginalRequestText);
+        Assert.AreEqual(
+            1,
+            service.Requests.Count(request => request.SessionId == "ses_a"));
+    }
+
+
+    [TestMethod]
+    public void ContradictoryEvidence_AppliesAmbiguousWithoutRequest()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithMixedEvidenceSources("job_a", "ses_a"));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+        PumpOnce();
+
+        Assert.AreEqual(string.Empty, job.OriginalRequestText);
+        StringAssert.Contains(job.OriginalRequestAttributionText, "Ambiguous");
+        Assert.AreEqual(0, service.Requests.Count);
+    }
+
+    [TestMethod]
+    public void ConflictAfterSingleton_ClearsImmediatelyAndDoesNotRetry()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request => request.SessionId == "ses_a"),
+            "the healthy no-evidence request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("old"));
+        PumpUntil(() => job.OriginalRequestText == "old", "the singleton result");
+
+        viewModel.ApplySnapshot(SnapshotWithMixedEvidenceSources("job_a", "ses_a"));
+
+        Assert.AreEqual(string.Empty, job.OriginalRequestText,
+            "Conflicting evidence must clear the prior singleton immediately.");
+        StringAssert.Contains(job.OriginalRequestAttributionText, "Ambiguous");
+        CollectionAssert.Contains(service.InvalidatedJobs, "job_a");
+        Assert.AreEqual(
+            1,
+            service.Requests.Count(request => request.SessionId == "ses_a"),
+            "Conflicting evidence must not be retried as a service query.");
+    }
+
+    [TestMethod]
+    public void ConflictWhileSingletonInFlight_DiscardsCompletionAndRecovers()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request => request.SessionId == "ses_a"),
+            "the healthy no-evidence request");
+
+        viewModel.ApplySnapshot(SnapshotWithMixedEvidenceSources("job_a", "ses_a"));
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("stale"));
+        PumpOnce();
+
+        Assert.AreEqual(string.Empty, job.OriginalRequestText,
+            "A completion for prior healthy identity must not publish after conflict.");
+        Assert.AreEqual(
+            1,
+            service.Requests.Count(request => request.SessionId == "ses_a"));
+
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        PumpUntil(
+            () => service.Requests.Count(request => request.SessionId == "ses_a") == 2,
+            "the healthy recovery request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("fresh"));
+        PumpUntil(() => job.OriginalRequestText == "fresh", "the recovered request");
+    }
+
+    [TestMethod]
+    public void UnavailableProjection_ClearsAndDoesNotRequestUntilHealthy()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request => request.SessionId == "ses_a"),
+            "the healthy no-evidence request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("old"));
+        PumpUntil(() => job.OriginalRequestText == "old", "the singleton result");
+
+        viewModel.ApplySnapshot(
+            SnapshotWithHealth("job_a", "ses_a", false) with
+            {
+                State = MonitoringState.Error
+            });
+
+        Assert.AreEqual(string.Empty, job.OriginalRequestText,
+            "An unavailable projection must clear the prior result immediately.");
+        Assert.AreEqual(string.Empty, job.OriginalRequestAttributionText);
+        CollectionAssert.Contains(service.InvalidatedJobs, "job_a");
+        PumpOnce();
+        Assert.AreEqual(
+            1,
+            service.Requests.Count(request => request.SessionId == "ses_a"),
+            "Unavailable monitoring must not retry from stale session metadata.");
+
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        PumpUntil(
+            () => service.Requests.Count(request => request.SessionId == "ses_a") == 2,
+            "the healthy observation request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("fresh"));
+        PumpUntil(() => job.OriginalRequestText == "fresh", "the healthy recovery result");
+    }
+
+    [TestMethod]
+    public void UnavailableProjectionWhileInFlight_DiscardsCompletionAndRecovers()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request => request.SessionId == "ses_a"),
+            "the healthy no-evidence request");
+
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", false));
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("stale"));
+        PumpOnce();
+        Assert.AreEqual(string.Empty, job.OriginalRequestText);
+
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        PumpUntil(
+            () => service.Requests.Count(request => request.SessionId == "ses_a") == 2,
+            "the healthy recovery request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("fresh"));
+        PumpUntil(() => job.OriginalRequestText == "fresh", "the recovered request");
+    }
+
+    [TestMethod]
+    public void MonitoringError_ClearsEvenWhenJobProjectionLooksHealthy()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+
+        PumpUntil(
+            () => service.Requests.Any(request => request.SessionId == "ses_a"),
+            "the healthy request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("old"));
+        PumpUntil(() => job.OriginalRequestText == "old", "the singleton result");
+
+        viewModel.ApplySnapshot(
+            SnapshotWithHealth("job_a", "ses_a", true) with
+            {
+                State = MonitoringState.Error
+            });
+
+        Assert.AreEqual(string.Empty, job.OriginalRequestText);
+        CollectionAssert.Contains(service.InvalidatedJobs, "job_a");
+        PumpOnce();
+        Assert.AreEqual(
+            1,
+            service.Requests.Count(request => request.SessionId == "ses_a"));
+
+        viewModel.ApplySnapshot(SnapshotWithHealth("job_a", "ses_a", true));
+        PumpUntil(
+            () => service.Requests.Count(request => request.SessionId == "ses_a") == 2,
+            "the recovered monitoring request");
+        service.Complete(
+            "job_a",
+            "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortSingleton("fresh"));
+        PumpUntil(() => job.OriginalRequestText == "fresh", "the recovered result");
+    }
+
+    [TestMethod]
     public void StartTimeChange_ClearsImmediatelyInvalidatesAndRestarts()
     {
         var service = new ControlledOriginalRequestService();
@@ -220,11 +537,8 @@ public sealed class OriginalRequestViewModelTests
             "job_a",
             "ses_a",
             firstStart,
-            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("one"));
+            OpenCodeOriginalRequestResult.BestEffortSingleton("one"));
         PumpUntil(() => job.OriginalRequestText == "one", "the first request");
-        StringAssert.Contains(
-            job.OriginalRequestAttributionText,
-            "not verified job ownership");
 
         viewModel.ApplySnapshot(SnapshotAt(("job_a", "ses_a", secondStart)));
 
@@ -240,7 +554,7 @@ public sealed class OriginalRequestViewModelTests
             "job_a",
             "ses_a",
             secondStart,
-            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("two"));
+            OpenCodeOriginalRequestResult.BestEffortSingleton("two"));
         PumpUntil(() => job.OriginalRequestText == "two", "the new start-time request");
     }
 
@@ -270,7 +584,7 @@ public sealed class OriginalRequestViewModelTests
             "job_a",
             "ses_a",
             firstStart,
-            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("stale"));
+            OpenCodeOriginalRequestResult.BestEffortSingleton("stale"));
         PumpOnce();
 
         Assert.AreEqual(string.Empty, job.OriginalRequestText,
@@ -280,7 +594,7 @@ public sealed class OriginalRequestViewModelTests
             "job_a",
             "ses_a",
             secondStart,
-            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("fresh"));
+            OpenCodeOriginalRequestResult.BestEffortSingleton("fresh"));
         PumpUntil(() => job.OriginalRequestText == "fresh", "the current start result");
     }
 
@@ -334,8 +648,140 @@ public sealed class OriginalRequestViewModelTests
             },
             Status = ForgeJobStatus.Unknown,
             SessionId = job.SessionId,
-            ObservedAt = DateTimeOffset.UtcNow
+            ObservedAt = DateTimeOffset.UtcNow,
+            LiveActivity = new LiveActivitySnapshot { IsHealthy = true }
         }).ToArray()
+    };
+
+    private static MonitoringSnapshot SnapshotWithEvidence(
+        string jobId,
+        string sessionId,
+        params string[] messageIds) => new()
+    {
+        ObservedAt = DateTimeOffset.UtcNow,
+        State = MonitoringState.Idle,
+        ForgeDirectoryAvailable = true,
+        Jobs = new[]
+        {
+            new ForgeJobSnapshot
+            {
+                Metadata = new ForgeJobMetadata
+                {
+                    JobId = jobId,
+                    MetadataPath = Path.Combine(@"C:\synthetic", jobId + ".json"),
+                    LogPath = Path.Combine(@"C:\synthetic", jobId + ".log")
+                },
+                Status = ForgeJobStatus.Unknown,
+                SessionId = sessionId,
+                ObservedAt = DateTimeOffset.UtcNow,
+                LiveActivity = new LiveActivitySnapshot
+                {
+                    IsHealthy = true,
+                    History = messageIds.Select(messageId => new LiveActivityHistoryEntry(
+                        jobId,
+                        sessionId,
+                        messageId,
+                        "part_" + messageId,
+                        "Assistant-reported text",
+                        "text",
+                        Path.Combine(@"C:\synthetic", jobId + ".log"),
+                        0,
+                        DateTimeOffset.UtcNow,
+                        DateTimeOffset.UtcNow,
+                        "digest",
+                        null)).ToArray()
+                }
+            }
+        }
+    };
+
+    private static MonitoringSnapshot SnapshotWithHealth(
+        string jobId,
+        string sessionId,
+        bool isHealthy) => new()
+    {
+        ObservedAt = DateTimeOffset.UtcNow,
+        State = MonitoringState.Idle,
+        ForgeDirectoryAvailable = true,
+        Jobs = new[]
+        {
+            new ForgeJobSnapshot
+            {
+                Metadata = new ForgeJobMetadata
+                {
+                    JobId = jobId,
+                    MetadataPath = Path.Combine(@"C:\synthetic", jobId + ".json"),
+                    LogPath = Path.Combine(@"C:\synthetic", jobId + ".log")
+                },
+                Status = ForgeJobStatus.Unknown,
+                SessionId = sessionId,
+                ObservedAt = DateTimeOffset.UtcNow,
+                LiveActivity = new LiveActivitySnapshot
+                {
+                    IsHealthy = isHealthy,
+                    Availability = isHealthy
+                        ? "Bounded source re-read; synthetic test projection."
+                        : "N/A - monitoring scan failed; no cached activity is shown."
+                }
+            }
+        }
+    };
+
+    private static MonitoringSnapshot SnapshotWithMixedEvidenceSources(
+        string jobId,
+        string sessionId) => new()
+    {
+        ObservedAt = DateTimeOffset.UtcNow,
+        State = MonitoringState.Idle,
+        ForgeDirectoryAvailable = true,
+        Jobs = new[]
+        {
+            new ForgeJobSnapshot
+            {
+                Metadata = new ForgeJobMetadata
+                {
+                    JobId = jobId,
+                    MetadataPath = Path.Combine(@"C:\synthetic", jobId + ".json"),
+                    LogPath = Path.Combine(@"C:\synthetic", jobId + ".log")
+                },
+                Status = ForgeJobStatus.Unknown,
+                SessionId = sessionId,
+                ObservedAt = DateTimeOffset.UtcNow,
+                LiveActivity = new LiveActivitySnapshot
+                {
+                    IsHealthy = true,
+                    History = new[]
+                    {
+                        new LiveActivityHistoryEntry(
+                            jobId,
+                            sessionId,
+                            "msg_a",
+                            "part_a",
+                            "Assistant-reported text",
+                            "text",
+                            @"C:\synthetic\a.log",
+                            0,
+                            DateTimeOffset.UtcNow,
+                            DateTimeOffset.UtcNow,
+                            "digest",
+                            null),
+                        new LiveActivityHistoryEntry(
+                            jobId,
+                            sessionId,
+                            "msg_b",
+                            "part_b",
+                            "Assistant-reported text",
+                            "text",
+                            @"C:\synthetic\b.log",
+                            1,
+                            DateTimeOffset.UtcNow,
+                            DateTimeOffset.UtcNow,
+                            "digest",
+                            null)
+                    }
+                }
+            }
+        }
     };
 
     private static void PumpOnce() =>
@@ -390,18 +836,26 @@ public sealed class OriginalRequestViewModelTests
             string sessionId,
             string? verifiedUserMessageId,
             CancellationToken cancellationToken,
-            DateTimeOffset? jobStartedAt = null)
+            DateTimeOffset? jobStartedAt = null,
+            IReadOnlyList<string>? observedAssistantMessageIds = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var completion = new TaskCompletionSource<OpenCodeOriginalRequestResult>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             lock (_gate)
             {
-                Requests.Add(new Request(jobId, sessionId, jobStartedAt));
+                Requests.Add(new Request(
+                    jobId,
+                    sessionId,
+                    jobStartedAt,
+                    observedAssistantMessageIds?.ToArray() ??
+                        Array.Empty<string>()));
                 _pending.Add(new PendingRequest(
                     jobId,
                     sessionId,
                     jobStartedAt,
+                    observedAssistantMessageIds?.ToArray() ??
+                        Array.Empty<string>(),
                     completion));
             }
 
@@ -418,6 +872,14 @@ public sealed class OriginalRequestViewModelTests
             string jobId,
             string sessionId,
             DateTimeOffset? startedAt,
+            OpenCodeOriginalRequestResult result) =>
+            Complete(jobId, sessionId, startedAt, null, result);
+
+        public void Complete(
+            string jobId,
+            string sessionId,
+            DateTimeOffset? startedAt,
+            IReadOnlyList<string>? observedAssistantMessageIds,
             OpenCodeOriginalRequestResult result)
         {
             PendingRequest pending;
@@ -426,7 +888,14 @@ public sealed class OriginalRequestViewModelTests
                 pending = _pending.Last(item =>
                     string.Equals(item.JobId, jobId, StringComparison.Ordinal) &&
                     string.Equals(item.SessionId, sessionId, StringComparison.Ordinal) &&
-                    item.StartedAt == startedAt);
+                    item.StartedAt == startedAt &&
+                    (observedAssistantMessageIds is null ||
+                     item.ObservedAssistantMessageIds
+                         .OrderBy(id => id, StringComparer.Ordinal)
+                         .SequenceEqual(
+                             observedAssistantMessageIds
+                                 .OrderBy(id => id, StringComparer.Ordinal),
+                             StringComparer.Ordinal)));
                 _pending.Remove(pending);
             }
 
@@ -452,12 +921,14 @@ public sealed class OriginalRequestViewModelTests
         public sealed record Request(
             string JobId,
             string SessionId,
-            DateTimeOffset? StartedAt);
+            DateTimeOffset? StartedAt,
+            IReadOnlyList<string> ObservedAssistantMessageIds);
 
         private sealed record PendingRequest(
             string JobId,
             string SessionId,
             DateTimeOffset? StartedAt,
+            IReadOnlyList<string> ObservedAssistantMessageIds,
             TaskCompletionSource<OpenCodeOriginalRequestResult> Completion);
     }
 }

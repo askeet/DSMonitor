@@ -30,6 +30,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? _selectedActivityCts;
     private CancellationTokenSource? _originalRequestCts;
     private bool _disposed;
+    private bool _monitoringHealthy = true;
 
     private MonitoringState _monitoringState = MonitoringState.Stopped;
     private bool _isMonitoring;
@@ -403,6 +404,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         var previousSelectedCount = _selectedJob?.Snapshot.ParsedEventCount;
+        var previousMonitoringHealthy = _monitoringHealthy;
+        _monitoringHealthy = snapshot.State != MonitoringState.Error;
+        var monitoringHealthChanged = previousMonitoringHealthy != _monitoringHealthy;
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var selectedIdentityChanged = false;
 
@@ -420,6 +424,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             {
                 var previousSessionId = row.Snapshot.SessionId;
                 var previousStartTicks = StartTicks(row.Snapshot.Metadata.Started);
+                var previousEvidenceFingerprint =
+                    JobRowViewModel.CurrentEvidenceFingerprint(
+                        row.Snapshot,
+                        previousSessionId);
                 row.Update(jobSnapshot, snapshot.ObservedAt);
                 var sessionChanged = !string.Equals(
                     previousSessionId,
@@ -427,13 +435,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     StringComparison.Ordinal);
                 var startChanged = previousStartTicks !=
                     StartTicks(jobSnapshot.Metadata.Started);
-                if (sessionChanged || startChanged)
+                var evidenceChanged = !string.Equals(
+                    previousEvidenceFingerprint,
+                    JobRowViewModel.CurrentEvidenceFingerprint(
+                        row.Snapshot,
+                        jobSnapshot.SessionId),
+                    StringComparison.Ordinal);
+                if (sessionChanged || startChanged || evidenceChanged ||
+                    monitoringHealthChanged || !_monitoringHealthy)
                 {
                     _originalRequestService.InvalidateJob(jobSnapshot.JobId);
                     if (ReferenceEquals(_selectedJob, row))
                     {
                         CancelOriginalRequestLoad();
                         selectedIdentityChanged = true;
+                    }
+                    else if (evidenceChanged || monitoringHealthChanged || !_monitoringHealthy)
+                    {
+                        row.ClearOriginalRequest();
                     }
                 }
             }
@@ -630,6 +649,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         CancelSelectedActivityLoad();
         CancelOriginalRequestLoad();
         _originalRequestService.ClearCache();
+        _monitoringHealthy = true;
 
         SelectedJob = null;
         Jobs.Clear();
@@ -820,25 +840,72 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         var startedAt = job.Snapshot.Metadata.Started;
-        if (job.HasOriginalRequestFor(sessionId!, startedAt))
+        var evidence = OriginalRequestEvidence.Select(job.Snapshot, sessionId);
+        var evidenceFingerprint = evidence.Fingerprint;
+        if (!_monitoringHealthy)
+        {
+            job.ClearOriginalRequest();
+            job.ApplyOriginalRequestResult(
+                sessionId!,
+                startedAt,
+                evidenceFingerprint,
+                OpenCodeOriginalRequestResult.None());
+            return;
+        }
+
+        if (job.HasOriginalRequestFor(sessionId!, startedAt, evidenceFingerprint))
         {
             return;
         }
 
-        // Never leave another association's or start time's text visible while
-        // the new query is running. Successes are retained per job, session,
-        // and exact start time; ambiguous and transient results are re-queried
-        // on a later selection.
+        // Never leave another association's, start time's, health state's, or
+        // evidence set's text visible while the new query is running. Successes
+        // are retained per job, session, start time, and exact observed evidence
+        // set; ambiguous, unavailable, and transient results are re-queried on a
+        // later selection.
         job.ClearOriginalRequest();
+        if (evidence.State == OriginalRequestEvidenceState.Unavailable)
+        {
+            // Monitoring failure or an unavailable projection must not fall
+            // back to stale session metadata or retry until healthy evidence.
+            job.ApplyOriginalRequestResult(
+                sessionId!,
+                startedAt,
+                evidenceFingerprint,
+                OpenCodeOriginalRequestResult.None());
+            return;
+        }
+
+        if (evidence.State == OriginalRequestEvidenceState.Conflicting)
+        {
+            // Contradictory Live Activity evidence is not an invitation to
+            // fall back to the singleton heuristic.
+            job.ApplyOriginalRequestResult(
+                sessionId!,
+                startedAt,
+                evidenceFingerprint,
+                OpenCodeOriginalRequestResult.Ambiguous());
+            return;
+        }
+
+        var observedIds = evidence.MessageIds;
         var cts = new CancellationTokenSource();
         _originalRequestCts = cts;
-        _ = LoadOriginalRequestSafelyAsync(job, sessionId!, startedAt, cts);
+        _ = LoadOriginalRequestSafelyAsync(
+            job,
+            sessionId!,
+            startedAt,
+            evidenceFingerprint,
+            observedIds,
+            cts);
     }
 
     private async Task LoadOriginalRequestSafelyAsync(
         JobRowViewModel job,
         string sessionId,
         DateTimeOffset? startedAt,
+        string evidenceFingerprint,
+        IReadOnlyList<string> observedIds,
         CancellationTokenSource cts)
     {
         try
@@ -848,21 +915,30 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 sessionId,
                 verifiedUserMessageId: null,
                 cts.Token,
-                jobStartedAt: startedAt).ConfigureAwait(true);
+                jobStartedAt: startedAt,
+                observedAssistantMessageIds: observedIds).ConfigureAwait(true);
 
             if (cts.IsCancellationRequested ||
                 !ReferenceEquals(_selectedJob, job) ||
                 !string.Equals(job.Snapshot.SessionId, sessionId, StringComparison.Ordinal) ||
-                StartTicks(job.Snapshot.Metadata.Started) != StartTicks(startedAt))
+                StartTicks(job.Snapshot.Metadata.Started) != StartTicks(startedAt) ||
+                !string.Equals(
+                    JobRowViewModel.CurrentEvidenceFingerprint(job.Snapshot, sessionId),
+                    evidenceFingerprint,
+                    StringComparison.Ordinal))
             {
                 return;
             }
 
-            job.ApplyOriginalRequestResult(sessionId, startedAt, result);
+            job.ApplyOriginalRequestResult(
+                sessionId,
+                startedAt,
+                evidenceFingerprint,
+                result);
         }
         catch (OperationCanceledException)
         {
-            // Selection, association, start time, or monitoring changed.
+            // Selection, association, start time, evidence, or monitoring changed.
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -870,11 +946,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (!cts.IsCancellationRequested &&
                 ReferenceEquals(_selectedJob, job) &&
                 string.Equals(job.Snapshot.SessionId, sessionId, StringComparison.Ordinal) &&
-                StartTicks(job.Snapshot.Metadata.Started) == StartTicks(startedAt))
+                StartTicks(job.Snapshot.Metadata.Started) == StartTicks(startedAt) &&
+                string.Equals(
+                    JobRowViewModel.CurrentEvidenceFingerprint(job.Snapshot, sessionId),
+                    evidenceFingerprint,
+                    StringComparison.Ordinal))
             {
                 job.ApplyOriginalRequestResult(
                     sessionId,
                     startedAt,
+                    evidenceFingerprint,
                     OpenCodeOriginalRequestResult.Unavailable(
                         OriginalRequestUnavailableReason.UnexpectedFailure));
             }

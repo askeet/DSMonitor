@@ -184,12 +184,22 @@ public sealed class OpenCodeOriginalRequestServiceTests
     [DataRow("not json")]
     [DataRow("""{"data":[],"cursor":{"previous":42}}""")]
     [DataRow("""{"data":[],"cursor":{"next":42}}""")]
+    [DataRow("""{"data":[],"data":[],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[],"cursor":{},"cursor":{}}""")]
+    [DataRow("""{"data":[],"cursor":{"previous":null,"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[],"cursor":{"previous":null,"next":null,"next":null}}""")]
     [DataRow("""{"data":[{"id":"msg_1","time":{"created":1},"text":"a","type":"assistant"}],"cursor":{"previous":null,"next":null}}""")]
     [DataRow("""{"data":[{"id":"bad id","time":{"created":1},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
     [DataRow("""{"data":[{"id":"msg_1","time":{},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_1","time":{"created":"1"},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
     [DataRow("""{"data":[{"id":"msg_1","time":{"created":1},"text":"a","files":{},"type":"user"}],"cursor":{"previous":null,"next":null}}""")]
-    [DataRow("""{"data":[{"id":"msg_1","time":{"created":1794084044805.00005},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
     [DataRow("""{"data":[{"id":"msg_1","time":{"created":1e400},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_1","id":"msg_1","time":{"created":1},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_1","time":{"created":1},"text":"a","type":"user","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_1","time":{"created":1},"text":"a","text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_1","time":{"created":1},"time":{"created":1},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_1","time":{"created":1,"created":1},"text":"a","type":"user"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_1","time":{"created":1},"text":"a","files":[],"files":[],"type":"user"}],"cursor":{"previous":null,"next":null}}""")]
     public async Task MalformedOrIncompleteResponse_IsUnavailable(string json)
     {
         var executor = new FakeExecutor((_, _) =>
@@ -203,6 +213,26 @@ public sealed class OpenCodeOriginalRequestServiceTests
         Assert.AreEqual(OriginalRequestUnavailableReason.MalformedResponse, result.Reason);
         Assert.AreEqual(string.Empty, result.Text);
         Assert.AreEqual(string.Empty, result.Label);
+    }
+
+    [TestMethod]
+    public async Task ValidUnknownPayloadProperties_AreIgnoredAndSingletonPreserved()
+    {
+        const string json =
+            "{\"data\":[{\"id\":\"msg_1\",\"type\":\"user\",\"text\":\"request\"," +
+            "\"time\":{\"created\":1,\"extra\":\"ok\"},\"files\":[]," +
+            "\"extra\":{\"nested\":true}}]," +
+            "\"cursor\":{\"previous\":null,\"next\":null,\"extra\":42}," +
+            "\"extra\":\"root\"}";
+        var executor = new FakeExecutor((_, _) =>
+            Task.FromResult(Execution(json)));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_5", "ses_5", null, CancellationToken.None);
+
+        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, result.Status);
+        Assert.AreEqual("request", result.Text);
     }
 
     [TestMethod]
@@ -471,13 +501,15 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_SharedSession_DistinctStartSelectsCorrespondingMessage()
+    public async Task ObservedCorrelation_SharedSession_DistinctAnchorsSelectCorrespondingRequest()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
-            PageWithTimes(
+            StreamPage(
                 null,
-                ("msg_first", "first request 🚀", 1_000),
-                ("msg_second", "second request\nsecond line", 2_000)))));
+                ("msg_user_a", "user", "first request 🚀"),
+                ("msg_assistant_a", "assistant", null),
+                ("msg_user_b", "user", "second request\nsecond line"),
+                ("msg_assistant_b", "assistant", null)))));
         using var service = CreateService(executor);
 
         var first = await service.GetOriginalRequestAsync(
@@ -485,28 +517,30 @@ public sealed class OpenCodeOriginalRequestServiceTests
             "ses_shared",
             verifiedUserMessageId: null,
             CancellationToken.None,
-            Start(1_000));
+            observedAssistantMessageIds: new[] { "msg_assistant_a" });
         var second = await service.GetOriginalRequestAsync(
             "job_b",
             "ses_shared",
             verifiedUserMessageId: null,
             CancellationToken.None,
-            Start(2_000));
+            observedAssistantMessageIds: new[] { "msg_assistant_b" });
 
         Assert.AreEqual(
-            OriginalRequestStatus.BestEffortTimeCorrelation,
+            OriginalRequestStatus.ObservedJobCorrelation,
             first.Status);
         Assert.AreEqual("first request 🚀", first.Text);
         Assert.AreEqual(
-            OriginalRequestStatus.BestEffortTimeCorrelation,
+            OriginalRequestStatus.ObservedJobCorrelation,
             second.Status);
         Assert.AreEqual("second request\nsecond line", second.Text);
-        StringAssert.Contains(first.Label, "not verified job ownership");
+        StringAssert.Contains(first.Label, "inference");
+        StringAssert.Contains(first.Label, "not authoritative");
+        Assert.IsFalse(first.Label.Contains("Verified", StringComparison.Ordinal));
         Assert.AreEqual(2, executor.CallCount);
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_SelectsNearestOnEitherSideOfStart()
+    public async Task MultipleUserMessages_AreAmbiguousRegardlessOfJobStart()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithTimes(
@@ -528,14 +562,14 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             Start(1_950));
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, before.Status);
-        Assert.AreEqual("before", before.Text);
-        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, after.Status);
-        Assert.AreEqual("after", after.Text);
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, before.Status);
+        Assert.AreEqual(string.Empty, before.Text);
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, after.Status);
+        Assert.AreEqual(string.Empty, after.Text);
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_HasNoMaximumGap()
+    public async Task MultipleUserMessages_LargeStartGap_StillAmbiguous()
     {
         const long start = 1_000_000_000;
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
@@ -552,14 +586,12 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             Start(start));
 
-        Assert.AreEqual(
-            OriginalRequestStatus.BestEffortTimeCorrelation,
-            result.Status);
-        Assert.AreEqual("near", result.Text);
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_EqualDistance_IsAmbiguousAndEmpty()
+    public async Task MultipleUserMessages_EqualDistance_IsAmbiguousAndEmpty()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithTimes(
@@ -581,7 +613,7 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_MissingStart_IsAmbiguousAndEmpty()
+    public async Task MultipleUserMessages_MissingStart_IsAmbiguousAndEmpty()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithTimes(
@@ -602,7 +634,7 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_UnsupportedStart_IsUnavailableAndEmpty()
+    public async Task MultipleUserMessages_UnsupportedStart_IsAmbiguousAndEmpty()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithTimes(
@@ -618,15 +650,12 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             DateTimeOffset.MinValue);
 
-        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
-        Assert.AreEqual(
-            OriginalRequestUnavailableReason.InvalidJobTimestamp,
-            result.Reason);
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
         Assert.AreEqual(string.Empty, result.Text);
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_LaterPageCandidate_IsSelected()
+    public async Task ObservedCorrelation_AnchorOnLaterPage_IsSelected()
     {
         var requests = new List<ProcessStartInfo>();
         var executor = new FakeExecutor((request, _) =>
@@ -634,13 +663,14 @@ public sealed class OpenCodeOriginalRequestServiceTests
             requests.Add(request);
             return Task.FromResult(
                 requests.Count == 1
-                    ? Execution(PageWithTimes(
+                    ? Execution(StreamPage(
                         "cursor_one",
-                        ("msg_far", "far", 100_000)))
-                    : Execution(PageWithTimes(
+                        ("msg_far_user", "user", "far"),
+                        ("msg_far_assistant", "assistant", null)))
+                    : Execution(StreamPage(
                         null,
-                        ("msg_near", "near", 1_000),
-                        ("msg_mid", "mid", 50_000))));
+                        ("msg_near_user", "user", "near"),
+                        ("msg_near_assistant", "assistant", null))));
         });
         using var service = CreateService(executor);
 
@@ -649,23 +679,31 @@ public sealed class OpenCodeOriginalRequestServiceTests
             "ses_later",
             null,
             CancellationToken.None,
-            Start(1_000));
+            observedAssistantMessageIds: new[] { "msg_near_assistant" });
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
+        Assert.AreEqual(OriginalRequestStatus.ObservedJobCorrelation, result.Status);
         Assert.AreEqual("near", result.Text);
         Assert.AreEqual(2, requests.Count);
+        var firstQuery = requests[0].ArgumentList[2];
+        StringAssert.Contains(firstQuery, "limit=50&order=asc");
+        Assert.IsFalse(firstQuery.Contains("type=user", StringComparison.Ordinal));
+        var secondQuery = requests[1].ArgumentList[2];
+        StringAssert.Contains(secondQuery, "cursor=cursor_one");
+        Assert.IsFalse(secondQuery.Contains("&order=", StringComparison.Ordinal));
+        Assert.IsFalse(secondQuery.Contains("type=user", StringComparison.Ordinal));
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_IncompletePaging_FailsClosed()
+    public async Task ObservedCorrelation_IncompletePaging_FailsClosed()
     {
         var requests = new List<ProcessStartInfo>();
         var executor = new FakeExecutor((request, _) =>
         {
             requests.Add(request);
-            return Task.FromResult(Execution(PageWithTimes(
+            return Task.FromResult(Execution(StreamPage(
                 "cursor_" + requests.Count,
-                ($"msg_{requests.Count}", "value", 1_000 + requests.Count))));
+                ($"msg_user_{requests.Count}", "user", "value"),
+                ($"msg_assistant_{requests.Count}", "assistant", null))));
         });
         using var service = CreateService(executor, maxPages: 2);
 
@@ -674,7 +712,7 @@ public sealed class OpenCodeOriginalRequestServiceTests
             "ses_incomplete",
             null,
             CancellationToken.None,
-            Start(1_000));
+            observedAssistantMessageIds: new[] { "msg_assistant_1" });
 
         Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
         Assert.AreEqual(OriginalRequestUnavailableReason.PaginationLimit, result.Reason);
@@ -683,33 +721,37 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_CacheIncludesExactStart()
+    public async Task ObservedCorrelation_CacheIncludesExactEvidenceSet()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
-            PageWithTimes(
+            StreamPage(
                 null,
-                ("msg_1", "first", 1_000),
-                ("msg_2", "second", 5_000)))));
+                ("msg_user_a", "user", "first"),
+                ("msg_assistant_a", "assistant", null),
+                ("msg_user_b", "user", "second"),
+                ("msg_assistant_b", "assistant", null)))));
         using var service = CreateService(executor);
+        var anchorsA = new[] { "msg_assistant_a" };
+        var anchorsB = new[] { "msg_assistant_b" };
 
         var first = await service.GetOriginalRequestAsync(
             "job_cache",
             "ses_cache",
             null,
             CancellationToken.None,
-            Start(1_000));
+            observedAssistantMessageIds: anchorsA);
         var second = await service.GetOriginalRequestAsync(
             "job_cache",
             "ses_cache",
             null,
             CancellationToken.None,
-            Start(5_000));
+            observedAssistantMessageIds: anchorsB);
         var repeat = await service.GetOriginalRequestAsync(
             "job_cache",
             "ses_cache",
             null,
             CancellationToken.None,
-            Start(1_000));
+            observedAssistantMessageIds: anchorsA);
 
         Assert.AreEqual("first", first.Text);
         Assert.AreEqual("second", second.Text);
@@ -718,7 +760,7 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_ExactTicks_EqualDistanceIsTie()
+    public async Task MultipleUserMessages_ExactTicks_EqualDistanceIsAmbiguous()
     {
         const long startMilliseconds = 1_794_084_044_805;
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
@@ -740,37 +782,31 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_ExactTicks_SelectsNearest()
+    public async Task ObservedCorrelation_MultipleAnchorsSameUser_AreCorrelated()
     {
-        const long startMilliseconds = 1_794_084_044_805;
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
-            PageWithRawTimes(
+            StreamPage(
                 null,
-                ("msg_early", "early", "1794084044805.0001"),
-                ("msg_late", "late", "1794084044805.0004")))));
+                ("msg_user", "user", "the request"),
+                ("msg_assistant_a", "assistant", null),
+                ("msg_assistant_b", "assistant", null),
+                ("msg_user_later", "user", "later request"),
+                ("msg_assistant_later", "assistant", null)))));
         using var service = CreateService(executor);
 
-        var nearestBefore = await service.GetOriginalRequestAsync(
-            "job_exact_near_before",
-            "ses_exact_near",
+        var result = await service.GetOriginalRequestAsync(
+            "job_same_user",
+            "ses_same_user",
             null,
             CancellationToken.None,
-            StartWithTicks(startMilliseconds, 2));
-        var nearestAfter = await service.GetOriginalRequestAsync(
-            "job_exact_near_after",
-            "ses_exact_near",
-            null,
-            CancellationToken.None,
-            StartWithTicks(startMilliseconds, 3));
+            observedAssistantMessageIds: new[] { "msg_assistant_a", "msg_assistant_b" });
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, nearestBefore.Status);
-        Assert.AreEqual("early", nearestBefore.Text);
-        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, nearestAfter.Status);
-        Assert.AreEqual("late", nearestAfter.Text);
+        Assert.AreEqual(OriginalRequestStatus.ObservedJobCorrelation, result.Status);
+        Assert.AreEqual("the request", result.Text);
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_MetadataFractionalStart_FeedsExactTicks()
+    public async Task MetadataFractionalStart_DoesNotSelectAmongMultipleUsers()
     {
         const long startMilliseconds = 1_794_084_044_805;
         using var workspace = new TestWorkspace();
@@ -799,12 +835,12 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             metadata.Started);
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
-        Assert.AreEqual("early", result.Text);
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
     }
 
     [TestMethod]
-    public async Task TimeCorrelation_SubTickPrecision_FailsClosed()
+    public async Task MultipleUserMessages_SubTickPrecision_IsAmbiguous()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithRawTimes(
@@ -820,15 +856,85 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             StartWithTicks(1_794_084_044_805, 2));
 
-        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
-        Assert.AreEqual(
-            OriginalRequestUnavailableReason.MalformedResponse,
-            result.Reason);
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
         Assert.AreEqual(string.Empty, result.Text);
     }
 
     [TestMethod]
-    public async Task VerifiedCorrelation_TakesPriorityOverTimeSelection()
+    public async Task Singleton_SubTickTimestamp_StillReturnsSingleton()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            PageWithRawTimes(
+                null,
+                ("msg_only", "only request", "1794084044805.00005")))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_singleton_sub_tick",
+            "ses_singleton_sub_tick",
+            null,
+            CancellationToken.None,
+            StartWithTicks(1_794_084_044_805, 2));
+
+        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, result.Status);
+        Assert.AreEqual("only request", result.Text);
+    }
+
+    [TestMethod]
+    public async Task VerifiedCorrelation_UnusableTimestampPrecision_StillSelectsTarget()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            PageWithRawTimes(
+                null,
+                ("msg_target", "target request", "1794084044805.0003"),
+                ("msg_imprecise", "imprecise target", "1794084044805.00005"),
+                ("msg_other", "other", "1794084044805.00007")))));
+        using var service = CreateService(executor);
+
+        var validTarget = await service.GetOriginalRequestAsync(
+            "job_verified_valid",
+            "ses_verified",
+            "msg_target",
+            CancellationToken.None);
+        var impreciseTarget = await service.GetOriginalRequestAsync(
+            "job_verified_imprecise",
+            "ses_verified",
+            "msg_imprecise",
+            CancellationToken.None);
+
+        Assert.AreEqual(
+            OriginalRequestStatus.VerifiedJobCorrelation,
+            validTarget.Status);
+        Assert.AreEqual("target request", validTarget.Text);
+        Assert.AreEqual(
+            OriginalRequestStatus.VerifiedJobCorrelation,
+            impreciseTarget.Status);
+        Assert.AreEqual("imprecise target", impreciseTarget.Text);
+    }
+
+    [TestMethod]
+    public async Task MultipleUserMessages_UnavailableTimestamp_IsAmbiguous()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            PageWithRawTimes(
+                null,
+                ("msg_valid", "valid", "1794084044805.0003"),
+                ("msg_imprecise", "imprecise", "1794084044805.00005")))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_candidate_unavailable",
+            "ses_candidate_unavailable",
+            null,
+            CancellationToken.None,
+            StartWithTicks(1_794_084_044_805, 2));
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task VerifiedCorrelation_TakesPriorityOverObservedAnchors()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithTimes(
@@ -842,10 +948,429 @@ public sealed class OpenCodeOriginalRequestServiceTests
             "ses_priority",
             "msg_verified",
             CancellationToken.None,
-            Start(1_000));
+            Start(1_000),
+            observedAssistantMessageIds: new[] { "msg_anchor" });
 
         Assert.AreEqual(OriginalRequestStatus.VerifiedJobCorrelation, result.Status);
         Assert.AreEqual("verified", result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_RolelessLiveActivityEvidence_FeedsApiCorrelation()
+    {
+        const string session = "ses_roleless_flow";
+        var snapshot = new DSMonitor.Models.ForgeJobSnapshot
+        {
+            Metadata = new DSMonitor.Models.ForgeJobMetadata
+            {
+                JobId = "job_roleless_flow",
+                MetadataPath = @"C:\synthetic\job_roleless_flow.json",
+                LogPath = @"C:\synthetic\job_roleless_flow.log"
+            },
+            SessionId = session,
+            ObservedAt = DateTimeOffset.UtcNow,
+            LiveActivity = new DSMonitor.Models.LiveActivitySnapshot
+            {
+                IsHealthy = true,
+                History = new[]
+                {
+                    new DSMonitor.Models.LiveActivityHistoryEntry(
+                        "job_roleless_flow",
+                        session,
+                        "msg_roleless_flow",
+                        "part_roleless_flow",
+                        "Observed roleless text — unverified",
+                        "request",
+                        @"C:\synthetic\job_roleless_flow.log",
+                        0,
+                        DateTimeOffset.UtcNow,
+                        DateTimeOffset.UtcNow,
+                        "digest",
+                        null)
+                }
+            }
+        };
+        var ids = OriginalRequestEvidence.Collect(snapshot, session);
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user_flow", "user", "request"),
+                ("msg_roleless_flow", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_roleless_flow",
+            session,
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: ids);
+
+        Assert.AreEqual(OriginalRequestStatus.ObservedJobCorrelation, result.Status);
+        Assert.AreEqual("request", result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_RolelessObservedId_ApiAssistantCorrelates()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user", "user", "request"),
+                ("msg_roleless", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_roleless_assistant",
+            "ses_roleless_assistant",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_roleless" });
+
+        Assert.AreEqual(OriginalRequestStatus.ObservedJobCorrelation, result.Status);
+        Assert.AreEqual("request", result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_RolelessObservedId_ApiUserRejectsCorrelation()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_roleless", "user", "request"),
+                ("msg_assistant", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_roleless_user",
+            "ses_roleless_user",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_roleless" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_ConflictingApiRoleForSameId_IsUnavailable()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_conflict", "user", "request"),
+                ("msg_conflict", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_conflicting_role",
+            "ses_conflicting_role",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_conflict" });
+
+        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
+        Assert.AreEqual(OriginalRequestUnavailableReason.DuplicateMessage, result.Reason);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_MissingAnchor_IsAmbiguousWithoutSingletonFallback()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user", "user", "only request"),
+                ("msg_assistant_other", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_missing_anchor",
+            "ses_missing_anchor",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant_missing" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_AnchorTypeMismatch_IsAmbiguous()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user", "user", "only request"),
+                ("msg_assistant", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_type_mismatch",
+            "ses_type_mismatch",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_user" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_ConflictingPredecessors_AreAmbiguous()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user_first", "user", "first request"),
+                ("msg_assistant_first", "assistant", null),
+                ("msg_user_second", "user", "second request"),
+                ("msg_assistant_second", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_conflict",
+            "ses_conflict",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds:
+                new[] { "msg_assistant_first", "msg_assistant_second" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_ContinuationSecondRequest_SelectsSecondUser()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user_first", "user", "first request"),
+                ("msg_assistant_first", "assistant", null),
+                ("msg_user_second", "user", "second request"),
+                ("msg_assistant_second", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_continuation",
+            "ses_continuation",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant_second" });
+
+        Assert.AreEqual(OriginalRequestStatus.ObservedJobCorrelation, result.Status);
+        Assert.AreEqual("second request", result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_AnchorIdOnlyInUserText_IsAmbiguous()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user", "user", "please inspect msg_fake"),
+                ("msg_assistant", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_fake_text",
+            "ses_fake_text",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_fake" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_UnknownVariants_ContentsIgnored()
+    {
+        const string json =
+            "{\"data\":[" +
+            "{\"id\":\"msg_user\",\"type\":\"user\",\"text\":\"request\"," +
+            "\"time\":{\"created\":1},\"files\":[]}," +
+            "{\"id\":\"msg_assistant\",\"type\":\"assistant\"," +
+            "\"text\":{\"unexpected\":true},\"time\":\"bad\",\"files\":{},\"extra\":[1]}," +
+            "{\"id\":\"msg_other\",\"type\":\"system\",\"text\":false," +
+            "\"time\":[],\"files\":{}}" +
+            "],\"cursor\":{\"previous\":null,\"next\":null,\"extra\":\"ok\"}," +
+            "\"extra\":true}";
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(json)));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_variants",
+            "ses_variants",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant" });
+
+        Assert.AreEqual(OriginalRequestStatus.ObservedJobCorrelation, result.Status);
+        Assert.AreEqual("request", result.Text);
+    }
+
+    [DataTestMethod]
+    [DataRow("""{"data":[{"id":"msg_assistant","type":"assistant"}],"data":[],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_assistant","type":"assistant"}],"cursor":{},"cursor":{}}""")]
+    [DataRow("""{"data":[{"id":"msg_assistant","type":"assistant"}],"cursor":{"previous":null,"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_assistant","type":"assistant"}],"cursor":{"previous":null,"next":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_assistant","id":"msg_assistant","type":"assistant"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_assistant","type":"assistant","type":"assistant"}],"cursor":{"previous":null,"next":null}}""")]
+    [DataRow("""{"data":[{"id":"msg_assistant","type":"assistant","time":{"created":1,"created":1}}],"cursor":{"previous":null,"next":null}}""")]
+    public async Task ObservedCorrelation_DuplicateConsumedProperties_IsUnavailable(string json)
+    {
+        var executor = new FakeExecutor((_, _) =>
+            Task.FromResult(Execution(json)));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_duplicate_properties",
+            "ses_duplicate_properties",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant" });
+
+        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
+        Assert.AreEqual(
+            OriginalRequestUnavailableReason.MalformedResponse,
+            result.Reason);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_DuplicateApiMessageId_IsUnavailable()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user", "user", "first"),
+                ("msg_assistant", "assistant", null),
+                ("msg_user", "user", "duplicate")))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_duplicate_api",
+            "ses_duplicate_api",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant" });
+
+        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
+        Assert.AreEqual(OriginalRequestUnavailableReason.DuplicateMessage, result.Reason);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_DuplicateEvidenceIds_IsAmbiguous()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_user", "user", "request"),
+                ("msg_assistant", "assistant", null)))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_duplicate_evidence",
+            "ses_duplicate_evidence",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant", "msg_assistant" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
+        Assert.AreEqual(0, executor.CallCount);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_InvalidEvidenceId_IsUnavailable()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(null, ("msg_user", "user", "request")))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_invalid_evidence",
+            "ses_invalid_evidence",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "bad id" });
+
+        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
+        Assert.AreEqual(OriginalRequestUnavailableReason.InvalidIdentifier, result.Reason);
+        Assert.AreEqual(0, executor.CallCount);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_ApiFailure_IsUnavailableWithoutFallback()
+    {
+        var executor = new FakeExecutor((_, _) =>
+            Task.FromResult(new OpenCodeCliExecution(1, "secret", false, false, true, false)));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_api_failure",
+            "ses_api_failure",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant" });
+
+        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
+        Assert.AreEqual(OriginalRequestUnavailableReason.ProcessFailure, result.Reason);
+        Assert.AreEqual(string.Empty, result.Text);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_RepeatedCursor_FailsClosed()
+    {
+        var requests = new List<ProcessStartInfo>();
+        var executor = new FakeExecutor((request, _) =>
+        {
+            requests.Add(request);
+            return Task.FromResult(Execution(
+                requests.Count == 1
+                    ? StreamPage(
+                        "cursor_one",
+                        ("msg_user", "user", "request"),
+                        ("msg_assistant", "assistant", null))
+                    : StreamPage("cursor_one", ("msg_other", "assistant", null))));
+        });
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_repeated_cursor",
+            "ses_repeated_cursor",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant" });
+
+        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
+        Assert.AreEqual(
+            OriginalRequestUnavailableReason.PaginationInconsistent,
+            result.Reason);
+        Assert.AreEqual(2, requests.Count);
+    }
+
+    [TestMethod]
+    public async Task ObservedCorrelation_AssistantBeforeAnyUser_IsAmbiguous()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            StreamPage(
+                null,
+                ("msg_assistant", "assistant", null),
+                ("msg_user", "user", "later request")))));
+        using var service = CreateService(executor);
+
+        var result = await service.GetOriginalRequestAsync(
+            "job_no_predecessor",
+            "ses_no_predecessor",
+            null,
+            CancellationToken.None,
+            observedAssistantMessageIds: new[] { "msg_assistant" });
+
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
     }
 
     [TestMethod]
@@ -954,6 +1479,25 @@ public sealed class OpenCodeOriginalRequestServiceTests
                 ",\"time\":{\"created\":" + message.Created +
                 "},\"text\":" + JsonSerializer.Serialize(message.Text) +
                 ",\"files\":[],\"type\":\"user\"}"));
+        var nextJson = next is null ? "null" : JsonSerializer.Serialize(next);
+        return "{\"data\":[" + data + "],\"cursor\":{\"previous\":null,\"next\":" +
+               nextJson + "}}";
+    }
+
+    private static string StreamPage(
+        string? next,
+        params (string Id, string Type, string? Text)[] messages)
+    {
+        var data = string.Join(
+            ",",
+            messages.Select(message =>
+                string.Equals(message.Type, "user", StringComparison.Ordinal)
+                    ? "{\"id\":" + JsonSerializer.Serialize(message.Id) +
+                      ",\"type\":\"user\",\"text\":" +
+                      JsonSerializer.Serialize(message.Text ?? string.Empty) +
+                      ",\"time\":{\"created\":1},\"files\":[]}"
+                    : "{\"id\":" + JsonSerializer.Serialize(message.Id) +
+                      ",\"type\":" + JsonSerializer.Serialize(message.Type) + "}"));
         var nextJson = next is null ? "null" : JsonSerializer.Serialize(next);
         return "{\"data\":[" + data + "],\"cursor\":{\"previous\":null,\"next\":" +
                nextJson + "}}";

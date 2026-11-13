@@ -115,7 +115,8 @@ public sealed class OriginalRequestUiTests
                 },
                 Status = ForgeJobStatus.Unknown,
                 SessionId = sessionId,
-                ObservedAt = DateTimeOffset.UtcNow
+                ObservedAt = DateTimeOffset.UtcNow,
+                LiveActivity = new LiveActivitySnapshot { IsHealthy = true }
             }
         }
     };
@@ -170,7 +171,8 @@ public sealed class OriginalRequestUiTests
             string sessionId,
             string? verifiedUserMessageId,
             CancellationToken cancellationToken,
-            DateTimeOffset? jobStartedAt = null)
+            DateTimeOffset? jobStartedAt = null,
+            IReadOnlyList<string>? observedAssistantMessageIds = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(_result);

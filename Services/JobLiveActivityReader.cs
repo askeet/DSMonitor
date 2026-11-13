@@ -407,6 +407,7 @@ public static class JobLiveActivityReader
                 HistoryRecords = historyRecords.ToArray(),
                 ReadWindowStart = start,
                 ReadWindowEnd = start + read,
+                IsHealthy = true,
                 Availability = "Bounded source re-read; timestamps describe source records, not execution liveness."
             };
         }

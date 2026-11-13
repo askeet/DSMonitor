@@ -93,6 +93,14 @@ public sealed record LiveActivitySnapshot
     internal Func<FullReportTarget, FullReportResult>? FullTextReader { get; init; }
 
     public string Availability { get; init; } = "N/A — no safely attributed activity available.";
+
+    /// <summary>
+    /// True only when this projection came from a successful guarded source
+    /// read. Monitoring failure and unavailable/unsafe projections are false.
+    /// A healthy projection may legitimately contain no activity anchors.
+    /// </summary>
+    public bool IsHealthy { get; init; }
+
     public const string RetentionNotice =
         "Transient excerpts from a bounded tail (up to 64 KB) of the job log; older results may be unavailable. " +
         "Re-read on restart, never restored from SQLite. Source order is used; observation is not proof of current execution, independent QA, or user acceptance.";

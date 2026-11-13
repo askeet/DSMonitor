@@ -61,6 +61,7 @@ public sealed class JobRowViewModel : ObservableObject
     private string _originalRequestAttributionText = string.Empty;
     private string? _originalRequestSessionId;
     private long? _originalRequestStartTicks;
+    private string? _originalRequestEvidenceFingerprint;
     private bool _originalRequestIsSuccess;
 
     public JobRowViewModel(ForgeJobSnapshot snapshot)
@@ -472,18 +473,28 @@ public sealed class JobRowViewModel : ObservableObject
 
     internal bool HasOriginalRequestFor(
         string sessionId,
-        DateTimeOffset? startedAt) =>
+        DateTimeOffset? startedAt,
+        string evidenceFingerprint) =>
         _originalRequestIsSuccess &&
         string.Equals(_originalRequestSessionId, sessionId, StringComparison.Ordinal) &&
-        _originalRequestStartTicks == StartTicks(startedAt);
+        _originalRequestStartTicks == StartTicks(startedAt) &&
+        string.Equals(
+            _originalRequestEvidenceFingerprint,
+            evidenceFingerprint,
+            StringComparison.Ordinal);
 
     internal void ApplyOriginalRequestResult(
         string sessionId,
         DateTimeOffset? startedAt,
+        string evidenceFingerprint,
         OpenCodeOriginalRequestResult result)
     {
         if (!string.Equals(Snapshot.SessionId, sessionId, StringComparison.Ordinal) ||
-            StartTicks(Snapshot.Metadata.Started) != StartTicks(startedAt))
+            StartTicks(Snapshot.Metadata.Started) != StartTicks(startedAt) ||
+            !string.Equals(
+                CurrentEvidenceFingerprint(sessionId),
+                evidenceFingerprint,
+                StringComparison.Ordinal))
         {
             return;
         }
@@ -491,6 +502,7 @@ public sealed class JobRowViewModel : ObservableObject
         var text = result.IsSuccess ? result.Text : string.Empty;
         var label = result.Status is OriginalRequestStatus.BestEffortSingleton or
             OriginalRequestStatus.VerifiedJobCorrelation or
+            OriginalRequestStatus.ObservedJobCorrelation or
             OriginalRequestStatus.BestEffortTimeCorrelation or
             OriginalRequestStatus.Ambiguous
             ? result.Label
@@ -498,6 +510,7 @@ public sealed class JobRowViewModel : ObservableObject
 
         _originalRequestSessionId = result.IsSuccess ? sessionId : null;
         _originalRequestStartTicks = result.IsSuccess ? StartTicks(startedAt) : null;
+        _originalRequestEvidenceFingerprint = result.IsSuccess ? evidenceFingerprint : null;
         _originalRequestIsSuccess = result.IsSuccess;
         SetText(text, ref _originalRequestText, nameof(OriginalRequestText));
         SetText(
@@ -506,10 +519,19 @@ public sealed class JobRowViewModel : ObservableObject
             nameof(OriginalRequestAttributionText));
     }
 
+    internal static string CurrentEvidenceFingerprint(
+        ForgeJobSnapshot snapshot,
+        string? sessionId) =>
+        OriginalRequestEvidence.Select(snapshot, sessionId).Fingerprint;
+
+    private string CurrentEvidenceFingerprint(string sessionId) =>
+        CurrentEvidenceFingerprint(Snapshot, sessionId);
+
     internal void ClearOriginalRequest()
     {
         _originalRequestSessionId = null;
         _originalRequestStartTicks = null;
+        _originalRequestEvidenceFingerprint = null;
         _originalRequestIsSuccess = false;
         SetText(string.Empty, ref _originalRequestText, nameof(OriginalRequestText));
         SetText(

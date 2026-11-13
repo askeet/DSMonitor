@@ -16,6 +16,12 @@ public enum OriginalRequestStatus
     None,
     BestEffortSingleton,
     VerifiedJobCorrelation,
+    ObservedJobCorrelation,
+
+    /// <summary>
+    /// Legacy value retained for source compatibility. The service no longer
+    /// selects a request by timestamp.
+    /// </summary>
     BestEffortTimeCorrelation,
     Ambiguous,
     Unavailable
@@ -52,6 +58,7 @@ public sealed record OpenCodeOriginalRequestResult
     public bool IsSuccess =>
         Status is OriginalRequestStatus.BestEffortSingleton or
             OriginalRequestStatus.VerifiedJobCorrelation or
+            OriginalRequestStatus.ObservedJobCorrelation or
             OriginalRequestStatus.BestEffortTimeCorrelation;
 
     public static OpenCodeOriginalRequestResult BestEffortSingleton(string text) => new()
@@ -69,6 +76,26 @@ public sealed record OpenCodeOriginalRequestResult
         Label = "Verified job-specific correlation."
     };
 
+    /// <summary>
+    /// A user message inferred from one or more observed assistant message ids
+    /// in the same verified session. Provider message order, not timestamps,
+    /// supplies the preceding user; this is an inference, not authoritative
+    /// ownership verification.
+    /// </summary>
+    public static OpenCodeOriginalRequestResult ObservedJobCorrelation(string text) => new()
+    {
+        Status = OriginalRequestStatus.ObservedJobCorrelation,
+        Text = text,
+        Label = "Observed message correlation — matched this job's verified Live Activity " +
+                "assistant message ids to the latest preceding user message in provider order " +
+                "for the verified session; this is an inference from message order, not " +
+                "authoritative proof of job ownership."
+    };
+
+    /// <summary>
+    /// Legacy factory retained for compatibility. It is not returned by the
+    /// service; timestamp-nearest attribution was removed.
+    /// </summary>
     public static OpenCodeOriginalRequestResult BestEffortTimeCorrelation(string text) => new()
     {
         Status = OriginalRequestStatus.BestEffortTimeCorrelation,
@@ -80,7 +107,7 @@ public sealed record OpenCodeOriginalRequestResult
     public static OpenCodeOriginalRequestResult Ambiguous() => new()
     {
         Status = OriginalRequestStatus.Ambiguous,
-        Label = "Ambiguous — multiple user messages and no unique verified job-specific correlation."
+        Label = "Ambiguous — no unique exact observed request correlation."
     };
 
     public static OpenCodeOriginalRequestResult None() => new()
@@ -102,7 +129,8 @@ public interface IOriginalRequestService : IDisposable
         string sessionId,
         string? verifiedUserMessageId,
         CancellationToken cancellationToken,
-        DateTimeOffset? jobStartedAt = null);
+        DateTimeOffset? jobStartedAt = null,
+        IReadOnlyList<string>? observedAssistantMessageIds = null);
 
     void InvalidateJob(string jobId);
 
@@ -123,7 +151,8 @@ public sealed class DisabledOriginalRequestService : IOriginalRequestService
         string sessionId,
         string? verifiedUserMessageId,
         CancellationToken cancellationToken,
-        DateTimeOffset? jobStartedAt = null)
+        DateTimeOffset? jobStartedAt = null,
+        IReadOnlyList<string>? observedAssistantMessageIds = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(OpenCodeOriginalRequestResult.None());
@@ -454,13 +483,16 @@ public sealed class OpenCodeCliProcessExecutor : IOpenCodeCliExecutor
 
 /// <summary>
 /// Reads the selected job's verified OpenCode session through the read-only
-/// CLI. It queries only user messages, reads all bounded pages before deciding,
-/// and fails closed on any uncertain response. Without a verified message id,
-/// a singleton is shown as best effort; multiple messages are attributed only
-/// when one timestamp is uniquely closest to the job start (no window or
-/// direction restriction). A successful singleton, verified correlation, or
-/// time correlation is cached in bounded memory keyed by job, session, and
-/// exact start time; transient failures and ambiguous results are never cached.
+/// CLI. With no observed assistant evidence it queries only user messages and
+/// reads all bounded pages: exactly one user message is shown as a best-effort
+/// singleton, and multiple messages are ambiguous. With observed assistant
+/// message ids it reads one unfiltered ascending message stream, requires
+/// complete bounded pagination and distinct ids, matches every observed id to
+/// an API assistant message, and selects the latest preceding user only when
+/// every matched assistant has the same predecessor. Provider order is used;
+/// timestamps are never an attribution input. Contradictory evidence never
+/// falls back to the singleton heuristic. Responses are bounded and transient;
+/// no response body or error text is logged.
 /// </summary>
 public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
 {
@@ -500,9 +532,11 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         string sessionId,
         string? verifiedUserMessageId,
         CancellationToken cancellationToken,
-        DateTimeOffset? jobStartedAt = null)
+        DateTimeOffset? jobStartedAt = null,
+        IReadOnlyList<string>? observedAssistantMessageIds = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _ = jobStartedAt; // Retained for contract compatibility; timestamps are not evidence.
         if (!OpenCodeIdentifiers.IsSafeJobId(jobId) ||
             !OpenCodeIdentifiers.IsSafeSessionId(sessionId) ||
             (verifiedUserMessageId is not null &&
@@ -512,11 +546,23 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
                 OriginalRequestUnavailableReason.InvalidIdentifier);
         }
 
+        if (!TryNormalizeObservedIds(
+                observedAssistantMessageIds,
+                out var observedIds,
+                out var evidenceFailure))
+        {
+            return evidenceFailure;
+        }
+
+        var evidenceFingerprint = OriginalRequestEvidence.ComputeFingerprint(
+            jobId,
+            sessionId,
+            observedIds);
         var key = new CacheKey(
             jobId,
             sessionId,
             verifiedUserMessageId ?? string.Empty,
-            jobStartedAt?.ToUniversalTime().Ticks);
+            evidenceFingerprint);
         Task<OpenCodeOriginalRequestResult> task;
         lock (_gate)
         {
@@ -541,7 +587,7 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
                 var operationId = ++_nextOperationId;
                 var inFlight = new InFlight(operationId, generation);
                 var lazy = new Lazy<Task<OpenCodeOriginalRequestResult>>(
-                    () => ExecuteAndCacheAsync(key, inFlight),
+                    () => ExecuteAndCacheAsync(key, inFlight, observedIds),
                     LazyThreadSafetyMode.ExecutionAndPublication);
                 inFlight.Task = lazy.Value;
                 _inFlight[key] = inFlight;
@@ -552,6 +598,48 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         return cancellationToken.CanBeCanceled
             ? await task.WaitAsync(cancellationToken).ConfigureAwait(false)
             : await task.ConfigureAwait(false);
+    }
+
+    private static bool TryNormalizeObservedIds(
+        IReadOnlyList<string>? input,
+        out string[] normalized,
+        out OpenCodeOriginalRequestResult failure)
+    {
+        normalized = Array.Empty<string>();
+        failure = null!;
+        if (input is null || input.Count == 0)
+        {
+            return true;
+        }
+
+        if (input.Count > OriginalRequestEvidence.MaxMessageIds)
+        {
+            failure = OpenCodeOriginalRequestResult.Unavailable(
+                OriginalRequestUnavailableReason.InvalidIdentifier);
+            return false;
+        }
+
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var id in input)
+        {
+            if (!OpenCodeIdentifiers.IsSafeMessageId(id))
+            {
+                failure = OpenCodeOriginalRequestResult.Unavailable(
+                    OriginalRequestUnavailableReason.InvalidIdentifier);
+                return false;
+            }
+
+            if (!set.Add(id!))
+            {
+                // Duplicate observed evidence is contradictory, not an
+                // invitation to fall back to a singleton guess.
+                failure = OpenCodeOriginalRequestResult.Ambiguous();
+                return false;
+            }
+        }
+
+        normalized = set.OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        return true;
     }
 
     public void InvalidateJob(string jobId)
@@ -611,7 +699,8 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
 
     private async Task<OpenCodeOriginalRequestResult> ExecuteAndCacheAsync(
         CacheKey key,
-        InFlight inFlight)
+        InFlight inFlight,
+        IReadOnlyList<string> observedIds)
     {
         // Yield so the caller can publish the in-flight entry before a
         // synchronously completing test executor re-enters the cache lock.
@@ -620,7 +709,7 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         OpenCodeOriginalRequestResult result;
         try
         {
-            result = await FetchAsync(key, _lifetime.Token).ConfigureAwait(false);
+            result = await FetchAsync(key, observedIds, _lifetime.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -655,12 +744,25 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
 
     private async Task<OpenCodeOriginalRequestResult> FetchAsync(
         CacheKey key,
+        IReadOnlyList<string> observedIds,
         CancellationToken lifetimeToken)
     {
         using var operationCts = CancellationTokenSource.CreateLinkedTokenSource(lifetimeToken);
         operationCts.CancelAfter(_options.OperationTimeout);
         var operationToken = operationCts.Token;
 
+        return observedIds.Count > 0 && key.VerifiedMessageId.Length == 0
+            ? await FetchObservedAsync(key, observedIds, operationToken, lifetimeToken)
+                .ConfigureAwait(false)
+            : await FetchUserOnlyAsync(key, operationToken, lifetimeToken)
+                .ConfigureAwait(false);
+    }
+
+    private async Task<OpenCodeOriginalRequestResult> FetchUserOnlyAsync(
+        CacheKey key,
+        CancellationToken operationToken,
+        CancellationToken lifetimeToken)
+    {
         string? cursor = null;
         var seenIds = new HashSet<string>(StringComparer.Ordinal);
         var seenCursors = new HashSet<string>(StringComparer.Ordinal);
@@ -668,162 +770,260 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         string? singleText = null;
         string? matchedText = null;
         var matchCount = 0;
-        UserMessage? nearestMessage = null;
-        var nearestDistanceTicks = long.MaxValue;
-        var nearestDistanceTied = false;
 
         for (var page = 0; page < _options.MaxPages; page++)
         {
-            try
+            var read = await ExecutePageAsync(
+                    key.SessionId,
+                    cursor,
+                    userOnly: true,
+                    operationToken,
+                    lifetimeToken)
+                .ConfigureAwait(false);
+            if (read.Error is { } error)
             {
-                operationToken.ThrowIfCancellationRequested();
-                var startInfo = CreateStartInfo(key.SessionId, cursor);
-                var execution = await _executor
-                    .ExecuteAsync(startInfo, operationToken)
-                    .WaitAsync(operationToken)
-                    .ConfigureAwait(false);
+                return error;
+            }
 
-                if (execution.TimedOut)
+            var parsed = read.UserPage!.Value;
+            if (!TryValidatePagination(parsed.Next, page, seenCursors, out error))
+            {
+                return error;
+            }
+
+            foreach (var message in parsed.Messages)
+            {
+                if (!seenIds.Add(message.Id))
                 {
                     return OpenCodeOriginalRequestResult.Unavailable(
-                        OriginalRequestUnavailableReason.TimedOut);
+                        OriginalRequestUnavailableReason.DuplicateMessage);
                 }
 
-                if (execution.ReadFailed)
+                totalMessages++;
+                if (key.VerifiedMessageId.Length > 0)
                 {
-                    return OpenCodeOriginalRequestResult.Unavailable(
-                        OriginalRequestUnavailableReason.ProcessFailure);
-                }
-
-                if (execution.OutputLimitExceeded ||
-                    execution.StandardOutput.Length > _options.MaxResponseCharacters)
-                {
-                    return OpenCodeOriginalRequestResult.Unavailable(
-                        OriginalRequestUnavailableReason.ResponseLimitExceeded);
-                }
-
-                if (execution.FailedToStart || execution.ExitCode != 0)
-                {
-                    return OpenCodeOriginalRequestResult.Unavailable(
-                        OriginalRequestUnavailableReason.ProcessFailure);
-                }
-
-                if (!TryParsePage(execution.StandardOutput, out var parsed, out var parseReason))
-                {
-                    return OpenCodeOriginalRequestResult.Unavailable(parseReason);
-                }
-
-                // Validate pagination before interpreting page content. A
-                // repeated cursor or an exceeded page bound is an uncertain
-                // timeline even when the current page already proves ambiguity.
-                if (parsed.Next is not null)
-                {
-                    if (!seenCursors.Add(parsed.Next))
+                    if (string.Equals(message.Id, key.VerifiedMessageId, StringComparison.Ordinal))
                     {
-                        return OpenCodeOriginalRequestResult.Unavailable(
-                            OriginalRequestUnavailableReason.PaginationInconsistent);
-                    }
-
-                    if (page == _options.MaxPages - 1)
-                    {
-                        return OpenCodeOriginalRequestResult.Unavailable(
-                            OriginalRequestUnavailableReason.PaginationLimit);
-                    }
-                }
-
-                foreach (var message in parsed.Messages)
-                {
-                    if (!seenIds.Add(message.Id))
-                    {
-                        return OpenCodeOriginalRequestResult.Unavailable(
-                            OriginalRequestUnavailableReason.DuplicateMessage);
-                    }
-
-                    totalMessages++;
-                    if (key.VerifiedMessageId.Length > 0)
-                    {
-                        if (string.Equals(message.Id, key.VerifiedMessageId, StringComparison.Ordinal))
+                        matchCount++;
+                        if (message.Text.Length > _options.MaxTextCharacters)
                         {
-                            matchCount++;
-                            if (message.Text.Length > _options.MaxTextCharacters)
-                            {
-                                return OpenCodeOriginalRequestResult.Unavailable(
-                                    OriginalRequestUnavailableReason.TextLimitExceeded);
-                            }
-
-                            matchedText = message.Text;
-                        }
-                    }
-                    else
-                    {
-                        if (totalMessages == 1)
-                        {
-                            singleText = message.Text;
+                            return OpenCodeOriginalRequestResult.Unavailable(
+                                OriginalRequestUnavailableReason.TextLimitExceeded);
                         }
 
-                        if (key.StartTicks is { } startedTicks &&
-                            IsSupportedJobStartTicks(startedTicks))
-                        {
-                            var distanceTicks = Math.Abs(
-                                message.Created.UtcTicks - startedTicks);
-                            if (distanceTicks < nearestDistanceTicks)
-                            {
-                                nearestDistanceTicks = distanceTicks;
-                                nearestMessage = message;
-                                nearestDistanceTied = false;
-                            }
-                            else if (distanceTicks == nearestDistanceTicks)
-                            {
-                                nearestDistanceTied = true;
-                            }
-                        }
+                        matchedText = message.Text;
                     }
                 }
-
-                if (parsed.Next is null)
+                else if (totalMessages == 1)
                 {
-                    return Resolve(
-                        key,
-                        totalMessages,
-                        singleText,
-                        matchCount,
-                        matchedText,
-                        nearestMessage,
-                        nearestDistanceTied,
-                        _options.MaxTextCharacters);
+                    singleText = message.Text;
                 }
+            }
 
-                cursor = parsed.Next;
-            }
-            catch (OperationCanceledException)
+            if (parsed.Next is null)
             {
-                if (lifetimeToken.IsCancellationRequested)
-                {
-                    throw;
-                }
+                return ResolveUserOnly(
+                    key,
+                    totalMessages,
+                    singleText,
+                    matchCount,
+                    matchedText,
+                    _options.MaxTextCharacters);
+            }
 
-                return OpenCodeOriginalRequestResult.Unavailable(
-                    OriginalRequestUnavailableReason.TimedOut);
-            }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
-            {
-                return OpenCodeOriginalRequestResult.Unavailable(
-                    OriginalRequestUnavailableReason.ProcessFailure);
-            }
+            cursor = parsed.Next;
         }
 
         return OpenCodeOriginalRequestResult.Unavailable(
             OriginalRequestUnavailableReason.PaginationLimit);
     }
 
-    private static OpenCodeOriginalRequestResult Resolve(
+    private async Task<OpenCodeOriginalRequestResult> FetchObservedAsync(
+        CacheKey key,
+        IReadOnlyList<string> observedIds,
+        CancellationToken operationToken,
+        CancellationToken lifetimeToken)
+    {
+        string? cursor = null;
+        var anchors = new HashSet<string>(observedIds, StringComparer.Ordinal);
+        var seenIds = new HashSet<string>(StringComparer.Ordinal);
+        var seenCursors = new HashSet<string>(StringComparer.Ordinal);
+        var predecessors = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var users = new Dictionary<string, UserMessage>(StringComparer.Ordinal);
+        string? lastUserId = null;
+
+        for (var page = 0; page < _options.MaxPages; page++)
+        {
+            var read = await ExecutePageAsync(
+                    key.SessionId,
+                    cursor,
+                    userOnly: false,
+                    operationToken,
+                    lifetimeToken)
+                .ConfigureAwait(false);
+            if (read.Error is { } error)
+            {
+                return error;
+            }
+
+            var parsed = read.UnfilteredPage!.Value;
+            if (!TryValidatePagination(parsed.Next, page, seenCursors, out error))
+            {
+                return error;
+            }
+
+            foreach (var message in parsed.Messages)
+            {
+                if (!seenIds.Add(message.Id))
+                {
+                    return OpenCodeOriginalRequestResult.Unavailable(
+                        OriginalRequestUnavailableReason.DuplicateMessage);
+                }
+
+                if (string.Equals(message.Type, "user", StringComparison.Ordinal))
+                {
+                    users[message.Id] = new UserMessage(
+                        message.Id,
+                        message.Text!,
+                        message.Created);
+                    lastUserId = message.Id;
+                }
+                else if (string.Equals(message.Type, "assistant", StringComparison.Ordinal) &&
+                         anchors.Contains(message.Id))
+                {
+                    // Provider stream order supplies the preceding user. No
+                    // timestamp comparison is made.
+                    if (!predecessors.TryAdd(message.Id, lastUserId))
+                    {
+                        return OpenCodeOriginalRequestResult.Unavailable(
+                            OriginalRequestUnavailableReason.DuplicateMessage);
+                    }
+                }
+            }
+
+            if (parsed.Next is null)
+            {
+                return ResolveObserved(
+                    anchors,
+                    predecessors,
+                    users,
+                    _options.MaxTextCharacters);
+            }
+
+            cursor = parsed.Next;
+        }
+
+        return OpenCodeOriginalRequestResult.Unavailable(
+            OriginalRequestUnavailableReason.PaginationLimit);
+    }
+
+    private async Task<PageExecution> ExecutePageAsync(
+        string sessionId,
+        string? cursor,
+        bool userOnly,
+        CancellationToken operationToken,
+        CancellationToken lifetimeToken)
+    {
+        try
+        {
+            operationToken.ThrowIfCancellationRequested();
+            var startInfo = CreateStartInfo(sessionId, cursor, userOnly);
+            var execution = await _executor
+                .ExecuteAsync(startInfo, operationToken)
+                .WaitAsync(operationToken)
+                .ConfigureAwait(false);
+
+            if (execution.TimedOut)
+            {
+                return PageExecution.FromReason(OriginalRequestUnavailableReason.TimedOut);
+            }
+
+            if (execution.ReadFailed)
+            {
+                return PageExecution.FromReason(OriginalRequestUnavailableReason.ProcessFailure);
+            }
+
+            if (execution.OutputLimitExceeded ||
+                execution.StandardOutput.Length > _options.MaxResponseCharacters)
+            {
+                return PageExecution.FromReason(
+                    OriginalRequestUnavailableReason.ResponseLimitExceeded);
+            }
+
+            if (execution.FailedToStart || execution.ExitCode != 0)
+            {
+                return PageExecution.FromReason(OriginalRequestUnavailableReason.ProcessFailure);
+            }
+
+            if (userOnly)
+            {
+                return TryParsePage(
+                    execution.StandardOutput,
+                    out var parsed,
+                    out var parseReason)
+                    ? PageExecution.FromUser(parsed)
+                    : PageExecution.FromReason(parseReason);
+            }
+
+            return TryParseStreamPage(
+                execution.StandardOutput,
+                out var stream,
+                out var streamReason)
+                ? PageExecution.FromStream(stream)
+                : PageExecution.FromReason(streamReason);
+        }
+        catch (OperationCanceledException)
+        {
+            if (lifetimeToken.IsCancellationRequested)
+            {
+                throw;
+            }
+
+            return PageExecution.FromReason(OriginalRequestUnavailableReason.TimedOut);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            return PageExecution.FromReason(OriginalRequestUnavailableReason.ProcessFailure);
+        }
+    }
+
+    private bool TryValidatePagination(
+        string? next,
+        int page,
+        HashSet<string> seenCursors,
+        out OpenCodeOriginalRequestResult error)
+    {
+        error = null!;
+        if (next is null)
+        {
+            return true;
+        }
+
+        // A repeated cursor or an exceeded page bound is an uncertain stream
+        // even when the current page already proves ambiguity.
+        if (!seenCursors.Add(next))
+        {
+            error = OpenCodeOriginalRequestResult.Unavailable(
+                OriginalRequestUnavailableReason.PaginationInconsistent);
+            return false;
+        }
+
+        if (page == _options.MaxPages - 1)
+        {
+            error = OpenCodeOriginalRequestResult.Unavailable(
+                OriginalRequestUnavailableReason.PaginationLimit);
+            return false;
+        }
+
+        return true;
+    }
+
+    private static OpenCodeOriginalRequestResult ResolveUserOnly(
         CacheKey key,
         int totalMessages,
         string? singleText,
         int matchCount,
         string? matchedText,
-        UserMessage? nearestMessage,
-        bool nearestDistanceTied,
         int maxTextCharacters)
     {
         if (totalMessages == 0)
@@ -857,40 +1057,73 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
                 : OpenCodeOriginalRequestResult.BestEffortSingleton(singleText);
         }
 
-        // Multiple messages can only be attributed by the caller's explicit
-        // verified id or, absent one, the uniquely nearest timestamp. A missing
-        // start, a tie, or an unusable start leaves the field empty.
-        if (key.StartTicks is not { } startedTicks)
-        {
-            return OpenCodeOriginalRequestResult.Ambiguous();
-        }
-
-        if (!IsSupportedJobStartTicks(startedTicks))
-        {
-            return OpenCodeOriginalRequestResult.Unavailable(
-                OriginalRequestUnavailableReason.InvalidJobTimestamp);
-        }
-
-        if (nearestDistanceTied || nearestMessage is not { } nearest)
-        {
-            return OpenCodeOriginalRequestResult.Ambiguous();
-        }
-
-        return nearest.Text.Length > maxTextCharacters
-            ? OpenCodeOriginalRequestResult.Unavailable(
-                OriginalRequestUnavailableReason.TextLimitExceeded)
-            : OpenCodeOriginalRequestResult.BestEffortTimeCorrelation(nearest.Text);
+        // Multiple user messages without observed assistant anchors are never
+        // attributed by timestamp. The field remains empty and ambiguous.
+        return OpenCodeOriginalRequestResult.Ambiguous();
     }
 
-    private static bool IsSupportedJobStartTicks(long utcTicks) =>
-        utcTicks > 0 && utcTicks < DateTimeOffset.MaxValue.Ticks;
+    private static OpenCodeOriginalRequestResult ResolveObserved(
+        IReadOnlyCollection<string> anchors,
+        IReadOnlyDictionary<string, string?> predecessors,
+        IReadOnlyDictionary<string, UserMessage> users,
+        int maxTextCharacters)
+    {
+        if (anchors.Count == 0)
+        {
+            return OpenCodeOriginalRequestResult.Ambiguous();
+        }
 
-    private ProcessStartInfo CreateStartInfo(string sessionId, string? cursor)
+        string? commonUserId = null;
+        foreach (var anchor in anchors)
+        {
+            if (!predecessors.TryGetValue(anchor, out var predecessor) ||
+                predecessor is null)
+            {
+                // A missing anchor, a non-assistant type, or an assistant
+                // before any user is contradictory evidence. Never fall back to
+                // the singleton heuristic in this case.
+                return OpenCodeOriginalRequestResult.Ambiguous();
+            }
+
+            if (commonUserId is null)
+            {
+                commonUserId = predecessor;
+            }
+            else if (!string.Equals(commonUserId, predecessor, StringComparison.Ordinal))
+            {
+                // Anchors split across requests/continuations do not identify
+                // one original request.
+                return OpenCodeOriginalRequestResult.Ambiguous();
+            }
+        }
+
+        if (commonUserId is null ||
+            !users.TryGetValue(commonUserId, out var user) ||
+            user.Text is null)
+        {
+            return OpenCodeOriginalRequestResult.Ambiguous();
+        }
+
+        return user.Text.Length > maxTextCharacters
+            ? OpenCodeOriginalRequestResult.Unavailable(
+                OriginalRequestUnavailableReason.TextLimitExceeded)
+            : OpenCodeOriginalRequestResult.ObservedJobCorrelation(user.Text);
+    }
+
+    private ProcessStartInfo CreateStartInfo(
+        string sessionId,
+        string? cursor,
+        bool userOnly)
     {
         var path = "/api/session/" +
                    Uri.EscapeDataString(sessionId) +
-                   "/message?type=user&limit=" +
-                   _options.PageSize.ToString(CultureInfo.InvariantCulture);
+                   "/message?";
+        if (userOnly)
+        {
+            path += "type=user&";
+        }
+
+        path += "limit=" + _options.PageSize.ToString(CultureInfo.InvariantCulture);
         path += cursor is null
             ? "&order=asc"
             : "&cursor=" + Uri.EscapeDataString(cursor);
@@ -937,19 +1170,23 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
 
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object ||
-                !root.TryGetProperty("data", out var data) ||
+                !TryGetSingleProperty(root, "data", out var data, out var hasData) ||
+                !hasData ||
                 data.ValueKind != JsonValueKind.Array ||
-                !root.TryGetProperty("cursor", out var cursor) ||
+                !TryGetSingleProperty(root, "cursor", out var cursor, out var hasCursor) ||
+                !hasCursor ||
                 cursor.ValueKind != JsonValueKind.Object ||
-                (cursor.TryGetProperty("previous", out var previous) &&
+                !TryGetSingleProperty(cursor, "previous", out var previous, out var hasPrevious) ||
+                (hasPrevious &&
                  previous.ValueKind is not (JsonValueKind.Null or JsonValueKind.String)) ||
-                (cursor.TryGetProperty("next", out var nextElement) &&
+                !TryGetSingleProperty(cursor, "next", out var nextElement, out var hasNext) ||
+                (hasNext &&
                  nextElement.ValueKind is not (JsonValueKind.Null or JsonValueKind.String)))
             {
                 return false;
             }
 
-            var next = nextElement.ValueKind == JsonValueKind.String
+            var next = hasNext && nextElement.ValueKind == JsonValueKind.String
                 ? nextElement.GetString()
                 : null;
             if (next is not null && !OpenCodeIdentifiers.IsSafeCursor(next))
@@ -982,32 +1219,254 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         }
     }
 
+    private static bool TryParseStreamPage(
+        string json,
+        out StreamPage parsed,
+        out OriginalRequestUnavailableReason reason)
+    {
+        parsed = default;
+        reason = OriginalRequestUnavailableReason.MalformedResponse;
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(
+                json,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 64
+                });
+
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryGetSingleProperty(root, "data", out var data, out var hasData) ||
+                !hasData ||
+                data.ValueKind != JsonValueKind.Array ||
+                !TryGetSingleProperty(root, "cursor", out var cursor, out var hasCursor) ||
+                !hasCursor ||
+                cursor.ValueKind != JsonValueKind.Object ||
+                !TryGetSingleProperty(cursor, "previous", out var previous, out var hasPrevious) ||
+                (hasPrevious &&
+                 previous.ValueKind is not (JsonValueKind.Null or JsonValueKind.String)) ||
+                !TryGetSingleProperty(cursor, "next", out var nextElement, out var hasNext) ||
+                (hasNext &&
+                 nextElement.ValueKind is not (JsonValueKind.Null or JsonValueKind.String)))
+            {
+                return false;
+            }
+
+            var next = hasNext && nextElement.ValueKind == JsonValueKind.String
+                ? nextElement.GetString()
+                : null;
+            if (next is not null && !OpenCodeIdentifiers.IsSafeCursor(next))
+            {
+                return false;
+            }
+
+            var messages = new List<StreamMessage>();
+            foreach (var item in data.EnumerateArray())
+            {
+                if (!TryParseStreamMessage(item, out var message))
+                {
+                    return false;
+                }
+
+                messages.Add(message);
+            }
+
+            parsed = new StreamPage(messages, next);
+            reason = OriginalRequestUnavailableReason.None;
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseStreamMessage(JsonElement item, out StreamMessage message)
+    {
+        message = default;
+        if (item.ValueKind != JsonValueKind.Object ||
+            !TryGetSingleProperty(item, "id", out var idElement, out var hasId) ||
+            !hasId ||
+            idElement.ValueKind != JsonValueKind.String ||
+            !OpenCodeIdentifiers.IsSafeMessageId(idElement.GetString()) ||
+            !TryGetSingleProperty(item, "type", out var typeElement, out var hasType) ||
+            !hasType ||
+            typeElement.ValueKind != JsonValueKind.String ||
+            !IsSafeMessageType(typeElement.GetString()))
+        {
+            return false;
+        }
+
+        var id = idElement.GetString()!;
+        var type = typeElement.GetString()!;
+        if (!string.Equals(type, "user", StringComparison.Ordinal))
+        {
+            // The unfiltered stream also contains assistant and other variants.
+            // Their contents are deliberately not read or retained; identity
+            // and type are sufficient for anchor matching and duplicate checks.
+            // A time object is inspected only for duplicate "created" keys.
+            if (!TryGetSingleProperty(item, "time", out var otherTime, out var hasOtherTime))
+            {
+                return false;
+            }
+
+            if (hasOtherTime &&
+                otherTime.ValueKind == JsonValueKind.Object &&
+                !TryGetSingleProperty(otherTime, "created", out _, out _))
+            {
+                return false;
+            }
+
+            message = new StreamMessage(id, type, null, null);
+            return true;
+        }
+
+        if (!TryGetSingleProperty(item, "text", out var textElement, out var hasText) ||
+            !hasText ||
+            textElement.ValueKind != JsonValueKind.String ||
+            !TryGetSingleProperty(item, "time", out var timeElement, out var hasTime) ||
+            !hasTime ||
+            timeElement.ValueKind != JsonValueKind.Object ||
+            !TryGetSingleProperty(timeElement, "created", out var createdElement, out var hasCreated) ||
+            !hasCreated ||
+            createdElement.ValueKind != JsonValueKind.Number ||
+            !createdElement.TryGetDouble(out var createdNumber) ||
+            !double.IsFinite(createdNumber))
+        {
+            return false;
+        }
+
+        if (!TryGetSingleProperty(item, "files", out var files, out var hasFiles))
+        {
+            return false;
+        }
+
+        if (hasFiles && files.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        DateTimeOffset? createdTimestamp =
+            ExactUnixMillisecondTimestamp.TryParse(createdElement, out var exactTimestamp)
+                ? exactTimestamp
+                : null;
+        message = new StreamMessage(
+            id,
+            type,
+            textElement.GetString()!,
+            createdTimestamp);
+        return true;
+    }
+
+    /// <summary>
+    /// Reads one property occurrence and rejects duplicate keys. The bounded
+    /// JSON document has already been parsed; this only prevents permissive
+    /// last-key-wins behavior for properties the service consumes.
+    /// </summary>
+    private static bool TryGetSingleProperty(
+        JsonElement value,
+        string name,
+        out JsonElement result,
+        out bool present)
+    {
+        result = default;
+        present = false;
+        var count = 0;
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!property.NameEquals(name))
+            {
+                continue;
+            }
+
+            count++;
+            if (count > 1)
+            {
+                return false;
+            }
+
+            result = property.Value;
+            present = true;
+        }
+
+        return true;
+    }
+
+
+    private static bool IsSafeMessageType(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 64)
+        {
+            return false;
+        }
+
+        foreach (var character in value)
+        {
+            if (character < 0x20 || character == 0x7F)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static bool TryParseUserMessage(JsonElement item, out UserMessage message)
     {
         message = default;
         if (item.ValueKind != JsonValueKind.Object ||
-            !item.TryGetProperty("id", out var idElement) ||
+            !TryGetSingleProperty(item, "id", out var idElement, out var hasId) ||
+            !hasId ||
             idElement.ValueKind != JsonValueKind.String ||
             !OpenCodeIdentifiers.IsSafeMessageId(idElement.GetString()) ||
-            !item.TryGetProperty("type", out var typeElement) ||
+            !TryGetSingleProperty(item, "type", out var typeElement, out var hasType) ||
+            !hasType ||
             typeElement.ValueKind != JsonValueKind.String ||
             !string.Equals(typeElement.GetString(), "user", StringComparison.Ordinal) ||
-            !item.TryGetProperty("text", out var textElement) ||
+            !TryGetSingleProperty(item, "text", out var textElement, out var hasText) ||
+            !hasText ||
             textElement.ValueKind != JsonValueKind.String ||
-            !item.TryGetProperty("time", out var timeElement) ||
+            !TryGetSingleProperty(item, "time", out var timeElement, out var hasTime) ||
+            !hasTime ||
             timeElement.ValueKind != JsonValueKind.Object ||
-            !timeElement.TryGetProperty("created", out var createdElement) ||
-            !ExactUnixMillisecondTimestamp.TryParse(createdElement, out var createdTimestamp))
+            !TryGetSingleProperty(timeElement, "created", out var createdElement, out var hasCreated) ||
+            !hasCreated ||
+            createdElement.ValueKind != JsonValueKind.Number ||
+            !createdElement.TryGetDouble(out var createdNumber) ||
+            !double.IsFinite(createdNumber))
         {
             return false;
         }
 
-        if (item.TryGetProperty("files", out var files) &&
-            files.ValueKind != JsonValueKind.Array)
+        if (!TryGetSingleProperty(item, "files", out var files, out var hasFiles))
         {
             return false;
         }
 
+        if (hasFiles && files.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        // Timestamp precision is optional for singleton and verified-id
+        // attribution. A structurally valid finite number whose exact tick is
+        // unavailable stays explicit as null instead of being approximated.
+        DateTimeOffset? createdTimestamp =
+            ExactUnixMillisecondTimestamp.TryParse(createdElement, out var exactTimestamp)
+                ? exactTimestamp
+                : null;
         message = new UserMessage(
             idElement.GetString()!,
             textElement.GetString()!,
@@ -1084,7 +1543,7 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         string JobId,
         string SessionId,
         string VerifiedMessageId,
-        long? StartTicks);
+        string EvidenceFingerprint);
 
     private readonly record struct Generation(long Epoch, long JobGeneration);
 
@@ -1106,11 +1565,36 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
     private readonly record struct UserMessage(
         string Id,
         string Text,
-        DateTimeOffset Created);
+        DateTimeOffset? Created);
+
+    private readonly record struct StreamMessage(
+        string Id,
+        string Type,
+        string? Text,
+        DateTimeOffset? Created);
 
     private readonly record struct ParsedPage(
         IReadOnlyList<UserMessage> Messages,
         string? Next);
+
+    private readonly record struct StreamPage(
+        IReadOnlyList<StreamMessage> Messages,
+        string? Next);
+
+    private sealed record PageExecution(
+        ParsedPage? UserPage,
+        StreamPage? UnfilteredPage,
+        OpenCodeOriginalRequestResult? Error)
+    {
+        public static PageExecution FromUser(ParsedPage page) =>
+            new(page, null, null);
+
+        public static PageExecution FromStream(StreamPage page) =>
+            new(null, page, null);
+
+        public static PageExecution FromReason(OriginalRequestUnavailableReason reason) =>
+            new(null, null, OpenCodeOriginalRequestResult.Unavailable(reason));
+    }
 }
 
 /// <summary>
