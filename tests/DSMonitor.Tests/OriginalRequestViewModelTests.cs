@@ -202,6 +202,116 @@ public sealed class OriginalRequestViewModelTests
     }
 
     [TestMethod]
+    public void ProvisionalRequest_IsClearedWhenAssistantEvidenceAppears()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(Snapshot(("job_a", "ses_a")));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+        PumpUntil(() => service.Requests.Count == 1, "the provisional request");
+        service.Complete("job_a", "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("provisional"));
+        PumpUntil(() => job.OriginalRequestText == "provisional", "the provisional result");
+
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_a"));
+        Assert.AreEqual(string.Empty, job.OriginalRequestText);
+        PumpUntil(() => service.Requests.Count == 2, "the exact evidence request");
+        service.Complete("job_a", "ses_a", null, new[] { "msg_a" },
+            OpenCodeOriginalRequestResult.ObservedJobCorrelation("exact"));
+        PumpUntil(() => job.OriginalRequestText == "exact", "the exact result");
+    }
+
+    [TestMethod]
+    public void ProvisionalRequest_StatusChangeRetriesWithoutRepeatingUnchangedRefreshes()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        var snapshot = Snapshot(("job_a", "ses_a"));
+        viewModel.ApplySnapshot(snapshot);
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+        PumpUntil(() => service.Requests.Count == 1, "the initial request");
+        service.Complete("job_a", "ses_a", OpenCodeOriginalRequestResult.None());
+        PumpOnce();
+        viewModel.ApplySnapshot(snapshot);
+        Assert.AreEqual(1, service.Requests.Count);
+
+        var updatedJob = snapshot.Jobs.Single() with { Status = ForgeJobStatus.Done };
+        viewModel.ApplySnapshot(snapshot with { Jobs = new[] { updatedJob } });
+        PumpUntil(() => service.Requests.Count == 2, "the status-triggered retry");
+    }
+
+    [TestMethod]
+    public void ProvisionalRequest_LateResultCannotOverwriteAssistantEvidence()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(Snapshot(("job_a", "ses_a")));
+        var job = viewModel.Jobs.Single();
+        viewModel.SelectedJob = job;
+        PumpUntil(() => service.Requests.Count == 1, "the provisional request");
+
+        viewModel.ApplySnapshot(SnapshotWithEvidence("job_a", "ses_a", "msg_a"));
+        PumpUntil(() => service.Requests.Count == 2, "the exact evidence request");
+        service.Complete("job_a", "ses_a", null, Array.Empty<string>(),
+            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("stale"));
+        PumpOnce();
+        Assert.AreEqual(string.Empty, job.OriginalRequestText);
+        service.Complete("job_a", "ses_a", null, new[] { "msg_a" },
+            OpenCodeOriginalRequestResult.ObservedJobCorrelation("exact"));
+        PumpUntil(() => job.OriginalRequestText == "exact", "the exact result");
+    }
+
+    [TestMethod]
+    public void ProvisionalRequest_ReselectingJobStartsFreshLookup()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        viewModel.ApplySnapshot(Snapshot(("job_a", "ses_a"), ("job_b", "ses_b")));
+        var first = viewModel.Jobs.Single(job => job.JobId == "job_a");
+        var second = viewModel.Jobs.Single(job => job.JobId == "job_b");
+        viewModel.SelectedJob = first;
+        PumpUntil(() => service.Requests.Count == 1, "the provisional request");
+        service.Complete("job_a", "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("old"));
+        PumpUntil(() => first.OriginalRequestText == "old", "the provisional result");
+        viewModel.SelectedJob = second;
+        PumpUntil(() => service.Requests.Count == 2, "the other job request");
+        viewModel.SelectedJob = first;
+        Assert.AreEqual(string.Empty, first.OriginalRequestText);
+        PumpUntil(() => service.Requests.Count == 3, "the refreshed provisional request");
+    }
+
+    [TestMethod]
+    public void MonitoringException_ClearsRequestsAndBlocksStaleSelectionUntilHealthy()
+    {
+        var service = new ControlledOriginalRequestService();
+        using var viewModel = CreateViewModel(service);
+        var snapshot = Snapshot(("job_a", "ses_a"), ("job_b", "ses_b"));
+        viewModel.ApplySnapshot(snapshot);
+        var first = viewModel.Jobs.Single(job => job.JobId == "job_a");
+        var second = viewModel.Jobs.Single(job => job.JobId == "job_b");
+        viewModel.SelectedJob = first;
+        PumpUntil(() => service.Requests.Count == 1, "the healthy request");
+        service.Complete("job_a", "ses_a",
+            OpenCodeOriginalRequestResult.BestEffortTimeCorrelation("old"));
+        PumpUntil(() => first.OriginalRequestText == "old", "the healthy result");
+
+        typeof(MainViewModel).GetMethod("HandleServiceFailure",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(viewModel, null);
+        Assert.AreEqual(string.Empty, first.OriginalRequestText);
+        viewModel.SelectedJob = second;
+        PumpOnce();
+        Assert.AreEqual(1, service.Requests.Count);
+        Assert.AreEqual(string.Empty, second.OriginalRequestText);
+
+        viewModel.ApplySnapshot(snapshot);
+        PumpUntil(() => service.Requests.Count == 2, "the recovered request");
+    }
+
+    [TestMethod]
     public void EvidenceChange_ClearsImmediatelyInvalidatesAndRestarts()
     {
         var service = new ControlledOriginalRequestService();

@@ -19,11 +19,11 @@ public sealed class OpenCodeOriginalRequestServiceTests
         using var service = CreateService(executor);
 
         var result = await service.GetOriginalRequestAsync(
-            "job_1", "ses_1", null, CancellationToken.None);
+            "job_1", "ses_1", null, CancellationToken.None, Start(1));
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, result.Status);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
         Assert.AreEqual(text, result.Text);
-        StringAssert.Contains(result.Label, "Best-effort singleton");
+        StringAssert.Contains(result.Label, "Best-effort time attribution");
         Assert.AreEqual(1, executor.CallCount);
 
         var request = executor.Requests.Single();
@@ -48,9 +48,9 @@ public sealed class OpenCodeOriginalRequestServiceTests
         using var service = CreateService(executor);
 
         var result = await service.GetOriginalRequestAsync(
-            "job_long", "ses_long", null, CancellationToken.None);
+            "job_long", "ses_long", null, CancellationToken.None, Start(1));
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, result.Status);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
         Assert.AreEqual(text.Length, result.Text.Length);
         Assert.AreEqual(text, result.Text);
     }
@@ -104,9 +104,9 @@ public sealed class OpenCodeOriginalRequestServiceTests
         using var service = CreateService(executor);
 
         var result = await service.GetOriginalRequestAsync(
-            "job_1", "ses_1", null, CancellationToken.None);
+            "job_1", "ses_1", null, CancellationToken.None, Start(1));
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, result.Status);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
         Assert.AreEqual("only", result.Text);
         Assert.AreEqual(2, requests.Count);
         var second = requests[1].ArgumentList[2];
@@ -229,9 +229,9 @@ public sealed class OpenCodeOriginalRequestServiceTests
         using var service = CreateService(executor);
 
         var result = await service.GetOriginalRequestAsync(
-            "job_5", "ses_5", null, CancellationToken.None);
+            "job_5", "ses_5", null, CancellationToken.None, Start(1));
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, result.Status);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
         Assert.AreEqual("request", result.Text);
     }
 
@@ -372,18 +372,18 @@ public sealed class OpenCodeOriginalRequestServiceTests
         using var service = CreateService(executor);
 
         var first = await service.GetOriginalRequestAsync(
-            "job_1", "ses_1", null, CancellationToken.None);
+            "job_1", "ses_1", "msg_1", CancellationToken.None);
         var repeat = await service.GetOriginalRequestAsync(
-            "job_1", "ses_1", null, CancellationToken.None);
+            "job_1", "ses_1", "msg_1", CancellationToken.None);
         Assert.AreEqual(1, executor.CallCount);
         Assert.AreEqual(first.Text, repeat.Text);
 
         await service.GetOriginalRequestAsync(
-            "job_2", "ses_1", null, CancellationToken.None);
+            "job_2", "ses_1", "msg_1", CancellationToken.None);
         Assert.AreEqual(2, executor.CallCount);
 
         await service.GetOriginalRequestAsync(
-            "job_1", "ses_2", null, CancellationToken.None);
+            "job_1", "ses_2", "msg_1", CancellationToken.None);
         Assert.AreEqual(3, executor.CallCount);
     }
 
@@ -394,9 +394,9 @@ public sealed class OpenCodeOriginalRequestServiceTests
             Task.FromResult(Execution(Page(null, ("msg_1", "value")))));
         using var service = CreateService(executor);
 
-        await service.GetOriginalRequestAsync("job_1", "ses_1", null, CancellationToken.None);
+        await service.GetOriginalRequestAsync("job_1", "ses_1", "msg_1", CancellationToken.None);
         service.InvalidateJob("job_1");
-        await service.GetOriginalRequestAsync("job_1", "ses_1", null, CancellationToken.None);
+        await service.GetOriginalRequestAsync("job_1", "ses_1", "msg_1", CancellationToken.None);
 
         Assert.AreEqual(2, executor.CallCount);
     }
@@ -416,15 +416,15 @@ public sealed class OpenCodeOriginalRequestServiceTests
         using var service = CreateService(executor);
 
         var first = service.GetOriginalRequestAsync(
-            "job_1", "ses_1", null, CancellationToken.None);
+            "job_1", "ses_1", null, CancellationToken.None, Start(1));
         var second = service.GetOriginalRequestAsync(
-            "job_1", "ses_1", null, CancellationToken.None);
+            "job_1", "ses_1", null, CancellationToken.None, Start(1));
         release.SetResult(true);
 
         var results = await Task.WhenAll(first, second);
 
         Assert.AreEqual(1, calls);
-        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, results[0].Status);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, results[0].Status);
         Assert.AreEqual(results[0].Text, results[1].Text);
     }
 
@@ -632,7 +632,7 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task MultipleUserMessages_AreAmbiguousRegardlessOfJobStart()
+    public async Task MultipleUserMessages_SelectUniqueNearestForEachJob()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithTimes(
@@ -654,14 +654,14 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             Start(1_950));
 
-        Assert.AreEqual(OriginalRequestStatus.Ambiguous, before.Status);
-        Assert.AreEqual(string.Empty, before.Text);
-        Assert.AreEqual(OriginalRequestStatus.Ambiguous, after.Status);
-        Assert.AreEqual(string.Empty, after.Text);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, before.Status);
+        Assert.AreEqual("before", before.Text);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, after.Status);
+        Assert.AreEqual("after", after.Text);
     }
 
     [TestMethod]
-    public async Task MultipleUserMessages_LargeStartGap_StillAmbiguous()
+    public async Task MultipleUserMessages_LargeStartGap_UsesNearest()
     {
         const long start = 1_000_000_000;
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
@@ -678,8 +678,8 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             Start(start));
 
-        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
-        Assert.AreEqual(string.Empty, result.Text);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
+        Assert.AreEqual("near", result.Text);
     }
 
     [TestMethod]
@@ -898,7 +898,7 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task MetadataFractionalStart_DoesNotSelectAmongMultipleUsers()
+    public async Task MetadataFractionalStart_SelectsNearestAtTickPrecision()
     {
         const long startMilliseconds = 1_794_084_044_805;
         using var workspace = new TestWorkspace();
@@ -927,8 +927,8 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             metadata.Started);
 
-        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
-        Assert.AreEqual(string.Empty, result.Text);
+        Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
+        Assert.AreEqual("early", result.Text);
     }
 
     [TestMethod]
@@ -953,7 +953,7 @@ public sealed class OpenCodeOriginalRequestServiceTests
     }
 
     [TestMethod]
-    public async Task Singleton_SubTickTimestamp_StillReturnsSingleton()
+    public async Task Singleton_SubTickTimestamp_IsAmbiguous()
     {
         var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
             PageWithRawTimes(
@@ -968,8 +968,8 @@ public sealed class OpenCodeOriginalRequestServiceTests
             CancellationToken.None,
             StartWithTicks(1_794_084_044_805, 2));
 
-        Assert.AreEqual(OriginalRequestStatus.BestEffortSingleton, result.Status);
-        Assert.AreEqual("only request", result.Text);
+        Assert.AreEqual(OriginalRequestStatus.Ambiguous, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
     }
 
     [TestMethod]
@@ -1502,6 +1502,50 @@ public sealed class OpenCodeOriginalRequestServiceTests
         Assert.AreEqual(content, result.Text);
         Assert.IsFalse(result.Overflow);
         Assert.AreEqual(0, overflowCalls);
+    }
+
+    [TestMethod]
+    public async Task Provisional_ThreeJobsSharingSession_SelectsEachNearestRequest()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            PageWithTimes(null, ("msg_a", "first", 1000), ("msg_b", "second", 2000),
+                ("msg_c", "third\nrequest 🚀", 3000)))));
+        using var service = CreateService(executor);
+
+        for (var index = 1; index <= 3; index++)
+        {
+            var result = await service.GetOriginalRequestAsync(
+                $"job_{index}", "ses_shared", null, CancellationToken.None, Start(index * 1000));
+            Assert.AreEqual(OriginalRequestStatus.BestEffortTimeCorrelation, result.Status);
+            Assert.AreEqual(new[] { "first", "second", "third\nrequest 🚀" }[index - 1], result.Text);
+        }
+    }
+
+    [TestMethod]
+    public async Task Provisional_ChangedStartForSameJob_DoesNotReuseOldCandidate()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            PageWithTimes(null, ("msg_a", "first", 1000), ("msg_b", "second", 2000)))));
+        using var service = CreateService(executor);
+        var first = await service.GetOriginalRequestAsync("job_1", "ses_shared", null,
+            CancellationToken.None, Start(1000));
+        var second = await service.GetOriginalRequestAsync("job_1", "ses_shared", null,
+            CancellationToken.None, Start(2000));
+        Assert.AreEqual("first", first.Text);
+        Assert.AreEqual("second", second.Text);
+        Assert.AreEqual(2, executor.CallCount);
+    }
+
+    [TestMethod]
+    public async Task Provisional_RequiresCompletePagination()
+    {
+        var executor = new FakeExecutor((_, _) => Task.FromResult(Execution(
+            PageWithTimes("next", ("msg_a", "first", 1000)))));
+        using var service = CreateService(executor, maxPages: 1);
+        var result = await service.GetOriginalRequestAsync("job_1", "ses_shared", null,
+            CancellationToken.None, Start(1000));
+        Assert.AreEqual(OriginalRequestStatus.Unavailable, result.Status);
+        Assert.AreEqual(string.Empty, result.Text);
     }
 
     private static OpenCodeOriginalRequestService CreateService(

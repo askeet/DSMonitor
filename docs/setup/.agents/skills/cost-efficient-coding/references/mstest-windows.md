@@ -1,0 +1,5 @@
+# Windows MSTest validation
+
+Apply when verified project files/configuration show .NET tests using MSTest on Windows, including VSTest runs. For previously established Codex sandbox MSTest testhost connection failures, classify only genuinely matching symptoms as infrastructure-blocked, distinct from application or test failures. Zero executed tests never constitutes a pass; diagnose other zero-test causes as unverified rather than automatically assuming an infrastructure failure. Do not repeatedly rerun or investigate matching known symptoms without new evidence, or initiate remediation solely for that limitation; investigate new or materially different failures normally.
+
+Preserve and report external-worker TRX results separately from independent QA: artifact and source review do not establish independent test execution. When independent execution is blocked, provide a normal-user PowerShell validation command using the project's applicable instructions. Never change Windows permissions, security settings or dependencies to bypass the restriction without explicit user approval.

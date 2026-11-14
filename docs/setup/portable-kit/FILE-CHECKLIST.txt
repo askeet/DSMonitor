@@ -1,0 +1,48 @@
+WINDOWS CODEX / FORGE DELEGATE / DEEPSEEK DISASTER-RECOVERY CHECKLIST
+
+SOURCE COMPUTER — BACKUP
+[ ] Run Backup-Delegate.bat manually on the original Windows machine.
+[ ] Check the backup report for %USERPROFILE%\.codex\AGENTS.md and config.toml.
+[ ] Check that both global skills are included:
+    .agents\skills\cost-efficient-coding\ (including references\)
+    .agents\skills\delegate-work\
+[ ] Check that the configured OpenCode worker definition(s) are included
+    (for example, .config\opencode\agents\deepseek-bounded.md).
+[ ] Check the actual Forge Delegate configuration and MCP launcher are included
+    (for example, .forge-delegate\config.json and start-mcp.cmd).
+[ ] Verify the ZIP contains manifest.json and payload/, and review any missing-file warnings.
+[ ] Optionally run the read-only local setup audit described in CODEX_DOCUMENTATION_PROMPT.md.
+[ ] Review backup contents for unexpected credentials or other sensitive information.
+[ ] Encrypt the ZIP before transferring or uploading it. The backup scripts do not encrypt it.
+[ ] Back up work repositories, uncommitted changes, and project-level AGENTS.md separately.
+[ ] Compare any portable-kit skill copies with the actual installed global skills;
+    do not assume bundled copies or historical version numbers are current.
+
+TARGET COMPUTER — RESTORE
+[ ] Install Codex Desktop and Node.js/npm if needed, with explicit user approval;
+    sign in to Codex Desktop. Install Git if required for your workflows.
+[ ] Run Install-Dependencies.bat only after reviewing its intended package versions
+    and explicitly approving installation; otherwise install compatible versions manually.
+[ ] Run Restore-Delegate.bat manually. Review skipped conflicts before using -Replace.
+[ ] Confirm both global skill directories, their references, and relative links were restored.
+[ ] Review restored Codex/OpenCode/Forge configuration for stale profile, npm, or
+    repository paths. Do not assume drive letters or Windows usernames match.
+[ ] Reauthenticate DeepSeek with the currently supported OpenCode login procedure;
+    do not restore or copy credential stores from the old machine.
+[ ] Confirm the MCP launcher and PATH references resolve on the new Windows installation.
+[ ] Run Verify-Delegate.bat (offline) and review any reported limitations.
+[ ] Restart Codex Desktop and check that Forge Delegate is configured and discoverable.
+[ ] Check project-level AGENTS.md permissions for the actual provider, destination,
+    and source-sharing scope; request missing permissions instead of assuming consent.
+[ ] OPTIONAL, ONLY WITH EXPLICIT APPROVAL: run one low-risk paid smoke test in a
+    safe project, checking actual provider/model/agent, approvals, and results.
+[ ] Verify actual project build/tests and relevant project-level instructions.
+[ ] Retain the original machine and encrypted backups until restoration is proven.
+
+SECURITY AND SCOPE
+- Never upload an unencrypted backup ZIP to chat, public Git, or shared storage.
+- Do not commit backups, credentials, local audit reports, or private runtime data.
+- Do not execute setup/restore scripts, install software, elevate privileges, or
+  change security settings automatically; obtain explicit approval for each operation.
+- AGENTS.md records project instructions; it cannot override platform approval gates.
+- This is a manual checklist. It does not verify what any script actually copies.

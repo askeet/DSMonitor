@@ -9,6 +9,12 @@ Applies to this repository: a .NET 10 Windows WPF application that observes Forg
 - Let the skill select the lowest-cost capable approach. A small local task does not require delegation; an applicable skill gate must not be bypassed because a local change looks small. Respect explicit task restrictions, including read-only work or no delegation. Do not change the user's selected model or effort silently.
 - Apply project checks to the affected behavior. Do not turn the SQLite checklist below into a repository-wide audit for unrelated changes, repeat accepted reviews without new evidence, or add approval steps beyond existing authorization.
 
+## External Delegation Authorization
+
+- **Approved provider:** DeepSeek. For authorized coding, debugging, testing, and review tasks, the minimum necessary repository source, tests, and instructions may be shared with this provider.
+- **Scope:** This repository only. Exclude secrets, credentials, private runtime data, unrelated files, and unrestricted OpenCode session history or Forge runtime records. Other providers, destinations, or expanded access require separate approval.
+- **Reuse:** Valid across tasks, sessions, and continuations while the approved provider, destination, and scope remain unchanged. Platform security gates apply. Installations, dependency changes, system or security changes, elevation, sandbox bypasses, destructive operations, and commits require separate authorization.
+
 ## Scope and implementation
 
 - Start with task-relevant files and tests. Expand only to trace dependencies, investigate failures, or resolve uncertainty; verify assumptions against the implementation before editing.

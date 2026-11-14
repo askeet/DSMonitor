@@ -1,5 +1,6 @@
 using System.Globalization;
 using DSMonitor.Models;
+using DSMonitor.Services;
 
 namespace DSMonitor.ViewModels;
 
@@ -16,19 +17,36 @@ public sealed class LiveActivityHistoryRowViewModel
 {
     private readonly ReportedStatusExtraction? _matchingReportedStatus;
     private readonly string _reportedStatusValue;
+    private readonly OpenCodeMessageDuration? _messageDuration;
 
     /// <param name="jobReportedStatus">
     /// The job-level value resolved once by
     /// <see cref="ReportedStatusPresentation.ResolveJobReportedStatus"/> for
     /// this row's own job. A value owned by another job is never applied.
     /// </param>
+    /// <param name="messageDuration">
+    /// Exact OpenCode assistant-message duration for this row's structured
+    /// message id, when the service confirmed an assistant type and a valid
+    /// created/completed pair. It is message scoped and never replaces a valid
+    /// same-part tool duration.
+    /// </param>
     public LiveActivityHistoryRowViewModel(
         LiveActivityHistoryEntry entry,
         ReportedStatusExtraction? reportedStatus,
         bool isCurrentActiveTarget,
-        ReportedStatusPresentation.JobReportedStatus? jobReportedStatus = null)
+        ReportedStatusPresentation.JobReportedStatus? jobReportedStatus = null,
+        OpenCodeMessageDuration? messageDuration = null)
     {
         Entry = entry ?? throw new ArgumentNullException(nameof(entry));
+        _messageDuration = messageDuration is not null &&
+                           messageDuration.Duration >= TimeSpan.Zero &&
+                           entry.Kind.Contains("text", StringComparison.OrdinalIgnoreCase) &&
+                           string.Equals(
+                               messageDuration.MessageId,
+                               entry.MessageId,
+                               StringComparison.Ordinal)
+            ? messageDuration
+            : null;
         _matchingReportedStatus = Matches(reportedStatus, entry)
             ? reportedStatus
             : null;
@@ -78,14 +96,33 @@ public sealed class LiveActivityHistoryRowViewModel
 
     public string DurationText => Entry.ObservedDuration is { } duration
         ? FormatDuration(duration)
-        : "N/A";
+        : _messageDuration is { } messageDuration
+            ? FormatMessageDuration(messageDuration.Duration)
+            : "N/A";
+
+    /// <summary>
+    /// Numeric sort value for the Duration column. A valid same-part tool
+    /// duration wins; otherwise the exact OpenCode message duration is used.
+    /// Missing evidence sorts after every known value.
+    /// </summary>
+    public double DurationSortSeconds =>
+        Entry.ObservedDuration?.TotalSeconds ??
+        _messageDuration?.Duration.TotalSeconds ??
+        double.PositiveInfinity;
 
     public string DurationTooltip => Entry.ObservedDuration is { } duration
         ? $"Observed same-part tool duration {FormatDurationDetail(duration)}. " +
           FormatToolStartEnd() +
           " This is not a job duration, execution-liveness proof, or completion evidence."
-        : "N/A — no reliable same-part start/end timing evidence for this activity; " +
-          "no job duration or inferred timing is used.";
+        : _messageDuration is { } messageDuration
+            ? "OpenCode assistant message duration " +
+              FormatMessageDurationDetail(messageDuration.Duration) +
+              $" (time.created {messageDuration.Created:O}, " +
+              $"time.completed {messageDuration.Completed:O}; message {messageDuration.MessageId}). " +
+              "Message scoped; not this part's duration, job duration, execution-liveness proof, " +
+              "or completion evidence."
+            : "N/A — no reliable same-part start/end timing or exact OpenCode assistant message " +
+              "duration for this activity; no job duration or inferred timing is used.";
 
     /// <summary>
     /// Complete bounded display text. WPF applies ellipsis from available width;
@@ -144,6 +181,31 @@ public sealed class LiveActivityHistoryRowViewModel
         LiveActivityHistoryEntry entry) =>
         extraction is not null &&
         string.Equals(extraction.Source.JobId, entry.JobId, StringComparison.Ordinal);
+
+    private static string FormatMessageDuration(TimeSpan duration)
+    {
+        if (duration == TimeSpan.Zero)
+        {
+            return "0s";
+        }
+
+        if (duration < TimeSpan.FromMinutes(1))
+        {
+            return duration.TotalSeconds.ToString("0.00", CultureInfo.InvariantCulture) + " s";
+        }
+
+        return FormatDuration(duration);
+    }
+
+    private static string FormatMessageDurationDetail(TimeSpan duration)
+    {
+        if (duration < TimeSpan.FromMinutes(1))
+        {
+            return duration.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture) + " s";
+        }
+
+        return FormatDurationDetail(duration);
+    }
 
     private static string FormatDuration(TimeSpan duration)
     {

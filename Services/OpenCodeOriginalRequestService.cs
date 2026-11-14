@@ -19,8 +19,7 @@ public enum OriginalRequestStatus
     ObservedJobCorrelation,
 
     /// <summary>
-    /// Legacy value retained for source compatibility. The service no longer
-    /// selects a request by timestamp.
+    /// Provisional nearest-timestamp attribution before assistant evidence exists.
     /// </summary>
     BestEffortTimeCorrelation,
     Ambiguous,
@@ -93,14 +92,13 @@ public sealed record OpenCodeOriginalRequestResult
     };
 
     /// <summary>
-    /// Legacy factory retained for compatibility. It is not returned by the
-    /// service; timestamp-nearest attribution was removed.
+    /// Provisional attribution based on the nearest request timestamp.
     /// </summary>
     public static OpenCodeOriginalRequestResult BestEffortTimeCorrelation(string text) => new()
     {
         Status = OriginalRequestStatus.BestEffortTimeCorrelation,
         Text = text,
-        Label = "Best-effort time attribution — the user message whose timestamp is uniquely " +
+        Label = "Best-effort time attribution (provisional) — the user message whose timestamp is uniquely " +
                 "closest to the Forge job start; a timestamp heuristic, not verified job ownership."
     };
 
@@ -536,7 +534,6 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         IReadOnlyList<string>? observedAssistantMessageIds = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        _ = jobStartedAt; // Retained for contract compatibility; timestamps are not evidence.
         if (!OpenCodeIdentifiers.IsSafeJobId(jobId) ||
             !OpenCodeIdentifiers.IsSafeSessionId(sessionId) ||
             (verifiedUserMessageId is not null &&
@@ -562,7 +559,8 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
             jobId,
             sessionId,
             verifiedUserMessageId ?? string.Empty,
-            evidenceFingerprint);
+            evidenceFingerprint,
+            jobStartedAt?.UtcTicks);
         Task<OpenCodeOriginalRequestResult> task;
         lock (_gate)
         {
@@ -733,6 +731,7 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
 
             if (!_disposed &&
                 result.IsSuccess &&
+                result.Status != OriginalRequestStatus.BestEffortTimeCorrelation &&
                 CurrentGeneration(key.JobId) == inFlight.Generation)
             {
                 Store(key, result);
@@ -767,9 +766,12 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         var seenIds = new HashSet<string>(StringComparer.Ordinal);
         var seenCursors = new HashSet<string>(StringComparer.Ordinal);
         var totalMessages = 0;
-        string? singleText = null;
         string? matchedText = null;
         var matchCount = 0;
+        long? nearestDistance = null;
+        string? nearestText = null;
+        var tied = false;
+        var invalidTime = false;
 
         for (var page = 0; page < _options.MaxPages; page++)
         {
@@ -814,9 +816,26 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
                         matchedText = message.Text;
                     }
                 }
-                else if (totalMessages == 1)
+                if (key.VerifiedMessageId.Length == 0 && key.StartTicks is { } startTicks)
                 {
-                    singleText = message.Text;
+                    if (message.Created is not { } created)
+                    {
+                        invalidTime = true;
+                    }
+                    else
+                    {
+                        var distance = Math.Abs(created.UtcTicks - startTicks);
+                        if (nearestDistance is null || distance < nearestDistance)
+                        {
+                            nearestDistance = distance;
+                            nearestText = message.Text;
+                            tied = false;
+                        }
+                        else if (distance == nearestDistance)
+                        {
+                            tied = true;
+                        }
+                    }
                 }
             }
 
@@ -825,9 +844,10 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
                 return ResolveUserOnly(
                     key,
                     totalMessages,
-                    singleText,
                     matchCount,
                     matchedText,
+                    nearestText,
+                    invalidTime || tied,
                     _options.MaxTextCharacters);
             }
 
@@ -1021,9 +1041,10 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
     private static OpenCodeOriginalRequestResult ResolveUserOnly(
         CacheKey key,
         int totalMessages,
-        string? singleText,
         int matchCount,
         string? matchedText,
+        string? nearestText,
+        bool invalidOrTied,
         int maxTextCharacters)
     {
         if (totalMessages == 0)
@@ -1044,22 +1065,17 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
                     OriginalRequestUnavailableReason.MalformedResponse);
         }
 
-        if (totalMessages == 1)
+        if (key.StartTicks is not { } startTicks ||
+            startTicks < DateTimeOffset.UnixEpoch.UtcTicks ||
+            invalidOrTied || nearestText is null)
         {
-            if (singleText is null)
-            {
-                return OpenCodeOriginalRequestResult.Ambiguous();
-            }
-
-            return singleText.Length > maxTextCharacters
-                ? OpenCodeOriginalRequestResult.Unavailable(
-                    OriginalRequestUnavailableReason.TextLimitExceeded)
-                : OpenCodeOriginalRequestResult.BestEffortSingleton(singleText);
+            return OpenCodeOriginalRequestResult.Ambiguous();
         }
 
-        // Multiple user messages without observed assistant anchors are never
-        // attributed by timestamp. The field remains empty and ambiguous.
-        return OpenCodeOriginalRequestResult.Ambiguous();
+        return nearestText.Length > maxTextCharacters
+            ? OpenCodeOriginalRequestResult.Unavailable(
+                OriginalRequestUnavailableReason.TextLimitExceeded)
+            : OpenCodeOriginalRequestResult.BestEffortTimeCorrelation(nearestText);
     }
 
     private static OpenCodeOriginalRequestResult ResolveObserved(
@@ -1543,7 +1559,8 @@ public sealed class OpenCodeOriginalRequestService : IOriginalRequestService
         string JobId,
         string SessionId,
         string VerifiedMessageId,
-        string EvidenceFingerprint);
+        string EvidenceFingerprint,
+        long? StartTicks);
 
     private readonly record struct Generation(long Epoch, long JobGeneration);
 

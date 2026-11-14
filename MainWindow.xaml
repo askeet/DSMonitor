@@ -977,6 +977,7 @@
                                     <Grid Grid.Row="3">
                                         <DataGrid x:Name="LiveActivityHistoryGrid"
                                                   Style="{StaticResource LiveActivityHistoryGrid}"
+                                                  CanUserSortColumns="True"
                                                   ItemsSource="{Binding LiveActivityHistory}"
                                                   SelectedItem="{Binding SelectedActivity, Mode=TwoWay}"
                                                   AutomationProperties.Name="Live activity history">
@@ -995,6 +996,7 @@
 
                                                 <DataGridTemplateColumn Header="Duration"
                                                                         Width="90"
+                                                                        SortMemberPath="DurationSortSeconds"
                                                                         HeaderStyle="{StaticResource JobColumnHeaderStyle}">
                                                     <DataGridTemplateColumn.CellTemplate>
                                                         <DataTemplate>

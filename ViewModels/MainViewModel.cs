@@ -21,6 +21,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly string _runsRoot;
     private readonly DispatcherTimer _clockTimer;
     private readonly IOriginalRequestService _originalRequestService;
+    private readonly IOpenCodeActivityDurationService _activityDurationService;
     private readonly Dictionary<string, JobRowViewModel> _jobsById =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -29,8 +30,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? _rawLogCts;
     private CancellationTokenSource? _selectedActivityCts;
     private CancellationTokenSource? _originalRequestCts;
+    private CancellationTokenSource? _activityDurationCts;
+    private string? _activityDurationRequestKey;
     private bool _disposed;
     private bool _monitoringHealthy = true;
+    private bool _originalRequestMonitoringFailed;
 
     private MonitoringState _monitoringState = MonitoringState.Stopped;
     private bool _isMonitoring;
@@ -60,13 +64,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Dispatcher dispatcher,
         string runsRoot,
         TimeSpan? refreshInterval = null,
-        IOriginalRequestService? originalRequestService = null)
+        IOriginalRequestService? originalRequestService = null,
+        IOpenCodeActivityDurationService? activityDurationService = null)
     {
         _serviceFactory = serviceFactory ?? throw new ArgumentNullException(nameof(serviceFactory));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _runsRoot = runsRoot;
         _originalRequestService =
             originalRequestService ?? DisabledOriginalRequestService.Instance;
+        _activityDurationService =
+            activityDurationService ?? DisabledOpenCodeActivityDurationService.Instance;
 
         Jobs = new ObservableCollection<JobRowViewModel>();
         JobsView = CollectionViewSource.GetDefaultView(Jobs);
@@ -242,6 +249,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 BeginRawLogLoad(value);
                 BeginSelectedActivityLoad(value);
                 BeginOriginalRequestLoad(value);
+                BeginActivityDurationLoad(value);
             }
         }
     }
@@ -339,6 +347,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         SetRowsMonitoringActive(false);
         CancelSelectedActivityLoad();
         CancelOriginalRequestLoad();
+        CancelActivityDurationLoad();
 
         if (cts is null && !IsMonitoring)
         {
@@ -409,6 +418,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var monitoringHealthChanged = previousMonitoringHealthy != _monitoringHealthy;
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var selectedIdentityChanged = false;
+        var retryOriginalRequest = false;
+        if (_originalRequestMonitoringFailed && _monitoringHealthy)
+        {
+            _originalRequestMonitoringFailed = false;
+            selectedIdentityChanged = true;
+        }
+        var anyEvidenceChanged = false;
+        var jobsChanged = false;
+        var durationReloadRequired = false;
 
         foreach (var jobSnapshot in snapshot.Jobs)
         {
@@ -419,16 +437,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 row.SelectedActivityChanged += OnJobSelectedActivityChanged;
                 _jobsById[jobSnapshot.JobId] = row;
                 Jobs.Add(row);
+                jobsChanged = true;
             }
             else
             {
                 var previousSessionId = row.Snapshot.SessionId;
+                var previousStatus = row.Snapshot.Status;
                 var previousStartTicks = StartTicks(row.Snapshot.Metadata.Started);
+                var previousLifecycleOffset =
+                    row.Snapshot.LiveActivity.LatestLifecycleByteOffset;
                 var previousEvidenceFingerprint =
                     JobRowViewModel.CurrentEvidenceFingerprint(
                         row.Snapshot,
                         previousSessionId);
                 row.Update(jobSnapshot, snapshot.ObservedAt);
+                var lifecycleChanged =
+                    previousLifecycleOffset != jobSnapshot.LiveActivity.LatestLifecycleByteOffset;
                 var sessionChanged = !string.Equals(
                     previousSessionId,
                     jobSnapshot.SessionId,
@@ -441,19 +465,37 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         row.Snapshot,
                         jobSnapshot.SessionId),
                     StringComparison.Ordinal);
+                anyEvidenceChanged |= evidenceChanged;
                 if (sessionChanged || startChanged || evidenceChanged ||
                     monitoringHealthChanged || !_monitoringHealthy)
                 {
                     _originalRequestService.InvalidateJob(jobSnapshot.JobId);
+                    _activityDurationService.InvalidateJob(jobSnapshot.JobId);
                     if (ReferenceEquals(_selectedJob, row))
                     {
                         CancelOriginalRequestLoad();
                         selectedIdentityChanged = true;
+                        CancelActivityDurationLoad();
+                        durationReloadRequired = true;
                     }
                     else if (evidenceChanged || monitoringHealthChanged || !_monitoringHealthy)
                     {
                         row.ClearOriginalRequest();
+                        row.ClearMessageDurations();
                     }
+                }
+
+                if (lifecycleChanged && ReferenceEquals(_selectedJob, row))
+                {
+                    durationReloadRequired = true;
+                }
+
+                if ((lifecycleChanged || previousStatus != jobSnapshot.Status) &&
+                    ReferenceEquals(_selectedJob, row) &&
+                    OriginalRequestEvidence.Select(jobSnapshot, jobSnapshot.SessionId).State ==
+                        OriginalRequestEvidenceState.None)
+                {
+                    retryOriginalRequest = true;
                 }
             }
 
@@ -461,23 +503,50 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 snapshot.State is MonitoringState.Monitoring or MonitoringState.Idle);
         }
 
-        if (selectedIdentityChanged)
+        if (selectedIdentityChanged || retryOriginalRequest)
         {
-            BeginOriginalRequestLoad(_selectedJob);
+            if (retryOriginalRequest && _selectedJob is not null)
+            {
+                _originalRequestService.InvalidateJob(_selectedJob.JobId);
+            }
+
+            BeginOriginalRequestLoad(_selectedJob, forceReload: retryOriginalRequest);
         }
 
         foreach (var removedId in _jobsById.Keys.Where(id => !seenIds.Contains(id)).ToArray())
         {
             if (_jobsById.Remove(removedId, out var removed))
             {
+                jobsChanged = true;
                 removed.SelectedActivityChanged -= OnJobSelectedActivityChanged;
                 _originalRequestService.InvalidateJob(removedId);
+                _activityDurationService.InvalidateJob(removedId);
+                removed.ClearMessageDurations();
                 Jobs.Remove(removed);
                 if (ReferenceEquals(_selectedJob, removed))
                 {
                     SelectedJob = null;
                 }
             }
+        }
+
+        if (jobsChanged || anyEvidenceChanged || monitoringHealthChanged)
+        {
+            foreach (var row in Jobs)
+            {
+                row.ClearMessageDurations();
+            }
+
+            if (_selectedJob is not null)
+            {
+                CancelActivityDurationLoad();
+                durationReloadRequired = true;
+            }
+        }
+
+        if (durationReloadRequired)
+        {
+            BeginActivityDurationLoad(_selectedJob);
         }
 
         JobsView.Refresh();
@@ -567,7 +636,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _rawLogCts = null;
         CancelSelectedActivityLoad();
         CancelOriginalRequestLoad();
+        CancelActivityDurationLoad();
         _originalRequestService.Dispose();
+        _activityDurationService.Dispose();
         _monitoringCts?.Dispose();
         _monitoringCts = null;
     }
@@ -611,6 +682,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         IsMonitoring = false;
         SetRowsMonitoringActive(false);
         CancelOriginalRequestLoad();
+        _originalRequestMonitoringFailed = true;
+        _originalRequestService.ClearCache();
+        CancelActivityDurationLoad();
+        foreach (var row in Jobs)
+        {
+            row.ClearOriginalRequest();
+            row.ClearMessageDurations();
+        }
+
+        _activityDurationService.ClearCache();
         MonitoringState = MonitoringState.Error;
         StateDetail = "Monitoring stopped after an unexpected error.";
         HasWarnings = true;
@@ -648,8 +729,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _rawLogCts = null;
         CancelSelectedActivityLoad();
         CancelOriginalRequestLoad();
+        CancelActivityDurationLoad();
         _originalRequestService.ClearCache();
+        _activityDurationService.ClearCache();
         _monitoringHealthy = true;
+        _originalRequestMonitoringFailed = false;
 
         SelectedJob = null;
         Jobs.Clear();
@@ -824,7 +908,219 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         cts.Dispose();
     }
 
-    private void BeginOriginalRequestLoad(JobRowViewModel? job)
+    private void BeginActivityDurationLoad(JobRowViewModel? job)
+    {
+        if (job is null)
+        {
+            CancelActivityDurationLoad();
+            return;
+        }
+
+        var sessionId = job.Snapshot.SessionId;
+        if (!_monitoringHealthy || !OpenCodeIdentifiers.IsSafeSessionId(sessionId))
+        {
+            CancelActivityDurationLoad();
+            job.ClearMessageDurations();
+            return;
+        }
+
+        var evidence = SelectDurationEvidence(job, sessionId!);
+        if (evidence is not { } selection || selection.MessageIds.Count == 0)
+        {
+            CancelActivityDurationLoad();
+            job.ClearMessageDurations();
+            return;
+        }
+
+        if (job.HasCompleteMessageDurationsFor(
+                sessionId!,
+                selection.Fingerprint,
+                selection.MessageIds))
+        {
+            CancelActivityDurationLoad();
+            return;
+        }
+
+        var requestKey = job.JobId + "\n" +
+                         sessionId + "\n" +
+                         selection.Fingerprint + "\n" +
+                         (job.Snapshot.LiveActivity.LatestLifecycleByteOffset?.ToString(
+                             CultureInfo.InvariantCulture) ?? string.Empty);
+        if (string.Equals(
+                _activityDurationRequestKey,
+                requestKey,
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        CancelActivityDurationLoad();
+        var cts = new CancellationTokenSource();
+        _activityDurationCts = cts;
+        _activityDurationRequestKey = requestKey;
+        _ = LoadActivityDurationsSafelyAsync(
+            job,
+            sessionId!,
+            selection.Fingerprint,
+            selection.MessageIds,
+            cts);
+    }
+
+    private async Task LoadActivityDurationsSafelyAsync(
+        JobRowViewModel job,
+        string sessionId,
+        string evidenceFingerprint,
+        IReadOnlyList<string> messageIds,
+        CancellationTokenSource cts)
+    {
+        var startedAt = job.Snapshot.Metadata.Started;
+        try
+        {
+            var result = await _activityDurationService.GetDurationsAsync(
+                job.JobId,
+                sessionId,
+                messageIds,
+                cts.Token).ConfigureAwait(true);
+
+            if (cts.IsCancellationRequested ||
+                !ReferenceEquals(_selectedJob, job) ||
+                !_monitoringHealthy ||
+                !string.Equals(job.Snapshot.SessionId, sessionId, StringComparison.Ordinal) ||
+                StartTicks(job.Snapshot.Metadata.Started) != StartTicks(startedAt))
+            {
+                return;
+            }
+
+            var current = SelectDurationEvidence(job, sessionId);
+            if (current is not { } selection ||
+                !string.Equals(
+                    selection.Fingerprint,
+                    evidenceFingerprint,
+                    StringComparison.Ordinal) ||
+                !selection.MessageIds.SequenceEqual(messageIds, StringComparer.Ordinal))
+            {
+                return;
+            }
+
+            if (result.IsSuccess)
+            {
+                job.ApplyMessageDurations(
+                    sessionId,
+                    evidenceFingerprint,
+                    messageIds,
+                    result.Durations,
+                    result.IsComplete);
+            }
+            else
+            {
+                job.ClearMessageDurations();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Selection, evidence, health, or monitoring changed.
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            if (!cts.IsCancellationRequested &&
+                ReferenceEquals(_selectedJob, job) &&
+                _monitoringHealthy &&
+                string.Equals(job.Snapshot.SessionId, sessionId, StringComparison.Ordinal) &&
+                StartTicks(job.Snapshot.Metadata.Started) == StartTicks(startedAt))
+            {
+                job.ClearMessageDurations();
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_activityDurationCts, cts))
+            {
+                _activityDurationCts = null;
+                _activityDurationRequestKey = null;
+            }
+
+            cts.Dispose();
+        }
+    }
+
+    private void CancelActivityDurationLoad()
+    {
+        var cts = _activityDurationCts;
+        _activityDurationCts = null;
+        _activityDurationRequestKey = null;
+        if (cts is null)
+        {
+            return;
+        }
+
+        cts.Cancel();
+        cts.Dispose();
+    }
+
+    /// <summary>
+    /// Builds the selected job's exact duration evidence, excluding any message
+    /// id claimed by more than one currently observed job in the same session.
+    /// </summary>
+    private DurationEvidence? SelectDurationEvidence(
+        JobRowViewModel job,
+        string sessionId)
+    {
+        var selected = OriginalRequestEvidence.Select(job.Snapshot, sessionId);
+        if (selected.State != OriginalRequestEvidenceState.Valid ||
+            selected.MessageIds.Count == 0)
+        {
+            return null;
+        }
+
+        var claims = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var row in _jobsById.Values)
+        {
+            var otherSessionId = row.Snapshot.SessionId;
+            if (!row.Snapshot.LiveActivity.IsHealthy ||
+                !OpenCodeIdentifiers.IsSafeSessionId(otherSessionId))
+            {
+                continue;
+            }
+
+            foreach (var entry in row.Snapshot.LiveActivity.History)
+            {
+                if (!string.Equals(entry.JobId, row.JobId, StringComparison.Ordinal) ||
+                    !string.Equals(entry.SessionId, otherSessionId, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var key = otherSessionId + "\n" + entry.MessageId;
+                if (!claims.TryGetValue(key, out var owners))
+                {
+                    owners = new HashSet<string>(StringComparer.Ordinal);
+                    claims[key] = owners;
+                }
+
+                owners.Add(row.JobId);
+            }
+        }
+
+        var allowed = selected.MessageIds
+            .Where(messageId =>
+                claims.TryGetValue(sessionId + "\n" + messageId, out var owners) &&
+                owners.Count == 1)
+            .ToArray();
+        if (allowed.Length == 0)
+        {
+            return null;
+        }
+
+        return new DurationEvidence(
+            allowed,
+            OriginalRequestEvidence.ComputeFingerprint(job.JobId, sessionId, allowed));
+    }
+
+    private readonly record struct DurationEvidence(
+        IReadOnlyList<string> MessageIds,
+        string Fingerprint);
+
+    private void BeginOriginalRequestLoad(JobRowViewModel? job, bool forceReload = false)
     {
         CancelOriginalRequestLoad();
         if (job is null)
@@ -842,7 +1138,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var startedAt = job.Snapshot.Metadata.Started;
         var evidence = OriginalRequestEvidence.Select(job.Snapshot, sessionId);
         var evidenceFingerprint = evidence.Fingerprint;
-        if (!_monitoringHealthy)
+        if (!_monitoringHealthy || _originalRequestMonitoringFailed)
         {
             job.ClearOriginalRequest();
             job.ApplyOriginalRequestResult(
@@ -853,7 +1149,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (job.HasOriginalRequestFor(sessionId!, startedAt, evidenceFingerprint))
+        if (!forceReload && job.HasOriginalRequestFor(sessionId!, startedAt, evidenceFingerprint))
         {
             return;
         }

@@ -63,6 +63,14 @@ public sealed class JobRowViewModel : ObservableObject
     private long? _originalRequestStartTicks;
     private string? _originalRequestEvidenceFingerprint;
     private bool _originalRequestIsSuccess;
+    private bool _originalRequestIsProvisional;
+    private IReadOnlyDictionary<string, OpenCodeMessageDuration> _messageDurations =
+        new Dictionary<string, OpenCodeMessageDuration>(StringComparer.Ordinal);
+    private string? _messageDurationSessionId;
+    private string? _messageDurationEvidenceFingerprint;
+    private IReadOnlySet<string> _messageDurationMessageIds =
+        new HashSet<string>(StringComparer.Ordinal);
+    private bool _messageDurationComplete;
 
     public JobRowViewModel(ForgeJobSnapshot snapshot)
     {
@@ -423,6 +431,7 @@ public sealed class JobRowViewModel : ObservableObject
         DateTimeOffset? startedAt,
         string evidenceFingerprint) =>
         _originalRequestIsSuccess &&
+        !_originalRequestIsProvisional &&
         string.Equals(_originalRequestSessionId, sessionId, StringComparison.Ordinal) &&
         _originalRequestStartTicks == StartTicks(startedAt) &&
         string.Equals(
@@ -459,6 +468,7 @@ public sealed class JobRowViewModel : ObservableObject
         _originalRequestStartTicks = result.IsSuccess ? StartTicks(startedAt) : null;
         _originalRequestEvidenceFingerprint = result.IsSuccess ? evidenceFingerprint : null;
         _originalRequestIsSuccess = result.IsSuccess;
+        _originalRequestIsProvisional = result.Status == OriginalRequestStatus.BestEffortTimeCorrelation;
         SetText(text, ref _originalRequestText, nameof(OriginalRequestText));
         SetText(
             label,
@@ -480,11 +490,95 @@ public sealed class JobRowViewModel : ObservableObject
         _originalRequestStartTicks = null;
         _originalRequestEvidenceFingerprint = null;
         _originalRequestIsSuccess = false;
+        _originalRequestIsProvisional = false;
         SetText(string.Empty, ref _originalRequestText, nameof(OriginalRequestText));
         SetText(
             string.Empty,
             ref _originalRequestAttributionText,
             nameof(OriginalRequestAttributionText));
+    }
+
+    internal bool HasCompleteMessageDurationsFor(
+        string sessionId,
+        string evidenceFingerprint,
+        IReadOnlyList<string> messageIds) =>
+        _messageDurationComplete &&
+        string.Equals(_messageDurationSessionId, sessionId, StringComparison.Ordinal) &&
+        string.Equals(
+            _messageDurationEvidenceFingerprint,
+            evidenceFingerprint,
+            StringComparison.Ordinal) &&
+        _messageDurationMessageIds.SetEquals(messageIds);
+
+    /// <summary>
+    /// Applies only exact message ids from the selected job's verified evidence
+    /// set. The values are transient and never feed the job table duration,
+    /// spinner termination, cost, or persistence.
+    /// </summary>
+    internal void ApplyMessageDurations(
+        string sessionId,
+        string evidenceFingerprint,
+        IReadOnlyList<string> messageIds,
+        IReadOnlyDictionary<string, OpenCodeMessageDuration> durations,
+        bool isComplete)
+    {
+        if (!string.Equals(
+                Snapshot.SessionId,
+                sessionId,
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var accepted = new Dictionary<string, OpenCodeMessageDuration>(
+            StringComparer.Ordinal);
+        foreach (var id in messageIds)
+        {
+            if (durations.TryGetValue(id, out var duration) &&
+                string.Equals(duration.MessageId, id, StringComparison.Ordinal))
+            {
+                accepted[id] = duration;
+            }
+        }
+
+        _messageDurations = accepted;
+        _messageDurationSessionId = sessionId;
+        _messageDurationEvidenceFingerprint = evidenceFingerprint;
+        _messageDurationMessageIds = new HashSet<string>(
+            messageIds,
+            StringComparer.Ordinal);
+        _messageDurationComplete =
+            isComplete && accepted.Count == _messageDurationMessageIds.Count;
+        UpdateLiveActivityHistory(Snapshot);
+    }
+
+    internal void ClearMessageDurations()
+    {
+        if (!HasAnyMessageDurations)
+        {
+            return;
+        }
+
+        ResetMessageDurations();
+        if (Snapshot is not null)
+        {
+            UpdateLiveActivityHistory(Snapshot);
+        }
+    }
+
+    private bool HasAnyMessageDurations =>
+        _messageDurations.Count > 0 ||
+        _messageDurationSessionId is not null ||
+        _messageDurationEvidenceFingerprint is not null;
+
+    private void ResetMessageDurations()
+    {
+        _messageDurations = new Dictionary<string, OpenCodeMessageDuration>(
+            StringComparer.Ordinal);
+        _messageDurationSessionId = null;
+        _messageDurationEvidenceFingerprint = null;
+        _messageDurationMessageIds = new HashSet<string>(StringComparer.Ordinal);
+        _messageDurationComplete = false;
     }
 
     public string LiveActivityHistoryNotice => LiveActivitySnapshot.HistoryRetentionNotice;
@@ -520,6 +614,7 @@ public sealed class JobRowViewModel : ObservableObject
             previousStartTicks != StartTicks(snapshot.Metadata.Started))
         {
             ClearOriginalRequest();
+            ResetMessageDurations();
         }
 
         Snapshot = snapshot;
@@ -965,6 +1060,29 @@ public sealed class JobRowViewModel : ObservableObject
         SetText(tooltip, ref _durationTooltip, nameof(DurationTooltip));
     }
 
+    private OpenCodeMessageDuration? MessageDurationFor(
+        ForgeJobSnapshot snapshot,
+        LiveActivityHistoryEntry entry)
+    {
+        if (string.IsNullOrEmpty(_messageDurationSessionId) ||
+            !string.Equals(
+                _messageDurationSessionId,
+                snapshot.SessionId,
+                StringComparison.Ordinal) ||
+            !string.Equals(
+                entry.SessionId,
+                snapshot.SessionId,
+                StringComparison.Ordinal) ||
+            !entry.Kind.Contains("text", StringComparison.OrdinalIgnoreCase) ||
+            !_messageDurations.TryGetValue(entry.MessageId, out var duration) ||
+            !string.Equals(duration.MessageId, entry.MessageId, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        return duration;
+    }
+
     private void UpdateLiveActivityHistory(ForgeJobSnapshot snapshot)
     {
         var previousIdentity = _selectedActivity is { } previous
@@ -983,7 +1101,8 @@ public sealed class JobRowViewModel : ObservableObject
                 entry,
                 snapshot.ReportedStatus,
                 _monitoringActive && MatchesCurrentActiveTarget(snapshot, doing, entry),
-                jobReportedStatus))
+                jobReportedStatus,
+                MessageDurationFor(snapshot, entry)))
             .ToArray();
         _liveActivityHistory = rows;
         // Reset the ItemsSource before restoring selection so a DataGrid that

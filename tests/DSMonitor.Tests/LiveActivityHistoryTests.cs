@@ -654,6 +654,8 @@ public sealed class LiveActivityHistoryTests
                 CollectionAssert.AreEqual(
                     new[] { "Started", "Duration", "Reported Status" },
                     grid.Columns.Select(column => column.Header?.ToString()).ToArray());
+                Assert.AreEqual("DurationSortSeconds", grid.Columns[1].SortMemberPath);
+                Assert.IsTrue(grid.CanUserSortColumns);
                 Assert.AreEqual(30d, grid.RowHeight);
                 var binding = BindingOperations.GetBinding(
                     grid,

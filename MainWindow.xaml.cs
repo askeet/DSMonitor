@@ -16,19 +16,21 @@ public partial class MainWindow : Window
     public MainWindow()
         : this(
             MonitoringComposition.CreateForStartup(),
-            OpenCodeOriginalRequestService.CreateProduction())
+            OpenCodeOriginalRequestService.CreateProduction(),
+            OpenCodeActivityDurationService.CreateProduction())
     {
     }
 
     /// <summary>
     /// Creates the window with an explicit composition. Callers that do not
-    /// supply a request service get the safe disabled implementation so
+    /// supply observation services get the safe disabled implementations so
     /// synthetic UI tests never start an OpenCode CLI process; production
     /// startup uses the parameterless constructor.
     /// </summary>
     public MainWindow(
         MonitoringComposition composition,
-        IOriginalRequestService? originalRequestService = null)
+        IOriginalRequestService? originalRequestService = null,
+        IOpenCodeActivityDurationService? activityDurationService = null)
     {
         ArgumentNullException.ThrowIfNull(composition);
         InitializeComponent();
@@ -39,7 +41,8 @@ public partial class MainWindow : Window
             Dispatcher,
             composition.Options.RunsRoot,
             composition.Options.RefreshInterval,
-            originalRequestService ?? DisabledOriginalRequestService.Instance);
+            originalRequestService ?? DisabledOriginalRequestService.Instance,
+            activityDurationService ?? DisabledOpenCodeActivityDurationService.Instance);
 
         DataContext = _viewModel;
         UpdateLiveActivityLayout();

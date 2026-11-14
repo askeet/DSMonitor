@@ -1,0 +1,174 @@
+# Codex + DeepSeek + Forge Delegate - Windows First Install
+
+For a clean Windows installation without an existing backup.
+
+## 1. Install prerequisites
+
+Install manually:
+
+- Codex Desktop and sign in to your account.
+- Node.js LTS, including npm.
+- Git, if required for your projects.
+
+## 2. Install dependencies
+
+Run `Install-Dependencies.bat`, review the package versions, and confirm by entering `INSTALL`.
+
+Default versions:
+
+- OpenCode `2.2.6`
+- Forge Delegate `1.2.4`
+
+These are the versions pinned in the portable kit, not necessarily the latest releases.
+
+## 3. Connect DeepSeek
+
+Run in PowerShell:
+
+```powershell
+opencode auth login deepseek
+```
+
+Enter your DeepSeek API key through the OpenCode authentication process.
+
+## 4. Register Forge Delegate with Codex
+
+After approving the MCP configuration changes, run:
+
+```powershell
+forge-delegate setup --targets codex --scope user --model "deepseek/deepseek-flash" --no-skill
+```
+
+`--no-skill` prevents Forge Delegate from installing its bundled `delegate-work` skill over our customized version.
+
+The setup command registers the MCP server in the user-level Codex configuration. It may also install an auto-updating launcher, which must be reviewed in Step 6.
+
+## 5. Configure the external worker
+
+Copy the complete, verified `deepseek-bounded.md` from the portable kit to:
+
+`%USERPROFILE%\.config\opencode\agents\deepseek-bounded.md`
+
+Preserve the original instructions and settings:
+
+- `mode: primary`
+- `model: deepseek/deepseek-flash`
+- `steps: 120`
+
+Do not replace the full agent instructions with a shortened example. If the portable kit does not contain the complete agent file, obtain the verified configuration before proceeding.
+
+Open:
+
+`%USERPROFILE%\.forge-delegate\config.json`
+
+Verify the following fields:
+
+```json
+{
+  "defaultModel": "deepseek/deepseek-flash",
+  "defaultAgent": "deepseek-bounded",
+  "autoApprove": false
+}
+```
+
+This is an example of the required fields, not a complete configuration file. Preserve all other existing settings.
+
+## 6. Verify Forge Delegate safety settings
+
+### Approval settings
+
+- Confirm that `autoApprove` is explicitly set to `false`.
+- Check that named profiles and individual `delegate` calls do not override it with `true`.
+- Keep the authorized model, worker, and project directory consistent across configuration and delegation requests.
+
+**Important:** With `autoApprove: false`, headless worker actions requiring approval may be denied or blocked if no interactive approval mechanism is available. Do not bypass this restriction by enabling automatic approval without explicit authorization.
+
+### Automatic updates
+
+Open:
+
+`%USERPROFILE%\.codex\config.toml`
+
+Find the Forge Delegate MCP entry and inspect the launcher command.
+
+- If it directly runs `forge-delegate.cmd`, the `launcher.mjs` auto-update mechanism is not involved.
+- If it runs `start-mcp.cmd`, inspect that wrapper to determine what it launches.
+- If it uses the auto-updating `launcher.mjs`, disable automatic updates with:
+
+```bat
+set "FORGE_AUTO_UPDATE=0"
+```
+
+For a `.cmd` or `.bat` wrapper, place this line before invoking the launcher.
+
+If Codex launches `launcher.mjs` directly, configure `FORGE_AUTO_UPDATE=0` in the MCP server's environment settings.
+
+Do not change system-wide Windows environment variables.
+
+Restart Codex Desktop after modifying the MCP launcher configuration.
+
+**Before the first delegation, confirm:**
+
+- `autoApprove: false`
+- Automatic updates disabled when using the auto-updating launcher
+- Correct external provider and model
+- Correct bounded agent
+- Authorized project directory and source-sharing scope
+
+## 7. Install global skills
+
+Copy both complete directories from:
+
+`docs/setup/.agents/skills/`
+
+To:
+
+`%USERPROFILE%\.agents\skills\`
+
+Required skills:
+
+- `cost-efficient-coding`
+- `delegate-work`
+
+Preserve all nested files, including:
+
+`cost-efficient-coding/references/`
+
+The main skill controls coding workflow, authorization, architecture decisions, repair budgets, and independent QA.
+
+The `delegate-work` skill provides Forge Delegate execution guidance.
+
+## 8. Enable global Codex instructions
+
+Create or update:
+
+`%USERPROFILE%\.codex\AGENTS.md`
+
+Add:
+
+```markdown
+For coding tasks, consider cost-efficient-coding.
+Apply its workflow when relevant, including explicit
+external delegation requests.
+```
+
+Preserve any existing global instructions.
+
+## 9. Verify installation
+
+1. Run `Verify-Delegate.bat`.
+2. Restart Codex Desktop.
+3. Confirm that the Forge Delegate MCP server and both skills are available.
+4. Verify that the selected worker matches the OpenCode and Forge Delegate configuration.
+5. Optionally run one explicitly authorized, low-risk test delegation. This consumes DeepSeek API credits.
+
+Offline verification does not establish actual provider authentication, model availability, successful delegation, or runtime enforcement of the step limit.
+
+On the first external delegation in a new project, `cost-efficient-coding` should offer a short permission selection. After explicit user consent, the approved permissions are saved in the project's root `AGENTS.md` and reused within their authorized scope.
+
+## After installation
+
+- Run `Backup-Delegate.bat` to back up the configured environment.
+- Use `Restore-Delegate.bat` only when restoring from a ZIP backup.
+- Encrypt backup ZIP files and keep them outside Git repositories.
+- Never allow an AI agent to execute installation or restoration scripts without separate explicit authorization.
