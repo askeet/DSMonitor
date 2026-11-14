@@ -302,10 +302,27 @@ public static class ForgeEventParser
         return end - start;
     }
 
-    private static string FormatDuration(long milliseconds) =>
-        milliseconds >= 1000
+    private static string FormatDuration(long milliseconds)
+    {
+        if (milliseconds >= 86_400_000)
+        {
+            return $"{milliseconds / 86_400_000}d {milliseconds % 86_400_000 / 3_600_000}h";
+        }
+
+        if (milliseconds >= 3_600_000)
+        {
+            return $"{milliseconds / 3_600_000}h {milliseconds % 3_600_000 / 60_000}m";
+        }
+
+        if (milliseconds >= 60_000)
+        {
+            return $"{milliseconds / 60_000}m {milliseconds % 60_000 / 1_000}s";
+        }
+
+        return milliseconds >= 1_000
             ? (milliseconds / 1000d).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " s"
             : milliseconds + " ms";
+    }
 
     private static string? GetString(JsonElement root, string propertyName)
     {

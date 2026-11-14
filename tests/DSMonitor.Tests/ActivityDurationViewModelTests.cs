@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Windows.Threading;
 using DSMonitor.Models;
 using DSMonitor.Services;
@@ -47,6 +48,8 @@ public sealed class ActivityDurationViewModelTests
         PumpUntil(
             () => service.Requests.Count == 1,
             "the initial duration request");
+        var sourceStarted = Text("msg_a").SourceTimestamp!.Value;
+        Assert.AreEqual(FormatStarted(sourceStarted), job.LiveActivityHistory.Single().StartedText);
 
         service.Complete(
             "job_a",
@@ -54,14 +57,17 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromMilliseconds(14_781))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "14.78 s",
+            () => job.LiveActivityHistory.Single().DurationText == "14s",
             "the applied duration");
+        var messageCreated = DateTimeOffset.FromUnixTimeMilliseconds(1_000);
+        Assert.AreEqual(FormatStarted(messageCreated), job.LiveActivityHistory.Single().StartedText);
 
         viewModel.ApplySnapshot(snapshot);
         PumpOnce();
 
         Assert.AreEqual(1, service.Requests.Count);
-        Assert.AreEqual("14.78 s", job.LiveActivityHistory.Single().DurationText);
+        Assert.AreEqual("14s", job.LiveActivityHistory.Single().DurationText);
+        Assert.AreEqual(FormatStarted(messageCreated), job.LiveActivityHistory.Single().StartedText);
         StringAssert.Contains(
             job.LiveActivityHistory.Single().DurationTooltip,
             "OpenCode assistant message duration");
@@ -105,7 +111,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_shared" },
             Available(("msg_shared", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1.00 s",
+            () => job.LiveActivityHistory.Single().DurationText == "1s",
             "the released claim duration");
     }
 
@@ -150,7 +156,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1.00 s",
+            () => job.LiveActivityHistory.Single().DurationText == "1s",
             "the lifecycle retry value");
     }
 
@@ -175,7 +181,7 @@ public sealed class ActivityDurationViewModelTests
         PumpOnce();
 
         var row = job.LiveActivityHistory.Single();
-        Assert.AreEqual("2.0 s", row.DurationText);
+        Assert.AreEqual("2s", row.DurationText);
         StringAssert.Contains(row.DurationTooltip, "same-part");
     }
 
@@ -189,6 +195,10 @@ public sealed class ActivityDurationViewModelTests
             Job("job_b", "ses_b", Text("msg_b"))));
         var jobA = viewModel.Jobs.Single(job => job.JobId == "job_a");
         var jobB = viewModel.Jobs.Single(job => job.JobId == "job_b");
+        var sourceA = Text("msg_a").SourceTimestamp!.Value;
+        var sourceB = Text("msg_b").SourceTimestamp!.Value;
+        Assert.AreEqual(FormatStarted(sourceA), jobA.LiveActivityHistory.Single().StartedText);
+        Assert.AreEqual(FormatStarted(sourceB), jobB.LiveActivityHistory.Single().StartedText);
 
         viewModel.SelectedJob = jobA;
         PumpUntil(
@@ -206,6 +216,7 @@ public sealed class ActivityDurationViewModelTests
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpOnce();
         Assert.AreEqual("N/A", jobA.LiveActivityHistory.Single().DurationText);
+        Assert.AreEqual(FormatStarted(sourceA), jobA.LiveActivityHistory.Single().StartedText);
 
         service.Complete(
             "job_b",
@@ -213,9 +224,13 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_b" },
             Available(("msg_b", TimeSpan.FromSeconds(2))));
         PumpUntil(
-            () => jobB.LiveActivityHistory.Single().DurationText == "2.00 s",
+            () => jobB.LiveActivityHistory.Single().DurationText == "2s",
             "the selected job duration");
         Assert.AreEqual("N/A", jobA.LiveActivityHistory.Single().DurationText);
+        Assert.AreEqual(FormatStarted(sourceA), jobA.LiveActivityHistory.Single().StartedText);
+        Assert.AreEqual(
+            FormatStarted(DateTimeOffset.FromUnixTimeMilliseconds(1_000)),
+            jobB.LiveActivityHistory.Single().StartedText);
     }
 
     [TestMethod]
@@ -233,7 +248,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1.00 s",
+            () => job.LiveActivityHistory.Single().DurationText == "1s",
             "the first evidence value");
 
         viewModel.ApplySnapshot(Snapshot(
@@ -272,7 +287,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1.00 s",
+            () => job.LiveActivityHistory.Single().DurationText == "1s",
             "the healthy value");
 
         viewModel.ApplySnapshot(new MonitoringSnapshot
@@ -303,6 +318,8 @@ public sealed class ActivityDurationViewModelTests
         PumpUntil(
             () => service.Requests.Any(request => request.SessionId == "ses_old"),
             "the old session request");
+        var sourceStarted = Text("msg_a").SourceTimestamp!.Value;
+        Assert.AreEqual(FormatStarted(sourceStarted), job.LiveActivityHistory.Single().StartedText);
         viewModel.ApplySnapshot(Snapshot(Job("job_session", "ses_new", Text("msg_a"))));
         PumpUntil(
             () => service.Requests.Any(request => request.SessionId == "ses_new"),
@@ -315,6 +332,7 @@ public sealed class ActivityDurationViewModelTests
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpOnce();
         Assert.AreEqual("N/A", job.LiveActivityHistory.Single().DurationText);
+        Assert.AreEqual(FormatStarted(sourceStarted), job.LiveActivityHistory.Single().StartedText);
 
         service.Complete(
             "job_session",
@@ -322,8 +340,11 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(2))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "2.00 s",
+            () => job.LiveActivityHistory.Single().DurationText == "2s",
             "the replacement session value");
+        Assert.AreEqual(
+            FormatStarted(DateTimeOffset.FromUnixTimeMilliseconds(1_000)),
+            job.LiveActivityHistory.Single().StartedText);
     }
 
     [TestMethod]
@@ -441,6 +462,9 @@ public sealed class ActivityDurationViewModelTests
 
         return OpenCodeActivityDurationsResult.Available(map, isComplete: true);
     }
+
+    private static string FormatStarted(DateTimeOffset timestamp) =>
+        timestamp.ToLocalTime().ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture);
 
     private static void PumpOnce() =>
         Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.Background);

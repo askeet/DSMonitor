@@ -24,9 +24,13 @@ internal static class LiveActivityHistoryPolicy
 }
 
 /// <summary>
-/// Bounded, transient per-job accumulation of job-specific message/part
-/// activity. It never reads a source, writes state, or persists content. A
-/// refresh may extend the previous history only when the current guarded read
+/// Transient per-job accumulation of job-specific message/part activity. It
+/// never reads a source, writes state, or persists content. The retained set is
+/// bounded by the current guarded reader window rather than a fixed row count:
+/// every valid record parsed from the latest <see cref="JobLiveActivityReader.MaxHistoryReadBytes"/>
+/// is retained, and a refresh evicts entries whose absolute source offset is
+/// outside the newly proven <c>[ReadWindowStart, ReadWindowEnd)</c> window.
+/// A refresh may extend the previous history only when the current guarded read
 /// proves the same exact job, verified path, physical identity, generation,
 /// nondecreasing captured length, and every previously retained record that is
 /// still inside the new bounded window reappears at the same byte offset with
@@ -36,7 +40,7 @@ internal static class LiveActivityHistoryPolicy
 ///
 /// One entry is retained per exact ordinal (session, message, part) identity
 /// inside the job/generation. The newest physical record wins; an older reread
-/// never overwrites a newer record. Entries and text are bounded.
+/// never overwrites a newer record. Per-entry text remains bounded.
 /// </summary>
 internal sealed class LiveActivityHistoryBuffer
 {
@@ -96,7 +100,7 @@ internal sealed class LiveActivityHistoryBuffer
 
         if (!CanCarry(read, jobId, verifiedPath, observation, current))
         {
-            Seed(jobId, verifiedPath, observation, current);
+            Seed(read, jobId, verifiedPath, observation, current);
             return Entries;
         }
 
@@ -109,7 +113,7 @@ internal sealed class LiveActivityHistoryBuffer
                 prior.ByteOffset == entry.ByteOffset &&
                 !DigestEquals(prior.RecordDigest, entry.RecordDigest))
             {
-                Seed(jobId, verifiedPath, observation, current);
+                Seed(read, jobId, verifiedPath, observation, current);
                 return Entries;
             }
         }
@@ -131,7 +135,7 @@ internal sealed class LiveActivityHistoryBuffer
 
         _entries = merged;
         UpdateEvidence(jobId, verifiedPath, observation);
-        Trim();
+        RemoveEntriesOutsideWindow(read.ReadWindowStart, read.ReadWindowEnd);
         return Entries;
     }
 
@@ -285,6 +289,7 @@ internal sealed class LiveActivityHistoryBuffer
         DigestEquals(left.RecordDigest, right.RecordDigest);
 
     private void Seed(
+        LiveActivitySnapshot read,
         string jobId,
         string verifiedPath,
         LedgerSourceObservation observation,
@@ -294,7 +299,7 @@ internal sealed class LiveActivityHistoryBuffer
         _entries = new Dictionary<(string Session, string Message, string PartId),
             LiveActivityHistoryEntry>(current);
         UpdateEvidence(jobId, verifiedPath, observation);
-        Trim();
+        RemoveEntriesOutsideWindow(read.ReadWindowStart, read.ReadWindowEnd);
     }
 
     private void UpdateEvidence(
@@ -309,19 +314,25 @@ internal sealed class LiveActivityHistoryBuffer
         CapturedLength = observation.CapturedLength;
     }
 
-    private void Trim()
+    /// <summary>
+    /// Keep only entries whose absolute source offset is inside the current
+    /// successfully parsed reader window. A sliding window therefore cannot
+    /// accumulate stale rows from earlier refreshes, while a proven continuity
+    /// overlap preserves every entry that is still inside the window.
+    /// </summary>
+    private void RemoveEntriesOutsideWindow(long windowStart, long windowEnd)
     {
-        if (_entries.Count <= JobLiveActivityReader.MaxHistoryEntries)
+        if (_entries.Count == 0 ||
+            _entries.Values.All(pair => pair.ByteOffset >= windowStart &&
+                                        pair.ByteOffset < windowEnd))
         {
             return;
         }
 
-        var retained = LiveActivityHistoryPolicy
-            .Order(_entries.Values)
-            .Take(JobLiveActivityReader.MaxHistoryEntries);
-        _entries = retained.ToDictionary(
-            Identity,
-            entry => entry);
+        _entries = _entries
+            .Where(pair => pair.Value.ByteOffset >= windowStart &&
+                           pair.Value.ByteOffset < windowEnd)
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
     }
 
     private static Dictionary<(string Session, string Message, string PartId),

@@ -106,9 +106,10 @@ public sealed record LiveActivitySnapshot
         "Re-read on restart, never restored from SQLite. Source order is used; observation is not proof of current execution, independent QA, or user acceptance.";
 
     public const string HistoryRetentionNotice =
-        "Transient, bounded job-specific history: at most 64 parts and 4,000 characters per part. " +
-        "Carried across a refresh only while the same verified job/source generation, nondecreasing length, " +
-        "and exact overlapping source records prove continuity. Cleared on restart, source replacement, " +
-        "truncation, conflict, unavailable/fallback scans, or missing overlap. This is not complete history, " +
-        "not job duration, and not proof of execution, completion, independent QA, or user acceptance.";
+        "Transient, bounded job-specific history: every valid part parsed from the latest 5 MiB of the job log, " +
+        "with at most 4,000 characters per part. Carried across a refresh only while the same verified job/source " +
+        "generation, nondecreasing length, and exact overlapping source records prove continuity; entries outside " +
+        "the current reader window are dropped. Cleared on restart, source replacement, truncation, conflict, " +
+        "unavailable/fallback scans, or missing overlap. This is not complete history, not job duration, and not " +
+        "proof of execution, completion, independent QA, or user acceptance.";
 }

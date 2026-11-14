@@ -341,7 +341,7 @@ public sealed class OpenCodeActivityDurationServiceTests
         Assert.AreEqual("0s", zero.DurationText);
 
         var shortDuration = Row(Message("msg_short", TimeSpan.FromMilliseconds(14_781)));
-        Assert.AreEqual("14.78 s", shortDuration.DurationText);
+        Assert.AreEqual("14s", shortDuration.DurationText);
         StringAssert.Contains(
             shortDuration.DurationTooltip,
             "OpenCode assistant message duration");
@@ -352,7 +352,7 @@ public sealed class OpenCodeActivityDurationServiceTests
         var tool = Row(
             Message("msg_tool", TimeSpan.FromMilliseconds(14_781)),
             toolDuration: TimeSpan.FromSeconds(2));
-        Assert.AreEqual("2.0 s", tool.DurationText);
+        Assert.AreEqual("2s", tool.DurationText);
         StringAssert.Contains(tool.DurationTooltip, "same-part");
 
         var toolRow = Row(
@@ -367,19 +367,82 @@ public sealed class OpenCodeActivityDurationServiceTests
         var shortDuration = Row(Message("msg_short", TimeSpan.FromMilliseconds(14_781)));
         var zero = Row(Message("msg_zero", TimeSpan.Zero));
         var missing = Row(null);
-        var otherMessage = Row(Message("msg_other", TimeSpan.FromSeconds(2)), entryMessage: "msg_short");
+        var otherMessage = Row(
+            Message("msg_other", TimeSpan.FromSeconds(2)),
+            entryMessage: "msg_short",
+            sourceTimestamp: DateTimeOffset.FromUnixTimeMilliseconds(2_000));
 
         Assert.AreEqual(14.781d, shortDuration.DurationSortSeconds, 0.0001);
         Assert.AreEqual(0d, zero.DurationSortSeconds);
         Assert.AreEqual(double.PositiveInfinity, missing.DurationSortSeconds);
         Assert.AreEqual("N/A", otherMessage.DurationText);
+        Assert.AreEqual(FormatStarted(otherMessage.Entry.SourceTimestamp!.Value), otherMessage.StartedText);
+    }
+
+    [TestMethod]
+    public void Presentation_StartedUsesExactMessageCreatedAndPreservesFallbacks()
+    {
+        var created = DateTimeOffset.FromUnixTimeMilliseconds(1_000);
+        var sourceTimestamp = DateTimeOffset.FromUnixTimeMilliseconds(2_000);
+        var message = new OpenCodeMessageDuration(
+            "msg_started",
+            created,
+            created.AddSeconds(14),
+            TimeSpan.FromSeconds(14));
+        var text = Row(
+            message,
+            entryMessage: "msg_started",
+            sourceTimestamp: sourceTimestamp);
+
+        Assert.AreEqual(FormatStarted(created), text.StartedText);
+        StringAssert.Contains(text.StartedTooltip, $"time.created {created:O}");
+        StringAssert.Contains(text.StartedTooltip, $"Forge source timestamp {sourceTimestamp:O}");
+        Assert.AreEqual("14s", text.DurationText);
+
+        var noSourceEntry = text.Entry with { SourceTimestamp = null };
+        var createdWithoutSource = new LiveActivityHistoryRowViewModel(
+            noSourceEntry,
+            null,
+            false,
+            null,
+            message);
+        Assert.AreEqual(FormatStarted(created), createdWithoutSource.StartedText);
+
+        var noMessageEvidence = Row(
+            null,
+            entryMessage: "msg_started",
+            sourceTimestamp: sourceTimestamp);
+        Assert.AreEqual(FormatStarted(sourceTimestamp), noMessageEvidence.StartedText);
+
+        var tool = Row(
+            message,
+            kind: "Observed tool activity",
+            entryMessage: "msg_started",
+            sourceTimestamp: sourceTimestamp);
+        Assert.AreEqual(FormatStarted(sourceTimestamp), tool.StartedText);
+        Assert.AreEqual("N/A", tool.DurationText);
+
+        var result = Row(
+            message,
+            kind: "Agent-reported result — unverified",
+            entryMessage: "msg_started",
+            sourceTimestamp: sourceTimestamp);
+        Assert.AreEqual(FormatStarted(sourceTimestamp), result.StartedText);
+
+        var rolelessText = Row(
+            message,
+            kind: "Observed roleless text — unverified",
+            entryMessage: "msg_started",
+            sourceTimestamp: sourceTimestamp);
+        Assert.AreEqual(FormatStarted(created), rolelessText.StartedText);
     }
 
     private static LiveActivityHistoryRowViewModel Row(
         OpenCodeMessageDuration? duration,
         TimeSpan? toolDuration = null,
         string kind = "Assistant-reported text",
-        string? entryMessage = null)
+        string? entryMessage = null,
+        DateTimeOffset? sourceTimestamp = null)
     {
         entryMessage ??= duration?.MessageId ?? "msg";
         var entry = new LiveActivityHistoryEntry(
@@ -391,7 +454,7 @@ public sealed class OpenCodeActivityDurationServiceTests
             "synthetic",
             @"C:\synthetic\job.log",
             0,
-            DateTimeOffset.FromUnixTimeMilliseconds(1_000),
+            sourceTimestamp ?? DateTimeOffset.FromUnixTimeMilliseconds(1_000),
             DateTimeOffset.FromUnixTimeMilliseconds(2_000),
             "digest",
             toolDuration);
@@ -414,6 +477,9 @@ public sealed class OpenCodeActivityDurationServiceTests
             DateTimeOffset.FromUnixTimeMilliseconds(1_000),
             DateTimeOffset.FromUnixTimeMilliseconds(1_000) + duration,
             duration);
+
+    private static string FormatStarted(DateTimeOffset timestamp) =>
+        timestamp.ToLocalTime().ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture);
 
     private static OpenCodeActivityDurationService CreateService(
         FakeExecutor executor,

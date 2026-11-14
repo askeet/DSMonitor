@@ -122,10 +122,11 @@ public sealed class LiveActivityHistoryTests
     }
 
     [TestMethod]
-    public void HistoryBuffer_CapsRetainedEntriesToTheNewestBoundedRows()
+    public void HistoryBuffer_RetainsEveryEntryInsideTheCurrentWindowWithoutARowCountCap()
     {
         var buffer = new LiveActivityHistoryBuffer();
-        var entries = Enumerable.Range(0, JobLiveActivityReader.MaxHistoryEntries + 6)
+        const int count = 70;
+        var entries = Enumerable.Range(0, count)
             .Select(index => Entry(
                 "part-" + index,
                 index * 10,
@@ -135,14 +136,14 @@ public sealed class LiveActivityHistoryTests
             .ToArray();
 
         var retained = buffer.Apply(
-            Read(entries, 0, entries.Length * 10L),
+            Read(entries, 0, count * 10L),
             "job",
             SourcePath,
-            Observation(captured: entries.Length * 10L));
+            Observation(captured: count * 10L));
 
-        Assert.AreEqual(JobLiveActivityReader.MaxHistoryEntries, retained.Count);
+        Assert.AreEqual(count, retained.Count);
         Assert.AreEqual("part-69", retained[0].Text);
-        Assert.AreEqual("part-6", retained[^1].Text);
+        Assert.AreEqual("part-0", retained[^1].Text);
     }
 
     [TestMethod]
@@ -173,8 +174,10 @@ public sealed class LiveActivityHistoryTests
             SourcePath,
             Observation(captured: 160));
 
+        // The current window starts at byte 50, so the older C row at byte 40
+        // is outside the successfully parsed window and must be evicted.
         CollectionAssert.AreEqual(
-            new[] { "A-new", "E", "D", "B", "C" },
+            new[] { "A-new", "E", "D", "B" },
             refreshed.Select(entry => entry.Text).ToArray());
 
         // An older physical record with the same identity must not replace the
@@ -188,7 +191,7 @@ public sealed class LiveActivityHistoryTests
         var retainedA = afterOlderReread.Single(entry => entry.PartId == "a");
         Assert.AreEqual("A-new", retainedA.Text);
         Assert.AreEqual(140L, retainedA.ByteOffset);
-        Assert.AreEqual(5, afterOlderReread.Count);
+        Assert.AreEqual(4, afterOlderReread.Count);
     }
 
     [TestMethod]
@@ -361,7 +364,7 @@ public sealed class LiveActivityHistoryTests
         var olderRow = row.LiveActivityHistory[1];
         var unknownRow = row.LiveActivityHistory[2];
 
-        Assert.AreEqual("2.0 s", newerRow.DurationText);
+        Assert.AreEqual("2s", newerRow.DurationText);
         StringAssert.Contains(newerRow.DurationTooltip, "same-part");
         Assert.AreEqual(
             newer.SourceTimestamp!.Value.ToLocalTime().ToString(

@@ -45,31 +45,54 @@ forge-delegate setup --targets codex --scope user --model "deepseek/deepseek-fla
 
 ## 5. Настроить внешнего исполнителя
 
-Скопировать полный проверенный `deepseek-bounded.md` из portable-kit в:
 
-`%USERPROFILE%\.config\opencode\agents\deepseek-bounded.md`
+Скопировать полный проверенный deepseek-bounded.md из portable-kit в:
 
-Сохранить оригинальные инструкции и параметры:
+%USERPROFILE%\.config\opencode\agents\deepseek-bounded.md
 
-- `mode: primary`
-- `model: deepseek/deepseek-flash`
-- `steps: 120`
+Проверить параметры агента:
 
-Не заменять полные инструкции агента сокращённым примером. Если portable-kit не содержит полного файла, получить проверенную конфигурацию перед продолжением установки.
+mode: primary
+model: deepseek/deepseek-flash
+steps: 120
+
+Сохранить все инструкции агента. Не заменять их сокращённым примером. Если portable-kit не содержит полного файла, получить проверенную конфигурацию перед продолжением.
 
 Открыть:
 
-`%USERPROFILE%\.forge-delegate\config.json`
+%USERPROFILE%\.forge-delegate\config.json
 
-Проверить следующие поля:
+Проверить и добавить отсутствующие настройки, сохраняя остальные существующие поля:
 
-```json
 {
   "defaultModel": "deepseek/deepseek-flash",
   "defaultAgent": "deepseek-bounded",
-  "autoApprove": false
+  "defaultVariant": null,
+  "autoApprove": false,
+  "timeoutMs": 5400000,
+  "defaultDirectory": null,
+  "profiles": {}
 }
-```
+
+Это рекомендуемая конфигурация для нашей установки.
+
+defaultModel — модель DeepSeek.
+
+defaultAgent — обязательный для нашего workflow выбор deepseek-bounded; без него OpenCode может использовать стандартный build.
+
+autoApprove: false — не разрешать автоматическое подтверждение инструментальных действий.
+
+timeoutMs: 5400000 — тайм-аут задания 90 минут.
+
+defaultVariant: null — без отдельного переопределения варианта модели.
+
+defaultDirectory: null — директория проекта передаётся при делегировании.
+
+profiles: {} — без дополнительных профилей.
+
+Важно: Forge timeoutMs и OpenCode steps: 120 являются независимыми ограничениями. Достижение тайм-аута само по себе не подтверждает завершение дочернего процесса.
+
+Не заменять файл целиком, если он содержит дополнительные действующие настройки.
 
 Это пример требуемых полей, а не полный конфигурационный файл. Сохранить все остальные существующие настройки.
 

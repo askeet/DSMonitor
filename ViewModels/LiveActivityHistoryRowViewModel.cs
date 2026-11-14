@@ -5,10 +5,12 @@ using DSMonitor.Services;
 namespace DSMonitor.ViewModels;
 
 /// <summary>
-/// One row in the Live Activity tab. The Started value is the record's own
-/// source timestamp (or a neutral unknown marker), Duration is only the
-/// same-part tool start/end duration when the source supplied a valid pair, and
-/// Reported Status keeps the row's own exact/report-local value when usable.
+/// One row in the Live Activity tab. Started uses the verified OpenCode
+/// assistant message creation time when the exact message duration evidence
+/// is available; otherwise it uses the record's own source timestamp (or a
+/// neutral unknown marker). Duration is only the same-part tool start/end
+/// duration when the source supplied a valid pair, and Reported Status keeps
+/// the row's own exact/report-local value when usable.
 /// Otherwise it reuses the job-level value resolved once for the Forge jobs
 /// table cell, including a job-owned text fallback. Nothing here establishes
 /// completion, success, or liveness.
@@ -27,7 +29,8 @@ public sealed class LiveActivityHistoryRowViewModel
     /// <param name="messageDuration">
     /// Exact OpenCode assistant-message duration for this row's structured
     /// message id, when the service confirmed an assistant type and a valid
-    /// created/completed pair. It is message scoped and never replaces a valid
+    /// created/completed pair. Its Created value may supply Started for this
+    /// exact message row. It is message scoped and never replaces a valid
     /// same-part tool duration.
     /// </param>
     public LiveActivityHistoryRowViewModel(
@@ -82,11 +85,17 @@ public sealed class LiveActivityHistoryRowViewModel
     /// </summary>
     public bool IsCurrentActiveTarget { get; }
 
-    public string StartedText => Entry.SourceTimestamp is { } timestamp
+    public string StartedText => (_messageDuration?.Created ?? Entry.SourceTimestamp) is { } timestamp
         ? timestamp.ToLocalTime().ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture)
         : "—";
 
-    public string StartedTooltip => Entry.SourceTimestamp is { } timestamp
+    public string StartedTooltip => _messageDuration is { } messageDuration
+        ? $"Verified OpenCode assistant message time.created {messageDuration.Created:O}; " +
+          $"Forge source timestamp {Entry.SourceTimestamp?.ToString("O") ?? "N/A"}; " +
+          $"observed {Entry.ObservedAt:O}. Job {Entry.JobId}; session {Entry.SessionId}; " +
+          $"message {Entry.MessageId}. Message-scoped creation time, not this part's " +
+          "observation/completion time."
+        : Entry.SourceTimestamp is { } timestamp
         ? $"Source timestamp {timestamp:O}; observed {Entry.ObservedAt:O}. " +
           $"Job {Entry.JobId}; session {Entry.SessionId}; message {Entry.MessageId}; " +
           $"part {Entry.PartId}; source {Entry.SourcePath} at byte {Entry.ByteOffset}. " +
@@ -97,7 +106,7 @@ public sealed class LiveActivityHistoryRowViewModel
     public string DurationText => Entry.ObservedDuration is { } duration
         ? FormatDuration(duration)
         : _messageDuration is { } messageDuration
-            ? FormatMessageDuration(messageDuration.Duration)
+            ? FormatDuration(messageDuration.Duration)
             : "N/A";
 
     /// <summary>
@@ -182,21 +191,6 @@ public sealed class LiveActivityHistoryRowViewModel
         extraction is not null &&
         string.Equals(extraction.Source.JobId, entry.JobId, StringComparison.Ordinal);
 
-    private static string FormatMessageDuration(TimeSpan duration)
-    {
-        if (duration == TimeSpan.Zero)
-        {
-            return "0s";
-        }
-
-        if (duration < TimeSpan.FromMinutes(1))
-        {
-            return duration.TotalSeconds.ToString("0.00", CultureInfo.InvariantCulture) + " s";
-        }
-
-        return FormatDuration(duration);
-    }
-
     private static string FormatMessageDurationDetail(TimeSpan duration)
     {
         if (duration < TimeSpan.FromMinutes(1))
@@ -229,9 +223,7 @@ public sealed class LiveActivityHistoryRowViewModel
             return $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
         }
 
-        return duration.TotalSeconds >= 1
-            ? duration.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " s"
-            : duration.TotalMilliseconds.ToString("0", CultureInfo.InvariantCulture) + " ms";
+        return $"{(int)duration.TotalSeconds}s";
     }
 
     private static string FormatDurationDetail(TimeSpan duration)

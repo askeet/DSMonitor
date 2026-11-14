@@ -76,7 +76,7 @@ public sealed class LiveActivityStabilizationTests
     }
 
     [TestMethod]
-    public void HistoryBuffer_CarriesOlderRowsWhenDedupHidesTheOverlapUpdate()
+    public void HistoryBuffer_CarriesOverlapUpdateAndDropsRowsOutsideTheWindow()
     {
         var buffer = new LiveActivityHistoryBuffer();
         var a = Entry("A", 20, Now.AddMinutes(-3), part: "a", digest: "A");
@@ -95,10 +95,13 @@ public sealed class LiveActivityStabilizationTests
             SourcePath,
             Observation(captured: 100));
 
+        // The same-part update is carried by the exact overlap at byte 40,
+        // while the older A row at byte 20 is outside the current window.
         CollectionAssert.AreEqual(
-            new[] { "B-updated", "A" },
+            new[] { "B-updated" },
             refreshed.Select(entry => entry.Text).ToArray());
         Assert.AreEqual(65L, refreshed.Single(entry => entry.PartId == "b").ByteOffset);
+        Assert.IsFalse(refreshed.Any(entry => entry.PartId == "a"));
     }
 
     [TestMethod]
@@ -337,9 +340,10 @@ public sealed class LiveActivityStabilizationTests
             snapshot => !snapshot.Jobs.Any(item => item.JobId == "job0"),
             TimeSpan.FromSeconds(10));
 
-        // Append enough bytes that the next 64 KB window starts inside the
-        // already-read filler before B. A is then outside the window; only a
-        // buffer that failed to clear on the aggregate error can still carry it.
+        // Append enough bytes that the next 5 MiB history window starts inside
+        // the already-read filler before B. A is then outside the window; only
+        // a buffer that failed to clear on the aggregate error can still carry
+        // it.
         var targetStart = a.ByteOffset + (b.ByteOffset - a.ByteOffset) / 2;
         var cLine = TestWorkspace.Text(
             Now.ToUnixTimeMilliseconds(),
@@ -348,14 +352,18 @@ public sealed class LiveActivityStabilizationTests
             part: "c",
             message: "mc");
         var cBytes = Encoding.UTF8.GetByteCount(cLine) + 1;
-        var required = JobLiveActivityReader.MaxReadBytes + targetStart - initialLength;
+        var required = JobLiveActivityReader.MaxHistoryReadBytes + targetStart - initialLength;
         var paddingLength = required - cBytes;
         Assert.IsTrue(paddingLength > 1);
-        var padding = new string('p', checked((int)paddingLength - 1)) + "\n";
+        var padding = BuildPadding(
+            checked((int)paddingLength),
+            Now.AddMinutes(-8).ToUnixTimeMilliseconds());
         File.AppendAllText(logPath, padding + cLine + "\n", Encoding.UTF8);
 
         var recovered = await harness.WaitForAsync(
-            snapshot => History(snapshot, "job0").Any(entry => entry.PartId == "c"),
+            snapshot => snapshot.Jobs.Any(item =>
+                item.JobId == "job0" &&
+                item.LiveActivity.History.Any(entry => entry.PartId == "c")),
             TimeSpan.FromSeconds(10));
         var recoveredHistory = History(recovered, "job0");
         Assert.IsTrue(recoveredHistory.Any(entry => entry.PartId == "b"));
@@ -540,6 +548,47 @@ public sealed class LiveActivityStabilizationTests
         MonitoringSnapshot snapshot,
         string jobId) =>
         snapshot.Jobs.Single(job => job.JobId == jobId).LiveActivity.History;
+
+    private static string BuildPadding(int length, long timestamp)
+    {
+        var builder = new StringBuilder(length);
+        var remaining = length;
+        var index = 0;
+        while (remaining > 200)
+        {
+            var lineBytes = Math.Min(100_000, remaining - 1);
+            var part = "padding-" + index;
+            var message = "padding-message-" + index;
+            var recordTimestamp = timestamp + index;
+            var overhead = Encoding.UTF8.GetByteCount(
+                TestWorkspace.Text(recordTimestamp, string.Empty, part: part, message: message)) + 1;
+            var textLength = lineBytes - overhead;
+            if (textLength < 1)
+            {
+                break;
+            }
+
+            builder
+                .Append(TestWorkspace.Text(
+                    recordTimestamp,
+                    new string('p', textLength),
+                    part: part,
+                    message: message))
+                .Append('\n');
+            remaining -= lineBytes;
+            index++;
+        }
+
+        if (remaining > 0)
+        {
+            // Keep the final filler short and newline-terminated. If no valid
+            // record fits, the following C record is still in the same
+            // ingestion window, so recovery is not blocked.
+            builder.Append(new string('p', Math.Max(0, remaining - 1))).Append('\n');
+        }
+
+        return builder.ToString();
+    }
 
     private static void SetLastActivity(string databasePath, string value)
     {

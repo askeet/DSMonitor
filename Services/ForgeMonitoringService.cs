@@ -820,7 +820,7 @@ public sealed class ForgeMonitoringService
                     _runsRoot,
                     observedAt,
                     cancellationToken,
-                    _options.MaxBytesPerPoll);
+                    JobLiveActivityReader.MaxHistoryReadBytes);
                 if (liveActivity.HasReadWindow)
                 {
                     liveActivity = ApplyLiveActivityHistory(

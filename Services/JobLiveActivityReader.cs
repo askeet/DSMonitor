@@ -39,10 +39,18 @@ public sealed record LiveActivitySourceEvidence(
 /// </summary>
 public static class JobLiveActivityReader
 {
+    /// <summary>Maximum tail bytes used for the user-visible Doing/Done preview.</summary>
     public const int MaxReadBytes = 64 * 1024;
     public const int MaxFullReportBytes = 256 * 1024;
     public const int MaxExcerptLength = 600;
-    public const int MaxHistoryEntries = 64;
+
+    /// <summary>
+    /// Maximum tail bytes read for Activity History. History retains every
+    /// valid part parsed inside this current window; there is no separate
+    /// fixed row-count cap.
+    /// </summary>
+    public const int MaxHistoryReadBytes = 5 * 1024 * 1024;
+
     public const int MaxHistoryTextLength = 4_000;
     private const string AssistantTextKind = "Assistant-reported text";
     private const string RolelessTextKind = "Observed roleless text — unverified";
@@ -139,7 +147,7 @@ public static class JobLiveActivityReader
         string runsRoot,
         DateTimeOffset observedAt,
         CancellationToken cancellationToken = default,
-        long maxBytes = MaxReadBytes) =>
+        long maxBytes = MaxHistoryReadBytes) =>
         Read(
             job,
             evidence,
@@ -188,7 +196,7 @@ public static class JobLiveActivityReader
 
             var count = (int)Math.Min(
                 observation.CapturedLength,
-                Math.Clamp(maxBytes, 1, MaxReadBytes));
+                Math.Clamp(maxBytes, 1, MaxHistoryReadBytes));
             var start = observation.CapturedLength - count;
             if (!TryReadWindow(
                     stream,
@@ -213,22 +221,48 @@ public static class JobLiveActivityReader
             var history = new Dictionary<(string Session, string Message, string PartId), LiveActivityHistoryEntry>();
             // Discard the first record when starting mid-file, even if it
             // happens to be complete. Never parse a possibly partial record.
-            var lineStart = start == 0 ? 0 : Array.IndexOf(bytes, (byte)'\n', 0, read) + 1;
+            var lineStart = start == 0 ? 0 : FindNewline(
+                bytes, 0, read, cancellationToken) + 1;
             if (start > 0 && lineStart == 0)
             {
                 return Unavailable("N/A — no complete record in bounded source window.");
             }
 
-            for (var index = lineStart; index < read; index++)
+            // The history window may be much larger than the existing preview
+            // window. Preserve the current Doing/Done behavior by only allowing
+            // records starting at or after the 64 KiB preview boundary to
+            // update the preview; a record that straddles that boundary is
+            // still discarded just as it was in the old 64 KiB tail read.
+            var previewWindowStart = observation.CapturedLength -
+                Math.Min(observation.CapturedLength, MaxReadBytes);
+            var previewLineStart = previewWindowStart <= start
+                ? lineStart
+                : PreviewLineStart(
+                    bytes,
+                    read,
+                    (int)(previewWindowStart - start),
+                    cancellationToken);
+
+            var index = lineStart;
+            while (index < read)
             {
-                if (bytes[index] != (byte)'\n') continue;
+                var newline = FindNewline(bytes, index, read, cancellationToken);
+                if (newline < 0)
+                {
+                    // An unterminated final record is incomplete and is never
+                    // parsed as if it were a complete JSONL record.
+                    break;
+                }
+
                 cancellationToken.ThrowIfCancellationRequested();
-                var offset = start + lineStart;
-                var recordStart = lineStart;
-                lineStart = index + 1;
+                var offset = start + index;
+                var recordStart = index;
+                var recordEnd = newline;
+                index = newline + 1;
+                var previewEligible = recordStart >= previewLineStart;
                 try
                 {
-                    var line = StrictUtf8.GetString(bytes, recordStart, index - recordStart)
+                    var line = StrictUtf8.GetString(bytes, recordStart, recordEnd - recordStart)
                         .TrimStart('\uFEFF');
                     using var document = JsonDocument.Parse(line);
                     var root = document.RootElement;
@@ -250,7 +284,11 @@ public static class JobLiveActivityReader
                         continue;
                     }
 
-                    latestLifecycleByteOffset = offset;
+                    if (previewEligible)
+                    {
+                        latestLifecycleByteOffset = offset;
+                    }
+
                     if (!ForgeEventParser.TryParse(line, job.JobId, observedAt, out var parsed) ||
                         parsed is null)
                     {
@@ -259,7 +297,7 @@ public static class JobLiveActivityReader
 
                     var key = (session!, message!);
                     var sourcePath = verifiedPath;
-                    var recordDigest = ComputeDigest(bytes, recordStart, index - recordStart);
+                    var recordDigest = ComputeDigest(bytes, recordStart, recordEnd - recordStart);
                     ActivityExcerpt Excerpt(string text, string kind) => new(
                         Sanitize(text),
                         kind,
@@ -293,12 +331,12 @@ public static class JobLiveActivityReader
                             TryGetToolDuration(
                                 part,
                                 out var observedDuration,
-                                out var start,
-                                out var end))
+                                out var startMilliseconds,
+                                out var endMilliseconds))
                         {
                             duration = observedDuration;
-                            durationStart = start;
-                            durationEnd = end;
+                            durationStart = startMilliseconds;
+                            durationEnd = endMilliseconds;
                         }
 
                         return new LiveActivityHistoryEntry(
@@ -339,11 +377,15 @@ public static class JobLiveActivityReader
                         hasText &&
                         !string.IsNullOrWhiteSpace(text))
                     {
-                        doing = Excerpt(
-                            text,
-                            verifiedAssistant ? AssistantTextKind : RolelessTextKind);
-                        latestText = doing;
-                        texts[key] = (doing, verifiedAssistant);
+                        if (previewEligible)
+                        {
+                            doing = Excerpt(
+                                text,
+                                verifiedAssistant ? AssistantTextKind : RolelessTextKind);
+                            latestText = doing;
+                            texts[key] = (doing, verifiedAssistant);
+                        }
+
                         RememberHistory(HistoryEntry(
                             text,
                             verifiedAssistant ? AssistantTextKind : RolelessTextKind,
@@ -353,9 +395,13 @@ public static class JobLiveActivityReader
                     {
                         // The existing parser emits safe tool names/states,
                         // excluding command arguments, output and secrets.
-                        doing = Excerpt(
-                            parsed.Event.Summary,
-                            verifiedAssistant ? AssistantToolKind : RolelessToolKind);
+                        if (previewEligible)
+                        {
+                            doing = Excerpt(
+                                parsed.Event.Summary,
+                                verifiedAssistant ? AssistantToolKind : RolelessToolKind);
+                        }
+
                         RememberHistory(HistoryEntry(
                             parsed.Event.Summary,
                             verifiedAssistant ? AssistantToolKind : RolelessToolKind,
@@ -368,14 +414,17 @@ public static class JobLiveActivityReader
                     {
                         // The terminal source event is evidence even when no
                         // text result was captured in this bounded window.
-                        doneEventByteOffset = offset;
-                        if (texts.TryGetValue(key, out var result))
+                        if (previewEligible)
                         {
-                            var verifiedResult = verifiedAssistant && result.VerifiedAssistant;
-                            done = result.Excerpt with
+                            doneEventByteOffset = offset;
+                            if (texts.TryGetValue(key, out var result))
                             {
-                                Kind = verifiedResult ? AssistantResultKind : RolelessResultKind
-                            };
+                                var verifiedResult = verifiedAssistant && result.VerifiedAssistant;
+                                done = result.Excerpt with
+                                {
+                                    Kind = verifiedResult ? AssistantResultKind : RolelessResultKind
+                                };
+                            }
                         }
                     }
                 }
@@ -1168,6 +1217,51 @@ public static class JobLiveActivityReader
         }
 
         return true;
+    }
+
+    private static int PreviewLineStart(
+        byte[] bytes,
+        int read,
+        int previewWindowStart,
+        CancellationToken cancellationToken)
+    {
+        if (previewWindowStart >= read)
+        {
+            return read;
+        }
+
+        var newline = FindNewline(
+            bytes, previewWindowStart, read, cancellationToken);
+        return newline < 0 ? read : newline + 1;
+    }
+
+    /// <summary>
+    /// Find the next record terminator while allowing cancellation during a
+    /// large window or a single long record. The bounded chunk size keeps the
+    /// check responsive without changing the parsed record boundaries.
+    /// </summary>
+    private static int FindNewline(
+        byte[] bytes,
+        int start,
+        int end,
+        CancellationToken cancellationToken)
+    {
+        const int ChunkSize = 64 * 1024;
+        var index = start;
+        while (index < end)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var limit = Math.Min(end, index + ChunkSize);
+            var found = Array.IndexOf(bytes, (byte)'\n', index, limit - index);
+            if (found >= 0)
+            {
+                return found;
+            }
+
+            index = limit;
+        }
+
+        return -1;
     }
 
     private static bool TryReadWindow(
