@@ -107,9 +107,12 @@ public sealed record LiveActivitySnapshot
 
     public const string HistoryRetentionNotice =
         "Transient, bounded job-specific history: every valid part parsed from the latest 5 MiB of the job log, " +
-        "with at most 4,000 characters per part. Carried across a refresh only while the same verified job/source " +
-        "generation, nondecreasing length, and exact overlapping source records prove continuity; entries outside " +
-        "the current reader window are dropped. Cleared on restart, source replacement, truncation, conflict, " +
-        "unavailable/fallback scans, or missing overlap. This is not complete history, not job duration, and not " +
-        "proof of execution, completion, independent QA, or user acceptance.";
+        "with at most 4,000 characters per part. Step start/finish records are kept as their own identity-checked " +
+        "entries; an unambiguous ordered start/finish pair may be shown as one merged step row after the window " +
+        "and continuity checks, and unpaired, duplicated, or conflicting step records are never paired. Carried " +
+        "across a refresh only while the same verified job/source generation, nondecreasing length, and exact " +
+        "overlapping source records prove continuity; entries outside the current reader window are dropped. " +
+        "Cleared on restart, source replacement, truncation, conflict, unavailable/fallback scans, or missing " +
+        "overlap. Activity History filters are in-memory and read no source. This is not complete history, not job " +
+        "duration, and not proof of execution, completion, independent QA, or user acceptance.";
 }

@@ -13,13 +13,24 @@ internal static class LiveActivityHistoryPolicy
 {
     public static IReadOnlyList<LiveActivityHistoryEntry> Order(
         IEnumerable<LiveActivityHistoryEntry> entries) =>
-        entries
-            .OrderBy(entry => entry.SourceTimestamp is null)
-            .ThenByDescending(entry => entry.SourceTimestamp ?? DateTimeOffset.MinValue)
-            .ThenByDescending(entry => entry.ByteOffset)
-            .ThenBy(entry => entry.SessionId, StringComparer.Ordinal)
-            .ThenBy(entry => entry.MessageId, StringComparer.Ordinal)
-            .ThenBy(entry => entry.PartId, StringComparer.Ordinal)
+        Order(entries, entry => entry);
+
+    /// <summary>
+    /// Display ordering for a projection whose items each carry one primary
+    /// source record. The keys are exactly the entry ordering above, so a
+    /// merged step row keeps the ordering evidence of the record that owns its
+    /// identity.
+    /// </summary>
+    public static IReadOnlyList<T> Order<T>(
+        IEnumerable<T> items,
+        Func<T, LiveActivityHistoryEntry> entrySelector) =>
+        items
+            .OrderBy(item => entrySelector(item).SourceTimestamp is null)
+            .ThenByDescending(item => entrySelector(item).SourceTimestamp ?? DateTimeOffset.MinValue)
+            .ThenByDescending(item => entrySelector(item).ByteOffset)
+            .ThenBy(item => entrySelector(item).SessionId, StringComparer.Ordinal)
+            .ThenBy(item => entrySelector(item).MessageId, StringComparer.Ordinal)
+            .ThenBy(item => entrySelector(item).PartId, StringComparer.Ordinal)
             .ToArray();
 }
 

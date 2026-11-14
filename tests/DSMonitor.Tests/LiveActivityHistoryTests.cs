@@ -63,10 +63,14 @@ public sealed class LiveActivityHistoryTests
         Assert.IsTrue(activity.HasReadWindow);
         Assert.AreEqual(0L, activity.ReadWindowStart);
         Assert.IsTrue(activity.ReadWindowEnd > 0);
-        Assert.AreEqual(2, activity.History.Count);
 
-        var newest = activity.History[0];
-        Assert.AreEqual("tool-1", newest.PartId);
+        // Phase 2 behavior change: the step-finish record is now retained as its
+        // own identity-checked history entry instead of being dropped, so the
+        // text and tool rows are located by exact part identity rather than by
+        // a fixed two-row count.
+        Assert.AreEqual(3, activity.History.Count);
+
+        var newest = activity.History.Single(entry => entry.PartId == "tool-1");
         Assert.AreEqual("msg-1", newest.MessageId);
         Assert.AreEqual("job", newest.JobId);
         Assert.AreEqual(TimeSpan.FromSeconds(2), newest.ObservedDuration);
@@ -80,11 +84,15 @@ public sealed class LiveActivityHistoryTests
         Assert.AreEqual(prepared.Evidence.VerifiedPath, newest.SourcePath);
         Assert.IsFalse(string.IsNullOrWhiteSpace(newest.RecordDigest));
 
-        var older = activity.History[1];
-        Assert.AreEqual("text-1", older.PartId);
+        var older = activity.History.Single(entry => entry.PartId == "text-1");
         Assert.IsNull(older.ObservedDuration);
         Assert.AreEqual("Status: DONE", older.Text);
         Assert.IsNotNull(older.SourceTimestamp);
+
+        var finish = activity.History.Single(entry => entry.PartId == "finish-1");
+        Assert.AreEqual(LiveActivityKind.StepFinish, finish.ActivityKind);
+        Assert.AreEqual("stop", finish.StepFinishReason);
+        Assert.AreEqual(activity.History[0].PartId, finish.PartId);
 
         Assert.IsTrue(
             (newest.SourceTimestamp ?? DateTimeOffset.MinValue) >=
@@ -664,7 +672,14 @@ public sealed class LiveActivityHistoryTests
                     grid,
                     ItemsControl.ItemsSourceProperty);
                 Assert.IsNotNull(binding);
-                Assert.AreEqual("LiveActivityHistory", binding.Path.Path);
+
+                // Phase 2 behavior change: the grid is bound to the in-memory
+                // filtered projection owned by the window view model, so the
+                // filter checkboxes can show/hide categories without a reread.
+                Assert.AreEqual("DataContext.FilteredActivityHistory", binding.Path.Path);
+                Assert.IsNotNull(binding.RelativeSource);
+                Assert.AreEqual(RelativeSourceMode.FindAncestor, binding.RelativeSource.Mode);
+                Assert.AreEqual(typeof(Window), binding.RelativeSource.AncestorType);
 
                 var template = window.FindResource(
                     "LiveActivityHistoryStatusCellTemplate") as DataTemplate;

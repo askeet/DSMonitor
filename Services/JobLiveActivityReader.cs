@@ -52,12 +52,17 @@ public static class JobLiveActivityReader
     public const int MaxHistoryReadBytes = 5 * 1024 * 1024;
 
     public const int MaxHistoryTextLength = 4_000;
+    private const int MaxStepReasonLength = 32;
+    private const int MaxToolNameLength = 64;
+    private const int MaxToolStatusLength = 32;
     private const string AssistantTextKind = "Assistant-reported text";
     private const string RolelessTextKind = "Observed roleless text — unverified";
     private const string AssistantToolKind = "Observed tool activity";
     private const string RolelessToolKind = "Observed roleless tool activity — unverified";
     private const string AssistantResultKind = "Agent-reported result — unverified";
     private const string RolelessResultKind = "Observed roleless result — unverified";
+    private const string StepStartKind = "Observed step start";
+    private const string StepFinishKind = "Observed step finish";
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly HashSet<string> SupportedRootTypes = new(StringComparer.Ordinal)
     {
@@ -279,7 +284,13 @@ public static class JobLiveActivityReader
                     }
 
                     if (!TryGetRoleEvidence(root, part, out var verifiedAssistant)) continue;
-                    if (!TryGetActivityKind(root, part, out var isText, out var isTool, out var isFinish))
+                    if (!TryGetActivityKind(
+                            root,
+                            part,
+                            out var isText,
+                            out var isTool,
+                            out var isFinish,
+                            out var isStepStart))
                     {
                         continue;
                     }
@@ -327,6 +338,7 @@ public static class JobLiveActivityReader
                         TimeSpan? duration = null;
                         long? durationStart = null;
                         long? durationEnd = null;
+                        long? toolStart = null;
                         if (toolRecord &&
                             TryGetToolDuration(
                                 part,
@@ -337,6 +349,11 @@ public static class JobLiveActivityReader
                             duration = observedDuration;
                             durationStart = startMilliseconds;
                             durationEnd = endMilliseconds;
+                        }
+
+                        if (toolRecord && TryGetToolStart(part, out var toolStartMilliseconds))
+                        {
+                            toolStart = toolStartMilliseconds;
                         }
 
                         return new LiveActivityHistoryEntry(
@@ -354,7 +371,8 @@ public static class JobLiveActivityReader
                             duration)
                         {
                             DurationStartUnixMilliseconds = durationStart,
-                            DurationEndUnixMilliseconds = durationEnd
+                            DurationEndUnixMilliseconds = durationEnd,
+                            ToolStartUnixMilliseconds = toolStart
                         };
                     }
                     void RememberHistory(LiveActivityHistoryEntry? entry)
@@ -371,6 +389,23 @@ public static class JobLiveActivityReader
                         {
                             history[historyKey] = entry;
                         }
+                    }
+                    void RememberStep(
+                        string text,
+                        string kind,
+                        LiveActivityKind activityKind,
+                        string? finishReason)
+                    {
+                        var entry = HistoryEntry(text, kind, toolRecord: false);
+                        RememberHistory(entry is null
+                            ? null
+                            : entry with
+                            {
+                                ActivityKind = activityKind,
+                                StepFinishReason = string.IsNullOrWhiteSpace(finishReason)
+                                    ? null
+                                    : finishReason
+                            });
                     }
                     if (isText &&
                         TryGetSingleString(part, "text", out var text, out var hasText) &&
@@ -395,27 +430,62 @@ public static class JobLiveActivityReader
                     {
                         // The existing parser emits safe tool names/states,
                         // excluding command arguments, output and secrets.
+                        var toolKind = verifiedAssistant ? AssistantToolKind : RolelessToolKind;
                         if (previewEligible)
                         {
-                            doing = Excerpt(
-                                parsed.Event.Summary,
-                                verifiedAssistant ? AssistantToolKind : RolelessToolKind);
+                            doing = Excerpt(parsed.Event.Summary, toolKind);
                         }
 
-                        RememberHistory(HistoryEntry(
+                        var toolEntry = HistoryEntry(
                             parsed.Event.Summary,
-                            verifiedAssistant ? AssistantToolKind : RolelessToolKind,
-                            toolRecord: true));
-                    }
-                    else if (isFinish &&
-                             TryGetSingleString(part, "reason", out var finishReason, out var hasReason) &&
-                             hasReason &&
-                             finishReason is "stop" or "end-turn")
-                    {
-                        // The terminal source event is evidence even when no
-                        // text result was captured in this bounded window.
-                        if (previewEligible)
+                            toolKind,
+                            toolRecord: true);
+                        if (toolEntry is not null)
                         {
+                            TryGetToolEvidence(
+                                part,
+                                out var toolName,
+                                out var toolStatus,
+                                out var toolOutcome);
+                            toolEntry = toolEntry with
+                            {
+                                ActivityKind = LiveActivityKind.Tool,
+                                ToolName = toolName,
+                                ToolStatus = toolStatus,
+                                ToolOutcome = toolOutcome
+                            };
+                        }
+
+                        RememberHistory(toolEntry);
+                    }
+                    else if (isStepStart)
+                    {
+                        // Step-start is a lifecycle record, not assistant
+                        // content: it is retained as its own identity-checked
+                        // entry so the bounded history and continuity proof see
+                        // the exact physical record.
+                        RememberStep(
+                            parsed.Event.Summary,
+                            StepStartKind,
+                            LiveActivityKind.StepStart,
+                            finishReason: null);
+                    }
+                    else if (isFinish)
+                    {
+                        var hasReason =
+                            TryGetSingleString(part, "reason", out var finishReason, out var reasonPresent) &&
+                            reasonPresent &&
+                            finishReason is not null;
+                        RememberStep(
+                            parsed.Event.Summary,
+                            StepFinishKind,
+                            LiveActivityKind.StepFinish,
+                            hasReason ? Sanitize(finishReason!, MaxStepReasonLength) : null);
+
+                        if (hasReason && finishReason is "stop" or "end-turn" && previewEligible)
+                        {
+                            // The terminal source event is evidence even when
+                            // no text result was captured in this window.
                             doneEventByteOffset = offset;
                             if (texts.TryGetValue(key, out var result))
                             {
@@ -432,6 +502,13 @@ public static class JobLiveActivityReader
                 catch (DecoderFallbackException) { /* Invalid UTF-8 cannot establish source identity. */ }
                 catch (InvalidOperationException) { /* Invalid escaped text/identity cannot be attributed. */ }
             }
+
+            // Step identity conflicts must be detected on the pre-dedup record
+            // set: newest-per-part de-duplication would otherwise hide a
+            // duplicate or conflicting step identity before pairing could see
+            // it. The flag travels with both the pre-dedup evidence and the
+            // retained entry so the bounded buffer cannot lose it.
+            MarkStepIdentityConflicts(historyRecords, history);
 
             beforePublishCheck?.Invoke();
             if (!SourceStillMatches(
@@ -978,7 +1055,7 @@ public static class JobLiveActivityReader
                     "N/A — the target record has conflicting, unsupported, or user role evidence.");
             }
 
-            if (!TryGetActivityKind(root, part, out var isText, out _, out _) || !isText)
+            if (!TryGetActivityKind(root, part, out var isText, out _, out _, out _) || !isText)
             {
                 return Fail(
                     FullReportStatus.Unsafe,
@@ -1506,11 +1583,13 @@ public static class JobLiveActivityReader
         JsonElement part,
         out bool isText,
         out bool isTool,
-        out bool isFinish)
+        out bool isFinish,
+        out bool isStepStart)
     {
         isText = false;
         isTool = false;
         isFinish = false;
+        isStepStart = false;
         if (!TryGetSingleType(root, out var rootType) ||
             !TryGetSingleType(part, out var partType) ||
             rootType is null ||
@@ -1522,7 +1601,13 @@ public static class JobLiveActivityReader
 
         if (rootType == "step-start")
         {
-            return partType is null or "step-start";
+            if (partType is not null and not "step-start")
+            {
+                return false;
+            }
+
+            isStepStart = true;
+            return true;
         }
 
         var rootCategory = Category(rootType);
@@ -1531,6 +1616,7 @@ public static class JobLiveActivityReader
             if (partType is null) return false;
             if (partType == "step-start")
             {
+                isStepStart = true;
                 return true;
             }
 
@@ -1665,6 +1751,182 @@ public static class JobLiveActivityReader
         duration = TimeSpan.FromMilliseconds(delta);
         return true;
     }
+
+    /// <summary>
+    /// Read the exact tool <c>state.time.start</c> on its own, so a tool row's
+    /// Started value uses only independently validated evidence even when the
+    /// end is missing, duplicated, malformed, or earlier than the start.
+    /// </summary>
+    private static bool TryGetToolStart(JsonElement part, out long startMilliseconds)
+    {
+        startMilliseconds = 0;
+        return TryGetSingleObject(part, "state", out var state) &&
+               TryGetSingleObject(state, "time", out var time) &&
+               TryGetInt64(time, "start", out startMilliseconds) &&
+               startMilliseconds >= 0 &&
+               startMilliseconds <= MaxUnixMilliseconds;
+    }
+
+    /// <summary>
+    /// Exact tool identity evidence: one bounded safe name and one exact status
+    /// token. A duplicate or malformed value is unavailable rather than resolved
+    /// last-key-wins, so a success or failure badge is never derived from
+    /// conflicting source data. Command arguments, input and output are never
+    /// read.
+    /// </summary>
+    private static void TryGetToolEvidence(
+        JsonElement part,
+        out string? toolName,
+        out string? toolStatus,
+        out LiveActivityToolOutcome outcome)
+    {
+        toolName = null;
+        toolStatus = null;
+        outcome = LiveActivityToolOutcome.Unknown;
+
+        if (TryGetSingleString(part, "tool", out var rawName, out var hasName) &&
+            hasName &&
+            !string.IsNullOrWhiteSpace(rawName))
+        {
+            var safeName = Sanitize(rawName!, MaxToolNameLength).Trim();
+            toolName = safeName.Length == 0 ? null : safeName;
+        }
+
+        if (!TryGetSingleObject(part, "state", out var state) ||
+            !TryGetSingleString(state, "status", out var rawStatus, out var hasStatus) ||
+            !hasStatus ||
+            string.IsNullOrWhiteSpace(rawStatus))
+        {
+            return;
+        }
+
+        var safeStatus = Sanitize(rawStatus!, MaxToolStatusLength).Trim();
+        if (safeStatus.Length == 0)
+        {
+            return;
+        }
+
+        toolStatus = safeStatus;
+        outcome = ClassifyToolStatus(safeStatus);
+    }
+
+    /// <summary>
+    /// Classifies one exact source status token. Only the exact token
+    /// <c>completed</c> counts as success and only the exact token
+    /// <c>error</c> counts as an error. Equivalent-looking tokens such as
+    /// <c>complete</c>, <c>done</c>, <c>failed</c>, and <c>failure</c> keep
+    /// their exact display value but are never counted as success or error.
+    /// </summary>
+    private static LiveActivityToolOutcome ClassifyToolStatus(string status) =>
+        NormalizeStatusToken(status) switch
+        {
+            "completed" => LiveActivityToolOutcome.Completed,
+            "error" => LiveActivityToolOutcome.Failed,
+            "running" or "in-progress" or "inprogress" => LiveActivityToolOutcome.Running,
+            "pending" => LiveActivityToolOutcome.Pending,
+            _ => LiveActivityToolOutcome.Unknown
+        };
+
+    /// <summary>
+    /// Normalizes one status token for exact comparison only; display keeps the
+    /// sanitized source token unchanged.
+    /// </summary>
+    private static string NormalizeStatusToken(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        foreach (var character in value.Trim())
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                builder.Append(char.ToLowerInvariant(character));
+            }
+            else if (character is '-' or '.')
+            {
+                builder.Append(character);
+            }
+            else if (character is '_' || char.IsWhiteSpace(character))
+            {
+                builder.Append('-');
+            }
+        }
+
+        return builder.Length == 0 ? "unknown" : builder.ToString();
+    }
+
+    /// <summary>
+    /// Marks step records whose exact job/session/message/part identity appears
+    /// more than once in the current bounded read. Pairing then fails closed
+    /// instead of letting newest-record de-duplication decide which record is
+    /// authoritative.
+    /// </summary>
+    private static void MarkStepIdentityConflicts(
+        List<LiveActivityHistoryEntry> records,
+        Dictionary<(string Session, string Message, string PartId), LiveActivityHistoryEntry> deduped)
+    {
+        Dictionary<(string Session, string Message, string PartId), int>? counts = null;
+        foreach (var record in records)
+        {
+            if (!IsStepKind(record.ActivityKind))
+            {
+                continue;
+            }
+
+            counts ??= new Dictionary<(string Session, string Message, string PartId), int>();
+            var key = (record.SessionId, record.MessageId, record.PartId);
+            counts[key] = counts.TryGetValue(key, out var count) ? count + 1 : 1;
+        }
+
+        if (counts is null)
+        {
+            return;
+        }
+
+        HashSet<(string Session, string Message, string PartId)>? conflicts = null;
+        foreach (var pair in counts)
+        {
+            if (pair.Value > 1)
+            {
+                conflicts ??= new HashSet<(string Session, string Message, string PartId)>();
+                conflicts.Add(pair.Key);
+            }
+        }
+
+        if (conflicts is null)
+        {
+            return;
+        }
+
+        for (var index = 0; index < records.Count; index++)
+        {
+            var record = records[index];
+            if (!IsStepKind(record.ActivityKind) || record.StepIdentityConflict)
+            {
+                continue;
+            }
+
+            if (conflicts.Contains((record.SessionId, record.MessageId, record.PartId)))
+            {
+                records[index] = record with { StepIdentityConflict = true };
+            }
+        }
+
+        foreach (var key in deduped.Keys.ToArray())
+        {
+            var entry = deduped[key];
+            if (!IsStepKind(entry.ActivityKind) || entry.StepIdentityConflict)
+            {
+                continue;
+            }
+
+            if (conflicts.Contains((entry.SessionId, entry.MessageId, entry.PartId)))
+            {
+                deduped[key] = entry with { StepIdentityConflict = true };
+            }
+        }
+    }
+
+    private static bool IsStepKind(LiveActivityKind kind) =>
+        kind is LiveActivityKind.StepStart or LiveActivityKind.StepFinish;
 
     private static bool TryGetInt64(JsonElement value, string name, out long result)
     {

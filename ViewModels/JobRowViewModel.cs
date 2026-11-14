@@ -57,6 +57,8 @@ public sealed class JobRowViewModel : ObservableObject
     private bool _selectedActivityTextIsComplete;
     private string _selectedActivityCompletenessText = "No activity selected.";
     private LiveActivityLoadKey? _selectedActivityLoadKey;
+    private int _visibleActivityCount;
+    private int _activityHistoryCountForVisibility;
     private string _originalRequestText = string.Empty;
     private string _originalRequestAttributionText = string.Empty;
     private string? _originalRequestSessionId;
@@ -219,6 +221,22 @@ public sealed class JobRowViewModel : ObservableObject
     public bool HasLiveActivityHistory => _liveActivityHistory.Count > 0;
 
     /// <summary>
+    /// True when the current in-memory filter projection contains at least one
+    /// row. It drives the tab's filtered empty state and never re-reads a source.
+    /// </summary>
+    public bool HasVisibleActivityHistory => _visibleActivityCount > 0;
+
+    /// <summary>
+    /// Empty-state text for the filtered grid: the neutral "no activity"
+    /// message when the job has no retained history, otherwise the explicit
+    /// filter message.
+    /// </summary>
+    public string ActivityHistoryEmptyText =>
+        _liveActivityHistory.Count == 0
+            ? LiveActivityHistoryEmptyText
+            : "No activity matches the selected filters.";
+
+    /// <summary>
     /// Currently selected history row. Each job owns its own selection, so
     /// switching jobs never transfers or clears another job's chosen activity.
     /// The newest row is selected by default and a matching exact identity is
@@ -258,6 +276,66 @@ public sealed class JobRowViewModel : ObservableObject
     public string SelectedActivityCompletenessText => _selectedActivityCompletenessText;
 
     internal event EventHandler? SelectedActivityChanged;
+
+    /// <summary>
+    /// Raised after a job's merged, filtered-independent history rows and
+    /// selection have settled, so presentation can re-apply filters and keep a
+    /// visible selection without racing the list reset.
+    /// </summary>
+    internal event EventHandler? ActivityHistoryUpdated;
+
+    /// <summary>
+    /// Publishes the number of rows currently visible under the caller's
+    /// in-memory filters and the filtered empty-state text.
+    /// </summary>
+    internal void SetActivityHistoryVisibility(int visibleCount)
+    {
+        var normalized = Math.Max(0, visibleCount);
+        var historyCount = _liveActivityHistory.Count;
+        if (_visibleActivityCount == normalized &&
+            _activityHistoryCountForVisibility == historyCount)
+        {
+            return;
+        }
+
+        _visibleActivityCount = normalized;
+        _activityHistoryCountForVisibility = historyCount;
+        OnPropertyChanged(nameof(HasVisibleActivityHistory));
+        OnPropertyChanged(nameof(ActivityHistoryEmptyText));
+    }
+
+    /// <summary>
+    /// Keeps the selected row on a visible row without reading a source. When
+    /// the current selection is still visible its value is re-published so a
+    /// replaced filtered ItemsSource cannot leave the grid visually unselected.
+    /// A filter-driven re-selection deliberately does not raise
+    /// <see cref="SelectedActivityChanged"/>, because toggling a filter must not
+    /// start a selected-text retrieval.
+    /// </summary>
+    internal void EnsureSelectedActivityVisible(
+        IReadOnlyList<LiveActivityHistoryRowViewModel> visibleRows)
+    {
+        ArgumentNullException.ThrowIfNull(visibleRows);
+
+        if (visibleRows.Count == 0)
+        {
+            if (_selectedActivity is not null)
+            {
+                SetSelectedActivityValue(null, notifySelectionChanged: false);
+            }
+
+            return;
+        }
+
+        if (_selectedActivity is { } current &&
+            visibleRows.Any(row => ReferenceEquals(row, current)))
+        {
+            OnPropertyChanged(nameof(SelectedActivity));
+            return;
+        }
+
+        SetSelectedActivityValue(visibleRows[0], notifySelectionChanged: false);
+    }
 
     /// <summary>
     /// Applies the global monitoring lifecycle. Stopped or failed monitoring
@@ -374,7 +452,9 @@ public sealed class JobRowViewModel : ObservableObject
         };
     }
 
-    private void SetSelectedActivityValue(LiveActivityHistoryRowViewModel? value)
+    private void SetSelectedActivityValue(
+        LiveActivityHistoryRowViewModel? value,
+        bool notifySelectionChanged = true)
     {
         var previousKey = _selectedActivityLoadKey;
         var nextKey = value is null ? (LiveActivityLoadKey?)null : LiveActivityLoadKey.FromRow(value);
@@ -402,7 +482,10 @@ public sealed class JobRowViewModel : ObservableObject
 
         OnPropertyChanged(nameof(SelectedActivity));
         RaiseSelectedActivityDisplayChanged();
-        SelectedActivityChanged?.Invoke(this, EventArgs.Empty);
+        if (notifySelectionChanged)
+        {
+            SelectedActivityChanged?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     private void RaiseSelectedActivityDisplayChanged()
@@ -1091,18 +1174,29 @@ public sealed class JobRowViewModel : ObservableObject
         var entries = LiveActivityHistoryPolicy.Order(
             snapshot.LiveActivity.History.Where(entry =>
                 string.Equals(entry.JobId, snapshot.JobId, StringComparison.Ordinal)));
+        // The display projection is derived only here, after the bounded
+        // buffer has applied its continuity proof and window eviction. Step
+        // records remain separate identity-checked entries in the history; a
+        // merged step row keeps the start record as its identity and carries
+        // the exact finish record as provenance.
+        var projected = LiveActivityHistoryProjection.Merge(entries);
         var doing = snapshot.LiveActivity.Doing;
         // Resolve the job-level value once from this snapshot and reuse it for
         // every row; rows still prefer their own exact/report-local value.
         var jobReportedStatus =
             ReportedStatusPresentation.ResolveJobReportedStatus(snapshot);
-        var rows = entries
-            .Select(entry => new LiveActivityHistoryRowViewModel(
-                entry,
+        var jobActive = _monitoringActive && snapshot.Status == ForgeJobStatus.Running;
+        var latestLifecycle = snapshot.LiveActivity.LatestLifecycleByteOffset;
+        var rows = projected
+            .Select(item => new LiveActivityHistoryRowViewModel(
+                item.Entry,
                 snapshot.ReportedStatus,
-                _monitoringActive && MatchesCurrentActiveTarget(snapshot, doing, entry),
+                _monitoringActive && MatchesCurrentActiveTarget(snapshot, doing, item.Entry),
                 jobReportedStatus,
-                MessageDurationFor(snapshot, entry)))
+                MessageDurationFor(snapshot, item.Entry),
+                item.Step,
+                snapshot.ObservedAt,
+                IsDefensiblyActiveStep(item, jobActive, latestLifecycle)))
             .ToArray();
         _liveActivityHistory = rows;
         // Reset the ItemsSource before restoring selection so a DataGrid that
@@ -1120,7 +1214,23 @@ public sealed class JobRowViewModel : ObservableObject
         {
             SetSelectedActivityValue(selected);
         }
+
+        ActivityHistoryUpdated?.Invoke(this, EventArgs.Empty);
     }
+
+    /// <summary>
+    /// An unpaired step start may be presented as active only when the job is
+    /// reported running, monitoring is active, and that start is the newest
+    /// observed lifecycle record in the current bounded read. It is never
+    /// completion or liveness evidence.
+    /// </summary>
+    private static bool IsDefensiblyActiveStep(
+        ProjectedActivity item,
+        bool jobActive,
+        long? latestLifecycleByteOffset) =>
+        jobActive &&
+        item.Step is { State: LiveActivityStepState.UnmatchedStart } &&
+        (latestLifecycleByteOffset is not { } latest || item.Entry.ByteOffset >= latest);
 
     /// <summary>
     /// The spinner is defensible only for the exact current Doing record from

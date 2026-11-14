@@ -54,6 +54,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _hasWarnings;
     private string _searchText = string.Empty;
     private JobRowViewModel? _selectedJob;
+    private bool _showActivityTextFilter = true;
+    private bool _showActivityToolsFilter;
+    private bool _showActivityStepsFilter;
+    private IReadOnlyList<LiveActivityHistoryRowViewModel> _filteredActivityHistory =
+        Array.Empty<LiveActivityHistoryRowViewModel>();
     private string _stateDetail = "Monitoring is stopped";
     private string _jobsSummaryText = "0 observed · 0 unknown";
     private string _openCodeStateText = "Not connected · Phase 2";
@@ -237,21 +242,196 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>Whether text entries are shown in Activity History.</summary>
+    public bool ShowActivityTextFilter
+    {
+        get => _showActivityTextFilter;
+        set => SetActivityFilter(
+            value,
+            ref _showActivityTextFilter,
+            nameof(ShowActivityTextFilter));
+    }
+
+    /// <summary>Whether tool entries are shown in Activity History.</summary>
+    public bool ShowActivityToolsFilter
+    {
+        get => _showActivityToolsFilter;
+        set => SetActivityFilter(
+            value,
+            ref _showActivityToolsFilter,
+            nameof(ShowActivityToolsFilter));
+    }
+
+    /// <summary>Whether step entries are shown in Activity History.</summary>
+    public bool ShowActivityStepsFilter
+    {
+        get => _showActivityStepsFilter;
+        set => SetActivityFilter(
+            value,
+            ref _showActivityStepsFilter,
+            nameof(ShowActivityStepsFilter));
+    }
+
     public JobRowViewModel? SelectedJob
     {
         get => _selectedJob;
         set
         {
+            if (ReferenceEquals(_selectedJob, value))
+            {
+                return;
+            }
+
+            var previous = _selectedJob;
             if (SetProperty(ref _selectedJob, value))
             {
+                if (previous is not null)
+                {
+                    previous.PropertyChanged -= OnSelectedJobPropertyChanged;
+                    previous.ActivityHistoryUpdated -= OnSelectedJobActivityHistoryUpdated;
+                }
+
+                if (value is not null)
+                {
+                    value.PropertyChanged += OnSelectedJobPropertyChanged;
+                    value.ActivityHistoryUpdated += OnSelectedJobActivityHistoryUpdated;
+                }
+
+                // Filters are job-scoped presentation state: every job starts
+                // from the declared defaults.
+                ResetActivityHistoryFilters();
                 OnPropertyChanged(nameof(HasSelection));
                 OnPropertyChanged(nameof(IsSelectionEmpty));
+                RefreshActivityHistoryPresentation(ensureSelection: true);
                 BeginRawLogLoad(value);
                 BeginSelectedActivityLoad(value);
                 BeginOriginalRequestLoad(value);
                 BeginActivityDurationLoad(value);
             }
         }
+    }
+
+    private void ResetActivityHistoryFilters()
+    {
+        _showActivityTextFilter = true;
+        _showActivityToolsFilter = false;
+        _showActivityStepsFilter = false;
+        OnPropertyChanged(nameof(ShowActivityTextFilter));
+        OnPropertyChanged(nameof(ShowActivityToolsFilter));
+        OnPropertyChanged(nameof(ShowActivityStepsFilter));
+    }
+
+    /// <summary>
+    /// In-memory projection of the selected job's already bounded, merged
+    /// history rows. No source read, ledger query, or selected-text retrieval is
+    /// performed here; toggling a filter only re-evaluates this list.
+    /// </summary>
+    public IReadOnlyList<LiveActivityHistoryRowViewModel> FilteredActivityHistory =>
+        _filteredActivityHistory;
+
+    public string ActivityTextFilterLabel =>
+        $"Text (✓{SelectedJob?.LiveActivityHistory.Count(row => row.IsTextActivity) ?? 0})";
+
+    public string ActivityToolsFilterLabel
+    {
+        get
+        {
+            var rows = SelectedJob?.LiveActivityHistory ??
+                Array.Empty<LiveActivityHistoryRowViewModel>();
+            return $"Tools (✓{rows.Count(row => row.IsSuccessfulToolActivity)} · " +
+                   $"✕{rows.Count(row => row.IsErrorToolActivity)})";
+        }
+    }
+
+    public string ActivityStepsFilterLabel =>
+        $"Steps ({SelectedJob?.LiveActivityHistory.Count(row => row.IsStepActivity) ?? 0})";
+
+    private void SetActivityFilter(
+        bool value,
+        ref bool field,
+        string propertyName)
+    {
+        if (field == value)
+        {
+            return;
+        }
+
+        field = value;
+        OnPropertyChanged(propertyName);
+        RefreshActivityHistoryPresentation(ensureSelection: true);
+    }
+
+    private void OnSelectedJobPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(JobRowViewModel.LiveActivityHistory) or null)
+        {
+            // Labels, filtered rows, and the empty state; selection is settled
+            // only after the job has restored its identity-based choice.
+            RefreshActivityHistoryPresentation(ensureSelection: false);
+        }
+    }
+
+    private void OnSelectedJobActivityHistoryUpdated(object? sender, EventArgs e) =>
+        RefreshActivityHistoryPresentation(ensureSelection: true);
+
+    /// <summary>
+    /// Single presentation refresh: rebuilds the in-memory filtered projection,
+    /// updates the job's filtered empty-state, publishes labels, and keeps the
+    /// selection on a visible row. Counts always describe every eligible
+    /// de-duplicated row, independent of the current filters.
+    /// </summary>
+    private void RefreshActivityHistoryPresentation(bool ensureSelection)
+    {
+        var job = SelectedJob;
+        var rows = job?.LiveActivityHistory ??
+            Array.Empty<LiveActivityHistoryRowViewModel>();
+        var filtered = rows
+            .Where(row =>
+                (_showActivityTextFilter && row.IsTextActivity) ||
+                (_showActivityToolsFilter && row.IsToolActivity) ||
+                (_showActivityStepsFilter && row.IsStepActivity))
+            .OrderBy(row => row.StartedSortTimestamp is null)
+            .ThenByDescending(row => row.StartedSortTimestamp)
+            .ThenByDescending(row => row.Entry.ByteOffset)
+            .ToArray();
+
+        if (!SequenceEqualByReference(_filteredActivityHistory, filtered))
+        {
+            _filteredActivityHistory = filtered;
+            OnPropertyChanged(nameof(FilteredActivityHistory));
+        }
+
+        job?.SetActivityHistoryVisibility(filtered.Length);
+        OnPropertyChanged(nameof(ActivityTextFilterLabel));
+        OnPropertyChanged(nameof(ActivityToolsFilterLabel));
+        OnPropertyChanged(nameof(ActivityStepsFilterLabel));
+
+        // Re-published after the projection so the grid keeps a visible
+        // selection; filter-driven re-selection does not start a source read.
+        if (ensureSelection)
+        {
+            job?.EnsureSelectedActivityVisible(filtered);
+        }
+    }
+
+    private static bool SequenceEqualByReference(
+        IReadOnlyList<LiveActivityHistoryRowViewModel> left,
+        IReadOnlyList<LiveActivityHistoryRowViewModel> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!ReferenceEquals(left[index], right[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public bool HasSelection => _selectedJob is not null;
@@ -634,6 +814,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _rawLogCts?.Cancel();
         _rawLogCts?.Dispose();
         _rawLogCts = null;
+        if (_selectedJob is not null)
+        {
+            _selectedJob.PropertyChanged -= OnSelectedJobPropertyChanged;
+            _selectedJob.ActivityHistoryUpdated -= OnSelectedJobActivityHistoryUpdated;
+        }
+
         CancelSelectedActivityLoad();
         CancelOriginalRequestLoad();
         CancelActivityDurationLoad();

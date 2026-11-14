@@ -225,7 +225,7 @@ These are known, noncritical V1 presentation limitations of the compact table an
 
 #### V1 Live Activity history — bounded transient limitations
 
-The Live Activity tab is a job-isolated, runtime-only projection built from the existing guarded reader parse of the already-read bounded window. Rows represent the reader's eligible Text/tool activity parts, not step-start/step-finish lifecycle records. It does not add a reader, persist content, query OpenCode stores, or infer completion. These limitations are noncritical for V1 and are recorded for Beta Stabilization; the safe behavior is intentionally conservative. All reproductions are synthetic and require no real Forge or OpenCode history.
+The Live Activity tab is a job-isolated, runtime-only projection built from the existing guarded reader parse of the already-read bounded window. Rows represent the reader's eligible Text/tool activity parts plus its identity-checked step-start/step-finish records. An unambiguous ordered start/finish pair inside one verified job/session/message is merged into a single step row only after the bounded window, continuity proof, and eviction are applied; duplicated, repeated, or conflicting step records and orphan finishes are never paired, and step rows are never treated as completion evidence. Activity History filters (Text/Tools/Steps) are in-memory projections that read no source. It does not add a reader, persist content, query OpenCode stores, or infer completion. These limitations are noncritical for V1 and are recorded for Beta Stabilization; the safe behavior is intentionally conservative. All reproductions are synthetic and require no real Forge or OpenCode history.
 
 | ID | Reproduction | Impact | Milestone |
 |---|---|---|---|
@@ -749,3 +749,33 @@ This addendum records implementation evidence only; it is not independent QA acc
 - **2026-11-09 — B1 durable SQLite event-ledger foundation:** Added `Persistence/EventLedger.cs` and `Persistence/EventLedgerModels.cs` as a separate byte-oriented persistence seam; added `Microsoft.Data.Sqlite` 10.0.14; added isolated deterministic tests and documented `LEDGER-001..020`/`SEC-011`/`TEST-021`. Schema version 1 uses verified physical source generations, complete `[start,end)` records, explicit dispositions, safe event metadata, and an atomically guarded committed cursor. Existing live monitoring, timeline, logging, and security behavior are unchanged. The architecture gate, historical findings, and user-verified real file-symlink result are preserved. Independent Sol revalidation of B1 is pending; Phase 1 remains IN PROGRESS / NOT ACCEPTED and Phases 2–4 remain NOT STARTED.
 - **2026-11-09 — B1 post-QA correction (sole authorized):** Added exact schema-object/DDL validation and unexpected trigger/view/index rejection; verified expected insert/update affected rows and rollback on silent suppression; added `Persistence/LedgerStorageGuard.cs` for reparse-point and final-path checks on the database and WAL/SHM sidecars with documented TOCTOU residual; added bounded keyset pagination to `ListRecords`/`ListEvents`; added a real literal UTF-8 multibyte byte sequence split across polls. Focused suite 31/31, timeline 33/33, logging/integration/security 47/47, full suite 145 passed / 0 skipped / 145 total, build 0 warnings/0 errors, `git diff --check` clean. No existing tests weakened; independent Sol revalidation pending; the sole post-QA correction is consumed.
 - **2026-11-13 — V1 Activity History OpenCode message duration enrichment:** Added a dedicated bounded `OpenCodeActivityDurationService` over the existing read-only CLI executor/options. It queries only exact healthy structured job/session/message evidence, confirms API assistant type, uses one unfiltered ascending stream with the existing 50-message/20-page/30-second bounds, and returns only `time.completed - time.created` values. Text rows may show the parent assistant-message duration; valid same-part tool durations and spinner termination are unchanged. Shared-claim conflicts, user-role/missing/malformed/duplicate identities, pagination failures, and negative/sub-tick timings remain `N/A`. Completed values are cached in bounded memory per job/session/message/evidence; incomplete/transient results are not permanently cached and retries are limited to selection, evidence/job changes, or bounded lifecycle events. Row rebuilds preserve exact values and history selection; Duration sorting uses a numeric member. No persistence, JSONL reader, job-table/elapsed/reported-status/original-request/response-viewer behavior changed. Limitations recorded in `LAH-BETA-005` and `LAH-BETA-014`.
+
+- **2026-11-14 - Activity History Phase 2 (Text/Tools/Steps filters and step pairing):** Activity History now
+  classifies every row from an explicit reader-assigned activity kind instead of display-text substrings, so the
+  Text/Tools/Steps filters and the `Text (check N)`, `Tools (check N / cross N)`, and `Steps (N)` labels are
+  exact and independent of tool names and of the current filters. Counts cover every eligible de-duplicated row;
+  toggling a filter is an in-memory projection that performs no source read; any or all categories may be disabled,
+  and an empty selection shows no rows. Visible rows are sorted by Started newest first across categories. Every job
+  switch resets the defaults (Text on). Tool rows map the bounded safe `part.tool` name and
+  the exact `state.status` (a success badge only for the exact token `completed`, an error badge only for the exact
+  token `error`; `complete`, `done`, `failed`, `failure`, running, pending, and unrecognized statuses keep their
+  exact display value without a badge), use an independently validated `state.time.start`
+  for Started, and keep Duration to a valid same-part start/end pair; message and step evidence never substitute
+  for it. Step start/finish records remain separate identity-checked entries in the bounded 5 MiB history,
+  `HistoryRecords`, and the continuity buffer. The merged display row is derived only after window eviction,
+  groups by exact ordinal job/session/message, orders by absolute byte offset, merges only unambiguous sequential
+  start-then-finish records, and fails closed for repeated starts, duplicated or conflicting identities, duplicate
+  offsets, orphan finishes, and unpaired starts. A paired row shows the start record's source timestamp, the
+  finish reason only (`Step: tool-calls` / `Step: stop` / `Step: finished`), and the two-timestamp span when both
+  timestamps are valid and ordered; an unmatched finish is exactly `Step: unmatched finish`, an unpaired start is
+  exactly `Step: in progress` only for a verified active job and `Step: unfinished` otherwise, and an ambiguous
+  record is `Step: ambiguous`; a live span appears only for a defensible active unpaired start and stops when
+  that evidence disappears. Both records stay in provenance, no raw or full-report text is retrieved for step
+  rows, a selection hidden by the filters is never exposed in the Response panel, and an explicit filtered empty
+  state replaced the unfiltered one. New synthetic coverage: filter combinations including an empty selection,
+  Started ordering across categories, per-job
+  reset, exact counts, tool status/time/name edge cases, source order with distinct identities, multiple
+  sequential pairs, repeated starts, orphans, conflicts, duplicates, window eviction and continuity, bounded-window
+  truncation, and grid selection. Existing tests were preserved; two assertions were updated for the intentional
+  contract change (step-finish records are now retained as history entries, and the grid binds to the filtered
+  projection). Phase 2 acceptance is not claimed and no phase status changed.
