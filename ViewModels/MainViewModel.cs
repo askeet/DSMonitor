@@ -55,10 +55,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _searchText = string.Empty;
     private JobRowViewModel? _selectedJob;
     private bool _showActivityTextFilter = true;
-    private bool _showActivityToolsFilter;
-    private bool _showActivityStepsFilter;
+    private bool _showActivityToolsFilter = true;
+    private bool _showActivityStepsFilter = true;
+    private bool _showActivityOtherFilter;
     private IReadOnlyList<LiveActivityHistoryRowViewModel> _filteredActivityHistory =
         Array.Empty<LiveActivityHistoryRowViewModel>();
+    private readonly Dictionary<LiveActivityHistoryRowViewModel, ActivityHistoryMessageGroup> _messageGroups = new();
     private string _stateDetail = "Monitoring is stopped";
     private string _jobsSummaryText = "0 observed · 0 unknown";
     private string _openCodeStateText = "Not connected · Phase 2";
@@ -272,6 +274,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             nameof(ShowActivityStepsFilter));
     }
 
+    public bool ShowActivityOtherFilter
+    {
+        get => _showActivityOtherFilter;
+        set => SetActivityFilter(value, ref _showActivityOtherFilter, nameof(ShowActivityOtherFilter));
+    }
+
     public JobRowViewModel? SelectedJob
     {
         get => _selectedJob;
@@ -285,6 +293,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var previous = _selectedJob;
             if (SetProperty(ref _selectedJob, value))
             {
+                foreach (var group in previous?.ActivityHistoryMessageGroups ??
+                         Array.Empty<ActivityHistoryMessageGroup>())
+                {
+                    group.DisplayRow.IsExpanded = false;
+                }
+
+                foreach (var group in value?.ActivityHistoryMessageGroups ??
+                         Array.Empty<ActivityHistoryMessageGroup>())
+                {
+                    group.DisplayRow.IsExpanded = false;
+                }
+
+                _messageGroups.Clear();
                 if (previous is not null)
                 {
                     previous.PropertyChanged -= OnSelectedJobPropertyChanged;
@@ -314,11 +335,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void ResetActivityHistoryFilters()
     {
         _showActivityTextFilter = true;
-        _showActivityToolsFilter = false;
-        _showActivityStepsFilter = false;
+        _showActivityToolsFilter = true;
+        _showActivityStepsFilter = true;
+        _showActivityOtherFilter = false;
         OnPropertyChanged(nameof(ShowActivityTextFilter));
         OnPropertyChanged(nameof(ShowActivityToolsFilter));
         OnPropertyChanged(nameof(ShowActivityStepsFilter));
+        OnPropertyChanged(nameof(ShowActivityOtherFilter));
     }
 
     /// <summary>
@@ -329,22 +352,75 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public IReadOnlyList<LiveActivityHistoryRowViewModel> FilteredActivityHistory =>
         _filteredActivityHistory;
 
+    /// <summary>
+    /// Hierarchical table rows. Current source rows provide the existing text
+    /// message rows; explicit message/part membership is supplied by the
+    /// ActivityHistoryMessageGroup contract when the history logic exposes it.
+    /// No membership is inferred here.
+    /// </summary>
+    public IReadOnlyList<ActivityHistoryDisplayRowViewModel> ActivityHistoryDisplayRows =>
+        ActivityHistoryDisplayRowViewModel.Project(
+            CurrentMessageGroups,
+            CurrentOtherRows,
+            _showActivityTextFilter,
+            _showActivityToolsFilter,
+            _showActivityStepsFilter,
+            _showActivityOtherFilter);
+
+    public bool HasActivityHistoryDisplayRows => ActivityHistoryDisplayRows.Count > 0;
+
+    public void RefreshActivityHistoryDisplayRows() =>
+        OnPropertyChanged(nameof(ActivityHistoryDisplayRows));
+
+    private IReadOnlyList<ActivityHistoryMessageGroup> CurrentMessageGroups =>
+        SelectedJob?.ActivityHistoryMessageGroups.Count > 0
+            ? SelectedJob.ActivityHistoryMessageGroups
+            : (SelectedJob?.LiveActivityHistory ?? Array.Empty<LiveActivityHistoryRowViewModel>())
+        .Where(row => row.IsTextActivity)
+        .Select(row =>
+        {
+            if (!_messageGroups.TryGetValue(row, out var group))
+            {
+                group = new ActivityHistoryMessageGroup(row);
+                _messageGroups.Add(row, group);
+            }
+
+            return group;
+        })
+        .ToArray();
+
+    private IReadOnlyList<LiveActivityHistoryRowViewModel> CurrentOtherRows =>
+        GetCurrentOtherRows();
+
+    private IReadOnlyList<LiveActivityHistoryRowViewModel> GetCurrentOtherRows()
+    {
+        var rows = SelectedJob?.LiveActivityHistory ?? Array.Empty<LiveActivityHistoryRowViewModel>();
+        var groups = SelectedJob?.ActivityHistoryMessageGroups ?? Array.Empty<ActivityHistoryMessageGroup>();
+        var groupedRows = groups.SelectMany(group => group.Children.Append(group.Message)).ToHashSet();
+        return rows.Where(row =>
+                groups.Count > 0
+                    ? !groupedRows.Contains(row)
+                    : !row.IsTextActivity)
+            .ToArray();
+    }
+
     public string ActivityTextFilterLabel =>
-        $"Text (✓{SelectedJob?.LiveActivityHistory.Count(row => row.IsTextActivity) ?? 0})";
+        $"Text Part ({CurrentMessageGroups.Sum(group => group.Children.Count(row => row.IsTextActivity))})";
 
     public string ActivityToolsFilterLabel
     {
         get
         {
-            var rows = SelectedJob?.LiveActivityHistory ??
-                Array.Empty<LiveActivityHistoryRowViewModel>();
+            var rows = CurrentMessageGroups.SelectMany(group => group.Children).ToArray();
             return $"Tools (✓{rows.Count(row => row.IsSuccessfulToolActivity)} · " +
                    $"✕{rows.Count(row => row.IsErrorToolActivity)})";
         }
     }
 
     public string ActivityStepsFilterLabel =>
-        $"Steps ({SelectedJob?.LiveActivityHistory.Count(row => row.IsStepActivity) ?? 0})";
+        $"Steps ({CurrentMessageGroups.Sum(group => group.Children.Count(row => row.IsStepActivity))})";
+
+    public string ActivityOtherFilterLabel => $"Other ({CurrentOtherRows.Count})";
 
     private void SetActivityFilter(
         bool value,
@@ -363,7 +439,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void OnSelectedJobPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(JobRowViewModel.LiveActivityHistory) or null)
+        if (e.PropertyName is nameof(JobRowViewModel.LiveActivityHistory) or
+            nameof(JobRowViewModel.ActivityHistoryMessageGroups) or null)
         {
             // Labels, filtered rows, and the empty state; selection is settled
             // only after the job has restored its identity-based choice.
@@ -385,15 +462,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var job = SelectedJob;
         var rows = job?.LiveActivityHistory ??
             Array.Empty<LiveActivityHistoryRowViewModel>();
-        var filtered = rows
-            .Where(row =>
-                (_showActivityTextFilter && row.IsTextActivity) ||
-                (_showActivityToolsFilter && row.IsToolActivity) ||
-                (_showActivityStepsFilter && row.IsStepActivity))
-            .OrderBy(row => row.StartedSortTimestamp is null)
-            .ThenByDescending(row => row.StartedSortTimestamp)
-            .ThenByDescending(row => row.Entry.ByteOffset)
-            .ToArray();
+        var currentTextRows = rows.Where(row => row.IsTextActivity).ToHashSet();
+        foreach (var stale in _messageGroups.Keys.Where(row => !currentTextRows.Contains(row)).ToArray())
+        {
+            _messageGroups.Remove(stale);
+        }
+        var filtered = ActivityHistoryDisplayRows.Select(row => row.Activity).ToArray();
 
         if (!SequenceEqualByReference(_filteredActivityHistory, filtered))
         {
@@ -405,6 +479,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(ActivityTextFilterLabel));
         OnPropertyChanged(nameof(ActivityToolsFilterLabel));
         OnPropertyChanged(nameof(ActivityStepsFilterLabel));
+        OnPropertyChanged(nameof(ActivityOtherFilterLabel));
+        OnPropertyChanged(nameof(ActivityHistoryDisplayRows));
+        OnPropertyChanged(nameof(HasActivityHistoryDisplayRows));
 
         // Re-published after the projection so the grid keeps a visible
         // selection; filter-driven re-selection does not start a source read.

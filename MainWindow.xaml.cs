@@ -1,5 +1,6 @@
 ﻿using System.ComponentModel;
 using System.Windows;
+using System.Windows.Controls;
 using DSMonitor.Services;
 using DSMonitor.ViewModels;
 
@@ -60,6 +61,31 @@ public partial class MainWindow : Window
     {
         _isSelectedMessageExpanded = !_isSelectedMessageExpanded;
         UpdateLiveActivityLayout();
+    }
+
+    private void ActivityHistoryExpandButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: ActivityHistoryDisplayRowViewModel row } &&
+            row.HasChildren)
+        {
+            row.IsExpanded = !row.IsExpanded;
+            if (DataContext is MainViewModel viewModel)
+            {
+                viewModel.RefreshActivityHistoryDisplayRows();
+            }
+        }
+    }
+
+    private void LiveActivityHistoryGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (sender is DataGrid { SelectedItem: ActivityHistoryDisplayRowViewModel row } &&
+            DataContext is MainViewModel viewModel)
+        {
+            if (viewModel.SelectedJob is { } selectedJob)
+            {
+                selectedJob.SelectedActivity = row.Activity;
+            }
+        }
     }
 
     private void OriginalRequestShowAllButton_Click(object sender, RoutedEventArgs e) =>

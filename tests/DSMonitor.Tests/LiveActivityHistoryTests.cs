@@ -663,9 +663,10 @@ public sealed class LiveActivityHistoryTests
                 var grid = window.FindName("LiveActivityHistoryGrid") as DataGrid;
                 Assert.IsNotNull(grid);
                 CollectionAssert.AreEqual(
-                    new[] { "Started", "Duration", "Reported Status" },
+                    new[] { "", "Started", "Duration", "Reported Status" },
                     grid.Columns.Select(column => column.Header?.ToString()).ToArray());
-                Assert.AreEqual("DurationSortSeconds", grid.Columns[1].SortMemberPath);
+                Assert.AreEqual("DurationSortSeconds", grid.Columns[2].SortMemberPath);
+                Assert.AreEqual(28d, grid.Columns[0].Width.Value);
                 Assert.IsTrue(grid.CanUserSortColumns);
                 Assert.AreEqual(30d, grid.RowHeight);
                 var binding = BindingOperations.GetBinding(
@@ -673,10 +674,9 @@ public sealed class LiveActivityHistoryTests
                     ItemsControl.ItemsSourceProperty);
                 Assert.IsNotNull(binding);
 
-                // Phase 2 behavior change: the grid is bound to the in-memory
-                // filtered projection owned by the window view model, so the
-                // filter checkboxes can show/hide categories without a reread.
-                Assert.AreEqual("DataContext.FilteredActivityHistory", binding.Path.Path);
+                // The grid is bound to an in-memory hierarchical projection;
+                // checkbox changes do not trigger source reads.
+                Assert.AreEqual("DataContext.ActivityHistoryDisplayRows", binding.Path.Path);
                 Assert.IsNotNull(binding.RelativeSource);
                 Assert.AreEqual(RelativeSourceMode.FindAncestor, binding.RelativeSource.Mode);
                 Assert.AreEqual(typeof(Window), binding.RelativeSource.AncestorType);

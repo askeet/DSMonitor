@@ -958,6 +958,49 @@ public sealed class Phase2ActivityHistoryTests
         Assert.IsFalse(row.IsSelectedActivityTextKind);
     }
 
+    [TestMethod]
+    public void GroupedPresentation_KeepsParentsFiltersChildrenAndInterleavesOtherRows()
+    {
+        LiveActivityHistoryRowViewModel Row(
+            string id, LiveActivityKind kind, int minute, long offset) =>
+            new(Entry("job", "ses", id, id, kind, offset, Now.AddMinutes(minute),
+                kind.ToString(), id), null, false);
+
+        var parent = Row("message-a", LiveActivityKind.Text, -1, 10);
+        var emptyParent = Row("message-b", LiveActivityKind.Text, -3, 20);
+        var textPart = Row("part-text", LiveActivityKind.Text, -2, 30);
+        var tool = Row("part-tool", LiveActivityKind.Tool, -1, 40);
+        var step = Row("part-step", LiveActivityKind.StepStart, -1, 50);
+        var other = Row("ungrouped", LiveActivityKind.Tool, 0, 60);
+        var groups = new[]
+        {
+            new ActivityHistoryMessageGroup(parent, [textPart, tool, step]),
+            new ActivityHistoryMessageGroup(emptyParent)
+        };
+
+        var collapsed = ActivityHistoryDisplayRowViewModel.Project(
+            groups, [other], showText: false, showTools: false, showSteps: false, showOther: false);
+        Assert.AreEqual(2, collapsed.Count);
+        Assert.IsTrue(collapsed.All(row => row.IsMessage));
+        Assert.IsFalse(collapsed.Single(row => ReferenceEquals(row.Activity, emptyParent)).HasChildren);
+
+        var parentRow = collapsed.Single(row => ReferenceEquals(row.Activity, parent));
+        parentRow.IsExpanded = true;
+        var refreshed = ActivityHistoryDisplayRowViewModel.Project(
+            groups, [other], showText: true, showTools: false, showSteps: true, showOther: true);
+
+        Assert.IsTrue(refreshed.Any(row => ReferenceEquals(row.Activity, parent) && row.IsMessage));
+        Assert.IsTrue(parentRow.IsExpanded, "Checkbox changes preserve expansion state.");
+        Assert.AreEqual(2, refreshed.Count(row => row.IsChild));
+        Assert.IsTrue(refreshed.Any(row => row.IsChild && ReferenceEquals(row.Activity, textPart)));
+        Assert.IsTrue(refreshed.Any(row => row.IsChild && ReferenceEquals(row.Activity, step)));
+        Assert.IsFalse(refreshed.Any(row => ReferenceEquals(row.Activity, tool)));
+        Assert.IsTrue(refreshed.Any(row => row.IsOther && ReferenceEquals(row.Activity, other)));
+        var emptyParentRow = ActivityHistoryDisplayRowViewModel.Message(groups[1]);
+        Assert.IsFalse(emptyParentRow.HasChildren);
+        Assert.IsFalse(emptyParentRow.IsExpanded);
+    }
+
     // ---------------- presentation wiring ----------------
 
     [STATestClass]
@@ -1001,106 +1044,53 @@ public sealed class Phase2ActivityHistoryTests
                 var rowA = viewModel.Jobs.Single(job => job.JobId == "jobA");
                 viewModel.SelectedJob = rowA;
 
-                // Exact counts over every eligible de-duplicated row.
-                Assert.AreEqual("Text (✓2)", viewModel.ActivityTextFilterLabel);
-                Assert.AreEqual("Tools (✓1 · ✕1)", viewModel.ActivityToolsFilterLabel);
-                Assert.AreEqual("Steps (1)", viewModel.ActivityStepsFilterLabel);
+                // Parent text rows stay visible; child counts stay at zero until
+                // a future history projection supplies explicit group membership.
+                Assert.AreEqual("Text Part (0)", viewModel.ActivityTextFilterLabel);
+                Assert.AreEqual("Tools (✓0 · ✕0)", viewModel.ActivityToolsFilterLabel);
+                Assert.AreEqual("Steps (0)", viewModel.ActivityStepsFilterLabel);
+                Assert.AreEqual("Other (3)", viewModel.ActivityOtherFilterLabel);
 
-                // Default: text only, and the newest visible text row is selected.
+                // All child filters default on, Other defaults off, and the
+                // current text rows retain their existing top-level rendering.
                 Assert.IsTrue(viewModel.ShowActivityTextFilter);
-                Assert.IsFalse(viewModel.ShowActivityToolsFilter);
-                Assert.IsFalse(viewModel.ShowActivityStepsFilter);
+                Assert.IsTrue(viewModel.ShowActivityToolsFilter);
+                Assert.IsTrue(viewModel.ShowActivityStepsFilter);
+                Assert.IsFalse(viewModel.ShowActivityOtherFilter);
                 Assert.AreEqual(2, viewModel.FilteredActivityHistory.Count);
                 Assert.IsTrue(viewModel.FilteredActivityHistory.All(row => row.IsTextActivity));
                 Assert.IsTrue(rowA.SelectedActivity is { IsTextActivity: true });
 
-                // Every category can be turned off, leaving an intentionally empty view.
+                // Parent rows remain visible when every child filter is off.
                 viewModel.ShowActivityTextFilter = false;
-                Assert.IsFalse(viewModel.ShowActivityTextFilter);
-                Assert.AreEqual(0, viewModel.FilteredActivityHistory.Count);
-                Assert.IsFalse(rowA.HasVisibleActivityHistory);
-
-                viewModel.ShowActivityTextFilter = true;
-                Assert.AreEqual(2, viewModel.FilteredActivityHistory.Count);
-
-                // Independent toggles.
-                viewModel.ShowActivityToolsFilter = true;
-                Assert.AreEqual(4, viewModel.FilteredActivityHistory.Count);
-                CollectionAssert.AreEqual(
-                    viewModel.FilteredActivityHistory
-                        .Select(row => row.StartedSortTimestamp)
-                        .OrderByDescending(value => value)
-                        .ToArray(),
-                    viewModel.FilteredActivityHistory
-                        .Select(row => row.StartedSortTimestamp)
-                        .ToArray());
-                viewModel.ShowActivityTextFilter = false;
-                Assert.IsFalse(viewModel.ShowActivityTextFilter);
-                Assert.AreEqual(2, viewModel.FilteredActivityHistory.Count);
-                Assert.IsTrue(viewModel.FilteredActivityHistory.All(row => row.IsToolActivity));
-
-                // All filters can be cleared, including after selecting tools.
                 viewModel.ShowActivityToolsFilter = false;
-                Assert.IsFalse(viewModel.ShowActivityToolsFilter);
-                Assert.AreEqual(0, viewModel.FilteredActivityHistory.Count);
-
-                viewModel.ShowActivityStepsFilter = true;
-                Assert.AreEqual(1, viewModel.FilteredActivityHistory.Count);
-                viewModel.ShowActivityTextFilter = true;
-                viewModel.ShowActivityToolsFilter = true;
-                Assert.AreEqual(5, viewModel.FilteredActivityHistory.Count);
-                CollectionAssert.AreEqual(
-                    viewModel.FilteredActivityHistory
-                        .Select(row => row.StartedSortTimestamp)
-                        .OrderByDescending(value => value)
-                        .ToArray(),
-                    viewModel.FilteredActivityHistory
-                        .Select(row => row.StartedSortTimestamp)
-                        .ToArray());
-                viewModel.ShowActivityToolsFilter = false;
-                Assert.AreEqual(3, viewModel.FilteredActivityHistory.Count);
-                Assert.AreEqual(
-                    2,
-                    viewModel.FilteredActivityHistory.Count(row => row.IsTextActivity));
-                Assert.AreEqual(
-                    1,
-                    viewModel.FilteredActivityHistory.Count(row => row.IsStepActivity));
-                Assert.IsFalse(viewModel.FilteredActivityHistory.Any(row => row.IsToolActivity));
-                CollectionAssert.AreEqual(
-                    viewModel.FilteredActivityHistory
-                        .Select(row => row.StartedSortTimestamp)
-                        .OrderByDescending(value => value)
-                        .ToArray(),
-                    viewModel.FilteredActivityHistory
-                        .Select(row => row.StartedSortTimestamp)
-                        .ToArray());
-                viewModel.ShowActivityTextFilter = false;
-                Assert.AreEqual(1, viewModel.FilteredActivityHistory.Count);
-                Assert.IsTrue(viewModel.FilteredActivityHistory[0].IsStepActivity);
-
-                // Clearing the final selected category is allowed.
                 viewModel.ShowActivityStepsFilter = false;
-                Assert.IsFalse(viewModel.ShowActivityStepsFilter);
-                Assert.AreEqual(0, viewModel.FilteredActivityHistory.Count);
+                Assert.AreEqual(2, viewModel.FilteredActivityHistory.Count);
+                Assert.AreEqual("Text Part (0)", viewModel.ActivityTextFilterLabel);
+                Assert.AreEqual("Tools (✓0 · ✕0)", viewModel.ActivityToolsFilterLabel);
+                Assert.AreEqual("Steps (0)", viewModel.ActivityStepsFilterLabel);
 
-                // Counts never depend on the current filters.
-                Assert.AreEqual("Text (✓2)", viewModel.ActivityTextFilterLabel);
-                Assert.AreEqual("Tools (✓1 · ✕1)", viewModel.ActivityToolsFilterLabel);
-                Assert.AreEqual("Steps (1)", viewModel.ActivityStepsFilterLabel);
+                // Other is independent of child categories and can be turned
+                // on while all three child filters remain off.
+                viewModel.ShowActivityOtherFilter = true;
+                Assert.AreEqual(5, viewModel.FilteredActivityHistory.Count);
+                Assert.AreEqual("Other (3)", viewModel.ActivityOtherFilterLabel);
+                viewModel.ShowActivityOtherFilter = false;
+                Assert.AreEqual(2, viewModel.FilteredActivityHistory.Count);
 
                 // The grid's selection binding keeps the visible selected row.
                 var grid = (DataGrid)window.FindName("LiveActivityHistoryGrid");
                 Assert.IsNotNull(grid);
                 PumpDispatcher();
                 window.UpdateLayout();
-                Assert.IsNull(rowA.SelectedActivity);
-                Assert.IsNull(grid.SelectedItem);
+                Assert.IsNotNull(rowA.SelectedActivity);
 
                 // Selecting another job resets the filter defaults.
                 viewModel.SelectedJob = viewModel.Jobs.Single(job => job.JobId == "jobB");
                 Assert.IsTrue(viewModel.ShowActivityTextFilter);
-                Assert.IsFalse(viewModel.ShowActivityToolsFilter);
-                Assert.IsFalse(viewModel.ShowActivityStepsFilter);
+                Assert.IsTrue(viewModel.ShowActivityToolsFilter);
+                Assert.IsTrue(viewModel.ShowActivityStepsFilter);
+                Assert.IsFalse(viewModel.ShowActivityOtherFilter);
                 Assert.AreEqual(1, viewModel.FilteredActivityHistory.Count);
                 Assert.AreEqual("jobB", viewModel.FilteredActivityHistory[0].Entry.JobId);
 
@@ -1173,13 +1163,15 @@ public sealed class Phase2ActivityHistoryTests
 
             var row = viewModel.Jobs.Single(job => job.JobId == "job");
             Assert.AreEqual(138, row.LiveActivityHistory.Count);
-            Assert.AreEqual("Text (✓0)", viewModel.ActivityTextFilterLabel);
-            Assert.AreEqual("Tools (✓132 · ✕6)", viewModel.ActivityToolsFilterLabel);
+            Assert.AreEqual("Text Part (0)", viewModel.ActivityTextFilterLabel);
+            Assert.AreEqual("Tools (✓0 · ✕0)", viewModel.ActivityToolsFilterLabel);
             Assert.AreEqual("Steps (0)", viewModel.ActivityStepsFilterLabel);
+            Assert.AreEqual("Other (138)", viewModel.ActivityOtherFilterLabel);
 
-            // Tool rows are hidden by the text-only default until Tools is enabled.
+            // No child relationship is fabricated; ungrouped records are
+            // available through Other independently of child filters.
             Assert.AreEqual(0, viewModel.FilteredActivityHistory.Count);
-            viewModel.ShowActivityToolsFilter = true;
+            viewModel.ShowActivityOtherFilter = true;
 
             var visible = viewModel.FilteredActivityHistory;
             Assert.AreEqual(138, visible.Count);

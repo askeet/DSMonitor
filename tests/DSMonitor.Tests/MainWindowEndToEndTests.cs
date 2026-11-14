@@ -312,7 +312,7 @@ public sealed class MainWindowEndToEndTests
             $"visible activity history for {job.JobId}");
 
         CollectionAssert.AreEqual(
-            new[] { "Started", "Duration", "Reported Status" },
+            new[] { "", "Started", "Duration", "Reported Status" },
             grid.Columns.Select(column => column.Header?.ToString()).ToArray());
 
         if (roleless)

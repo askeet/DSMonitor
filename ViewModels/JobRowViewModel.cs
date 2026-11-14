@@ -52,6 +52,8 @@ public sealed class JobRowViewModel : ObservableObject
     private DateTimeOffset _currentTime;
     private IReadOnlyList<LiveActivityHistoryRowViewModel> _liveActivityHistory =
         Array.Empty<LiveActivityHistoryRowViewModel>();
+    private IReadOnlyList<ActivityHistoryMessageGroup> _activityHistoryMessageGroups =
+        Array.Empty<ActivityHistoryMessageGroup>();
     private LiveActivityHistoryRowViewModel? _selectedActivity;
     private string _selectedActivityText = "N/A";
     private bool _selectedActivityTextIsComplete;
@@ -217,6 +219,21 @@ public sealed class JobRowViewModel : ObservableObject
     /// </summary>
     public IReadOnlyList<LiveActivityHistoryRowViewModel> LiveActivityHistory =>
         _liveActivityHistory;
+
+    /// <summary>
+    /// Explicit message/part membership for the grouped history presentation.
+    /// The current history producer leaves this empty until it can supply
+    /// verified associations; presentation does not infer them.
+    /// </summary>
+    public IReadOnlyList<ActivityHistoryMessageGroup> ActivityHistoryMessageGroups
+    {
+        get => _activityHistoryMessageGroups;
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            SetProperty(ref _activityHistoryMessageGroups, value);
+        }
+    }
 
     public bool HasLiveActivityHistory => _liveActivityHistory.Count > 0;
 
