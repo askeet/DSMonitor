@@ -30,7 +30,7 @@ public sealed class JobRowViewModel : ObservableObject
     private string _projectText = "N/A";
     private string _projectTooltip = string.Empty;
     private string _modelText = "—";
-    private string _startedText = "—";
+    private string _startedText = "N/A";
     private string _durationText = "N/A";
     private string _durationTooltip = "N/A — started or last activity is unavailable; duration is not inferred.";
     private double _durationSortSeconds = double.PositiveInfinity;
@@ -721,9 +721,7 @@ public sealed class JobRowViewModel : ObservableObject
         SetText(directory ?? string.Empty, ref _projectTooltip, nameof(ProjectTooltip));
         SetText(snapshot.Metadata.Model ?? "—", ref _modelText, nameof(ModelText));
         SetText(
-            snapshot.Metadata.Started is { } started
-                ? started.ToLocalTime().ToString("MMM dd, HH:mm")
-                : "—",
+            StartedDisplayFormatter.Format(snapshot.Metadata.Started),
             ref _startedText,
             nameof(StartedText));
         UpdateDuration(snapshot, now);
@@ -864,13 +862,13 @@ public sealed class JobRowViewModel : ObservableObject
 
         if (_status.IsActive() || _status == ForgeJobStatus.Unknown)
         {
-            SetText(FormatDuration(now - started.Value), ref _elapsedText, nameof(ElapsedText));
+            SetText(FormatElapsedDuration(now - started.Value), ref _elapsedText, nameof(ElapsedText));
             return;
         }
 
         if (Snapshot.LastActivity is { } lastActivity && lastActivity > started.Value)
         {
-            SetText(FormatDuration(lastActivity - started.Value), ref _elapsedText, nameof(ElapsedText));
+            SetText(FormatElapsedDuration(lastActivity - started.Value), ref _elapsedText, nameof(ElapsedText));
         }
         else
         {
@@ -968,7 +966,7 @@ public sealed class JobRowViewModel : ObservableObject
         }
 
         SetProperty(ref _durationSortSeconds, duration.TotalSeconds, nameof(DurationSortSeconds));
-        SetText(FormatDuration(duration), ref _durationText, nameof(DurationText));
+        SetText(DurationDisplayFormatter.Format(duration), ref _durationText, nameof(DurationText));
         SetText(
             $"Live duration {FormatDurationDetail(duration)} " +
             $"(started {started.ToLocalTime():yyyy-MM-dd HH:mm:ss}). " +
@@ -1004,7 +1002,7 @@ public sealed class JobRowViewModel : ObservableObject
 
         var duration = finish - started;
         SetProperty(ref _durationSortSeconds, duration.TotalSeconds, nameof(DurationSortSeconds));
-        SetText(FormatDuration(duration), ref _durationText, nameof(DurationText));
+        SetText(DurationDisplayFormatter.Format(duration), ref _durationText, nameof(DurationText));
         SetText(
             $"Observed duration {FormatDurationDetail(duration)} " +
             $"(started {started.ToLocalTime():yyyy-MM-dd HH:mm:ss}, " +
@@ -1055,7 +1053,7 @@ public sealed class JobRowViewModel : ObservableObject
 
         var duration = lastActivity - started;
         SetProperty(ref _durationSortSeconds, duration.TotalSeconds, nameof(DurationSortSeconds));
-        SetText(FormatDuration(duration), ref _durationText, nameof(DurationText));
+        SetText(DurationDisplayFormatter.Format(duration), ref _durationText, nameof(DurationText));
         SetText(
             $"Observed duration {FormatDurationDetail(duration)} " +
             $"(started {started.ToLocalTime():yyyy-MM-dd HH:mm:ss}, " +
@@ -1463,7 +1461,7 @@ public sealed class JobRowViewModel : ObservableObject
         return $"{(int)duration.TotalSeconds}s";
     }
 
-    private static string FormatDuration(TimeSpan duration)
+    private static string FormatElapsedDuration(TimeSpan duration)
     {
         if (duration < TimeSpan.Zero)
         {

@@ -57,7 +57,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromMilliseconds(14_781))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "14s",
+            () => job.LiveActivityHistory.Single().DurationText == "14.781s",
             "the applied duration");
         var messageCreated = DateTimeOffset.FromUnixTimeMilliseconds(1_000);
         Assert.AreEqual(FormatStarted(messageCreated), job.LiveActivityHistory.Single().StartedText);
@@ -66,7 +66,7 @@ public sealed class ActivityDurationViewModelTests
         PumpOnce();
 
         Assert.AreEqual(1, service.Requests.Count);
-        Assert.AreEqual("14s", job.LiveActivityHistory.Single().DurationText);
+        Assert.AreEqual("14.781s", job.LiveActivityHistory.Single().DurationText);
         Assert.AreEqual(FormatStarted(messageCreated), job.LiveActivityHistory.Single().StartedText);
         StringAssert.Contains(
             job.LiveActivityHistory.Single().DurationTooltip,
@@ -111,7 +111,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_shared" },
             Available(("msg_shared", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1s",
+            () => job.LiveActivityHistory.Single().DurationText == "1.000s",
             "the released claim duration");
     }
 
@@ -156,7 +156,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1s",
+            () => job.LiveActivityHistory.Single().DurationText == "1.000s",
             "the lifecycle retry value");
     }
 
@@ -181,7 +181,7 @@ public sealed class ActivityDurationViewModelTests
         PumpOnce();
 
         var row = job.LiveActivityHistory.Single();
-        Assert.AreEqual("2s", row.DurationText);
+        Assert.AreEqual("2.000s", row.DurationText);
         StringAssert.Contains(row.DurationTooltip, "same-part");
     }
 
@@ -224,7 +224,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_b" },
             Available(("msg_b", TimeSpan.FromSeconds(2))));
         PumpUntil(
-            () => jobB.LiveActivityHistory.Single().DurationText == "2s",
+            () => jobB.LiveActivityHistory.Single().DurationText == "2.000s",
             "the selected job duration");
         Assert.AreEqual("N/A", jobA.LiveActivityHistory.Single().DurationText);
         Assert.AreEqual(FormatStarted(sourceA), jobA.LiveActivityHistory.Single().StartedText);
@@ -248,7 +248,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1s",
+            () => job.LiveActivityHistory.Single().DurationText == "1.000s",
             "the first evidence value");
 
         viewModel.ApplySnapshot(Snapshot(
@@ -287,7 +287,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(1))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "1s",
+            () => job.LiveActivityHistory.Single().DurationText == "1.000s",
             "the healthy value");
 
         viewModel.ApplySnapshot(new MonitoringSnapshot
@@ -340,7 +340,7 @@ public sealed class ActivityDurationViewModelTests
             new[] { "msg_a" },
             Available(("msg_a", TimeSpan.FromSeconds(2))));
         PumpUntil(
-            () => job.LiveActivityHistory.Single().DurationText == "2s",
+            () => job.LiveActivityHistory.Single().DurationText == "2.000s",
             "the replacement session value");
         Assert.AreEqual(
             FormatStarted(DateTimeOffset.FromUnixTimeMilliseconds(1_000)),
@@ -464,7 +464,7 @@ public sealed class ActivityDurationViewModelTests
     }
 
     private static string FormatStarted(DateTimeOffset timestamp) =>
-        timestamp.ToLocalTime().ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture);
+        timestamp.ToLocalTime().ToString("MMM d HH:mm:ss.fff", CultureInfo.InvariantCulture);
 
     private static void PumpOnce() =>
         Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.Background);

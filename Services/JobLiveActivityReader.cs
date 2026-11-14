@@ -277,13 +277,6 @@ public static class JobLiveActivityReader
                         continue;
                     }
 
-                    if (!TryResolvePreviewIdentity(
-                            root, part, out var session, out var message, out var partId))
-                    {
-                        continue;
-                    }
-
-                    if (!TryGetRoleEvidence(root, part, out var verifiedAssistant)) continue;
                     if (!TryGetActivityKind(
                             root,
                             part,
@@ -294,6 +287,14 @@ public static class JobLiveActivityReader
                     {
                         continue;
                     }
+
+                    if (!TryResolvePreviewIdentity(
+                            root, part, isTool, out var session, out var message, out var partId))
+                    {
+                        continue;
+                    }
+
+                    if (!TryGetRoleEvidence(root, part, out var verifiedAssistant)) continue;
 
                     if (previewEligible)
                     {
@@ -1116,26 +1117,41 @@ public static class JobLiveActivityReader
         out string? message,
         out string? partId) =>
         TryResolveIdentityCore(
-            root, part, requireSafePartId: true, out session, out message, out partId);
+            root,
+            part,
+            requireSafePartId: true,
+            isTool: false,
+            out session,
+            out message,
+            out partId);
 
     /// <summary>
     /// Preview variant: strict alias and root/part consistency checks, but an
     /// unsafe single part id remains displayable as null rather than rejecting
-    /// the whole observation.
+    /// the whole observation. Tool records use version-compatible part
+    /// identity selection after strict tool classification.
     /// </summary>
     private static bool TryResolvePreviewIdentity(
         JsonElement root,
         JsonElement part,
+        bool isTool,
         out string? session,
         out string? message,
         out string? partId) =>
         TryResolveIdentityCore(
-            root, part, requireSafePartId: false, out session, out message, out partId);
+            root,
+            part,
+            requireSafePartId: false,
+            isTool,
+            out session,
+            out message,
+            out partId);
 
     private static bool TryResolveIdentityCore(
         JsonElement root,
         JsonElement part,
         bool requireSafePartId,
+        bool isTool,
         out string? session,
         out string? message,
         out string? partId)
@@ -1148,7 +1164,9 @@ public static class JobLiveActivityReader
             !TryGetAlias(part, "sessionID", "sessionId", out var partSession) ||
             !TryGetAlias(root, "messageID", "messageId", out var rootMessage) ||
             !TryGetAlias(part, "messageID", "messageId", out var partMessage) ||
-            !TryGetAlias(part, "id", "partID", out var partIdentity))
+            !TryGetPartIdentity(
+                part, isTool, out var partIdentity, out var hasV2PartId) ||
+            (isTool && !TryValidateToolCallIdentity(part, hasV2PartId)))
         {
             return false;
         }
@@ -1173,6 +1191,90 @@ public static class JobLiveActivityReader
         return ValidId(session) &&
                ValidId(message) &&
                (!requireSafePartId || ValidId(partId));
+    }
+
+    /// <summary>
+    /// Resolve part identity. Non-tool records keep the strict id/partID alias
+    /// contract. Tool records use the version-compatible fields: OpenCode 2.x
+    /// uses <c>partID</c> for the part and <c>id</c> for the tool-call identity;
+    /// 1.x uses <c>id</c> for the part and <c>callID</c> for the tool-call
+    /// identity. The call identity is never used as the part identity when an
+    /// authoritative part field is present. Structural duplicate/malformed part
+    /// evidence fails closed; a missing or unsafe part value remains
+    /// preview-eligible but cannot produce a History row without a valid part
+    /// identity.
+    /// </summary>
+    private static bool TryGetPartIdentity(
+        JsonElement part,
+        bool isTool,
+        out string? partId,
+        out bool hasV2PartId)
+    {
+        partId = null;
+        hasV2PartId = false;
+        if (!isTool)
+        {
+            return TryGetAlias(part, "id", "partID", out partId);
+        }
+
+        if (!TryGetSingleString(part, "partID", out var v2PartId, out var hasExplicitPartId) ||
+            !TryGetSingleString(part, "id", out var legacyPartId, out var hasLegacyId))
+        {
+            return false;
+        }
+
+        hasV2PartId = hasExplicitPartId;
+        partId = hasExplicitPartId ? v2PartId : hasLegacyId ? legacyPartId : null;
+        return true;
+    }
+
+    /// <summary>
+    /// Validate the tool-call identity without using it as the part identity.
+    /// A missing call identifier remains compatible. Supplied call evidence
+    /// must be a single, non-empty, display-safe string; duplicate or
+    /// conflicting V2 id/callID evidence fails closed.
+    /// </summary>
+    private static bool TryValidateToolCallIdentity(
+        JsonElement part,
+        bool hasV2PartId)
+    {
+        if (!hasV2PartId)
+        {
+            // OpenCode 1.x: callID is the call identity and is optional.
+            if (!TryGetSingleString(part, "callID", out var callId, out var hasCallId))
+            {
+                return false;
+            }
+
+            return !hasCallId || ValidId(callId);
+        }
+
+        // OpenCode 2.x: id and callID both describe the call identity. Equal
+        // aliases are consistent; conflicting, duplicate, null, empty, or
+        // unsafe supplied values are rejected. Missing both remains compatible.
+        if (!TryGetSingleString(part, "id", out var v2CallId, out var hasV2CallId) ||
+            !TryGetSingleString(part, "callID", out var alternateCallId, out var hasAlternateCallId))
+        {
+            return false;
+        }
+
+        if (hasV2CallId && hasAlternateCallId)
+        {
+            return string.Equals(v2CallId, alternateCallId, StringComparison.Ordinal) &&
+                   ValidId(v2CallId);
+        }
+
+        if (hasV2CallId)
+        {
+            return ValidId(v2CallId);
+        }
+
+        if (hasAlternateCallId)
+        {
+            return ValidId(alternateCallId);
+        }
+
+        return true;
     }
 
     /// <summary>

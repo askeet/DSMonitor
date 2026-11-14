@@ -159,8 +159,8 @@ public sealed class LiveActivityHistoryRowViewModel
         (IsToolActivity ? ToolStartUnixMilliseconds() : null) is { } toolStart
             ? FormatStarted(toolStart)
             : (_messageDuration?.Created ?? Entry.SourceTimestamp) is { } timestamp
-                ? timestamp.ToLocalTime().ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture)
-                : "—";
+                ? StartedDisplayFormatter.Format(timestamp)
+                : "N/A";
 
     /// <summary>Timestamp used to order all Activity History categories newest first.</summary>
     public DateTimeOffset? StartedSortTimestamp
@@ -217,7 +217,7 @@ public sealed class LiveActivityHistoryRowViewModel
     }
 
     public string DurationText =>
-        ResolveDuration() is { } duration ? FormatDuration(duration) : "N/A";
+        ResolveDuration() is { } duration ? DurationDisplayFormatter.Format(duration) : "N/A";
 
     /// <summary>
     /// Numeric sort value for the Duration column. A paired step span, a valid
@@ -398,9 +398,17 @@ public sealed class LiveActivityHistoryRowViewModel
         }
     }
 
-    private static string FormatStarted(long unixMilliseconds) =>
-        FormatUnixMilliseconds(unixMilliseconds).ToLocalTime()
-            .ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture);
+    private static string FormatStarted(long unixMilliseconds)
+    {
+        try
+        {
+            return StartedDisplayFormatter.Format(FormatUnixMilliseconds(unixMilliseconds));
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return "N/A";
+        }
+    }
 
     private static DateTimeOffset FormatUnixMilliseconds(long unixMilliseconds) =>
         DateTimeOffset.FromUnixTimeMilliseconds(unixMilliseconds);
@@ -457,31 +465,6 @@ public sealed class LiveActivityHistoryRowViewModel
         }
 
         return FormatDurationDetail(duration);
-    }
-
-    private static string FormatDuration(TimeSpan duration)
-    {
-        if (duration < TimeSpan.Zero)
-        {
-            duration = TimeSpan.Zero;
-        }
-
-        if (duration.TotalDays >= 1)
-        {
-            return $"{(int)duration.TotalDays}d {duration.Hours}h";
-        }
-
-        if (duration.TotalHours >= 1)
-        {
-            return $"{(int)duration.TotalHours}h {duration.Minutes}m";
-        }
-
-        if (duration.TotalMinutes >= 1)
-        {
-            return $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
-        }
-
-        return $"{(int)duration.TotalSeconds}s";
     }
 
     private static string FormatDurationDetail(TimeSpan duration)

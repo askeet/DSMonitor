@@ -192,8 +192,253 @@ public sealed class Phase2ActivityHistoryTests
         // tool start exists.
         var sourceStart = byPart["p-negative"].SourceTimestamp!.Value;
         Assert.AreEqual(
-            sourceStart.ToLocalTime().ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture),
+            sourceStart.ToLocalTime().ToString("MMM d HH:mm:ss.fff", CultureInfo.InvariantCulture),
             negative.StartedText);
+    }
+
+    [TestMethod]
+    public void Reader_ToolIdentity_IsVersionCompatibleAndKeepsCallIdentityDistinct()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var timestamp = Now.AddMinutes(-2).ToUnixTimeMilliseconds();
+        var start = Now.AddMinutes(-4).ToUnixTimeMilliseconds();
+        workspace.WriteLog(
+            "job",
+            // OpenCode 1.x: id is the part identity; callID stays distinct.
+            ToolRecord(
+                timestamp,
+                "shell",
+                "completed",
+                start,
+                start + 1_000,
+                part: "p-v1",
+                callId: "call-v1"),
+            // OpenCode 2.x: partID is the part identity; id is the call identity.
+            ToolRecordV2(
+                timestamp + 1,
+                "edit",
+                "error",
+                null,
+                null,
+                part: "p-v2",
+                callId: "call-v2"),
+            // A missing call identifier remains compatible.
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 2) +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{" +
+            "\"partID\":\"p-v2-no-call\",\"messageID\":\"msg\",\"type\":\"tool\"," +
+            "\"tool\":\"write\"}}");
+
+        var activity = Read(workspace, Prepare(workspace));
+        var byPart = activity.History.ToDictionary(entry => entry.PartId, StringComparer.Ordinal);
+
+        Assert.AreEqual(3, activity.History.Count);
+        Assert.AreEqual(3, activity.HistoryRecords.Count);
+        Assert.AreEqual(3, byPart.Count);
+        Assert.IsTrue(byPart.ContainsKey("p-v1"));
+        Assert.IsTrue(byPart.ContainsKey("p-v2"));
+        Assert.IsTrue(byPart.ContainsKey("p-v2-no-call"));
+        Assert.IsFalse(byPart.ContainsKey("call-v1"));
+        Assert.IsFalse(byPart.ContainsKey("call-v2"));
+
+        Assert.AreEqual("ses", byPart["p-v1"].SessionId);
+        Assert.AreEqual("msg", byPart["p-v1"].MessageId);
+        Assert.AreEqual("shell", byPart["p-v1"].ToolName);
+        Assert.AreEqual(LiveActivityToolOutcome.Completed, byPart["p-v1"].ToolOutcome);
+        Assert.AreEqual("ses", byPart["p-v2"].SessionId);
+        Assert.AreEqual("msg", byPart["p-v2"].MessageId);
+        Assert.AreEqual("edit", byPart["p-v2"].ToolName);
+        Assert.AreEqual(LiveActivityToolOutcome.Failed, byPart["p-v2"].ToolOutcome);
+        Assert.AreEqual("write", byPart["p-v2-no-call"].ToolName);
+        Assert.AreEqual(LiveActivityToolOutcome.Unknown, byPart["p-v2-no-call"].ToolOutcome);
+    }
+
+    [TestMethod]
+    public void Reader_ToolIdentity_DuplicateOrMalformedPartEvidenceFailsClosed()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var timestamp = Now.AddMinutes(-2).ToUnixTimeMilliseconds();
+        workspace.WriteLog(
+            "job",
+            // Duplicate partID keys.
+            RawToolRecordV2(
+                timestamp,
+                "\"partID\":\"p-dup-1\",\"partID\":\"p-dup-2\""),
+            // Duplicate V2 call identity keys.
+            RawToolRecordV2(
+                timestamp + 1,
+                "\"partID\":\"p-dup-call\"",
+                "\"id\":\"call-1\",\"id\":\"call-2\""),
+            // A present but non-string partID must not fall back to id.
+            RawToolRecordV2(
+                timestamp + 2,
+                "\"partID\":42",
+                "\"id\":\"call-fallback\""),
+            // Duplicate legacy id is rejected by the existing V1 alias gate.
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 3) +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{\"id\":\"p-v1-1\"," +
+            "\"id\":\"p-v1-2\",\"messageID\":\"msg\",\"type\":\"tool\",\"tool\":\"shell\"}}",
+            // Duplicate and non-string V1 callID evidence.
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 4) +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{\"id\":\"p-v1-call\"," +
+            "\"callID\":\"call-1\",\"callID\":\"call-2\",\"messageID\":\"msg\"," +
+            "\"type\":\"tool\",\"tool\":\"shell\"}}",
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 5) +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{\"id\":\"p-v1-call-type\"," +
+            "\"callID\":42,\"messageID\":\"msg\",\"type\":\"tool\",\"tool\":\"shell\"}}",
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 6) +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{\"id\":\"p-v1-call-null\"," +
+            "\"callID\":null,\"messageID\":\"msg\",\"type\":\"tool\",\"tool\":\"shell\"}}",
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 7) +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{\"id\":\"p-v1-call-empty\"," +
+            "\"callID\":\"\",\"messageID\":\"msg\",\"type\":\"tool\",\"tool\":\"shell\"}}",
+            // Conflicting V2 id/callID evidence.
+            RawToolRecordV2(
+                timestamp + 8,
+                "\"partID\":\"p-call-conflict\"",
+                "\"id\":\"call-a\",\"callID\":\"call-b\""),
+            // Explicitly null, empty, non-string, and invalid V2 id.
+            RawToolRecordV2(
+                timestamp + 9,
+                "\"partID\":\"p-null-call\"",
+                "\"id\":null"),
+            RawToolRecordV2(
+                timestamp + 10,
+                "\"partID\":\"p-empty-call\"",
+                "\"id\":\"\""),
+            RawToolRecordV2(
+                timestamp + 11,
+                "\"partID\":\"p-number-call\"",
+                "\"id\":42"),
+            RawToolRecordV2(
+                timestamp + 12,
+                "\"partID\":\"p-invalid-call\"",
+                "\"id\":\"bad\\u0001\""),
+            // Invalid control characters in a V1 callID are malformed evidence.
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 13) +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{\"id\":\"p-v1-call-invalid\"," +
+            "\"callID\":\"bad\\u0001\",\"messageID\":\"msg\",\"type\":\"tool\",\"tool\":\"shell\"}}");
+
+        var activity = Read(workspace, Prepare(workspace));
+
+        Assert.AreEqual(0, activity.History.Count);
+        Assert.AreEqual(0, activity.HistoryRecords.Count);
+        Assert.IsNull(activity.Doing);
+    }
+
+    [TestMethod]
+    public void Reader_ToolIdentity_MissingOrUnsafePartIdIsPreviewOnly()
+    {
+        using var v2Workspace = new TestWorkspace();
+        v2Workspace.WriteMetadata("job");
+        var timestamp = Now.AddMinutes(-2).ToUnixTimeMilliseconds();
+        v2Workspace.WriteLog(
+            "job",
+            RawToolRecordV2(
+                timestamp,
+                "\"partID\":null",
+                "\"id\":\"call-present\"",
+                message: "msg"),
+            RawToolRecordV2(
+                timestamp + 1,
+                "\"partID\":\"bad\\u0001\"",
+                "\"id\":\"call-present-unsafe\"",
+                message: "msg"));
+        var v2 = Read(v2Workspace, Prepare(v2Workspace));
+        Assert.IsNotNull(v2.Doing);
+        Assert.AreEqual("ses", v2.Doing.SessionId);
+        Assert.IsNull(v2.Doing.PartId);
+        Assert.AreEqual(0, v2.History.Count);
+        Assert.AreEqual(0, v2.HistoryRecords.Count);
+
+        using var v1Workspace = new TestWorkspace();
+        v1Workspace.WriteMetadata("job");
+        v1Workspace.WriteLog(
+            "job",
+            "{\"type\":\"tool_use\",\"timestamp\":" + timestamp +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{" +
+            "\"callID\":\"call-present\",\"messageID\":\"msg\",\"type\":\"tool\"," +
+            "\"tool\":\"shell\"}}");
+        var v1 = Read(v1Workspace, Prepare(v1Workspace));
+        Assert.IsNotNull(v1.Doing);
+        Assert.AreEqual("ses", v1.Doing.SessionId);
+        Assert.IsNull(v1.Doing.PartId);
+        Assert.AreEqual(0, v1.History.Count);
+        Assert.AreEqual(0, v1.HistoryRecords.Count);
+    }
+
+    [TestMethod]
+    public void Reader_ToolIdentity_RejectsSessionAndMessageConflicts()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("job");
+        var timestamp = Now.AddMinutes(-2).ToUnixTimeMilliseconds();
+        workspace.WriteLog(
+            "job",
+            // Root/part session conflict.
+            "{\"type\":\"tool_use\",\"timestamp\":" + timestamp +
+            ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{\"id\":\"call-1\"," +
+            "\"partID\":\"p-session-conflict\",\"sessionID\":\"other\",\"messageID\":\"msg\"," +
+            "\"type\":\"tool\",\"tool\":\"shell\"}}",
+            // Root/part message conflict.
+            "{\"type\":\"tool_use\",\"timestamp\":" + (timestamp + 1) +
+            ",\"sessionID\":\"ses\",\"messageID\":\"msg\",\"role\":\"assistant\"," +
+            "\"part\":{\"id\":\"call-2\",\"partID\":\"p-message-conflict\"," +
+            "\"messageID\":\"other\",\"type\":\"tool\",\"tool\":\"shell\"}}");
+
+        var activity = Read(workspace, Prepare(workspace));
+
+        Assert.AreEqual(0, activity.History.Count);
+        Assert.AreEqual(0, activity.HistoryRecords.Count);
+        Assert.IsNull(activity.Doing);
+    }
+
+    [TestMethod]
+    public void Reader_ToolIdentity_KeepsJobsSessionsAndMessagesDistinctForSharedPartId()
+    {
+        using var workspace = new TestWorkspace();
+        workspace.WriteMetadata("jobA");
+        workspace.WriteMetadata("jobB");
+        var timestamp = Now.AddMinutes(-2).ToUnixTimeMilliseconds();
+        workspace.WriteLog(
+            "jobA",
+            ToolRecordV2(
+                timestamp,
+                "shell",
+                "completed",
+                null,
+                null,
+                session: "sesA",
+                part: "shared-part",
+                message: "msgA",
+                callId: "callA"));
+        workspace.WriteLog(
+            "jobB",
+            ToolRecordV2(
+                timestamp,
+                "edit",
+                "error",
+                null,
+                null,
+                session: "sesB",
+                part: "shared-part",
+                message: "msgB",
+                callId: "callB"));
+
+        var jobA = Read(workspace, Prepare(workspace, "jobA"));
+        var jobB = Read(workspace, Prepare(workspace, "jobB"));
+
+        var a = jobA.History.Single();
+        Assert.AreEqual("jobA", a.JobId);
+        Assert.AreEqual("sesA", a.SessionId);
+        Assert.AreEqual("msgA", a.MessageId);
+        Assert.AreEqual("shared-part", a.PartId);
+        var b = jobB.History.Single();
+        Assert.AreEqual("jobB", b.JobId);
+        Assert.AreEqual("sesB", b.SessionId);
+        Assert.AreEqual("msgB", b.MessageId);
+        Assert.AreEqual("shared-part", b.PartId);
     }
 
     // ---------------- step records and pairing ----------------
@@ -458,11 +703,11 @@ public sealed class Phase2ActivityHistoryTests
 
         var valid = new LiveActivityHistoryRowViewModel(start, null, false, null, null, pair, Now, false);
         Assert.AreEqual(TimeSpan.FromMinutes(3).TotalSeconds, valid.DurationSortSeconds);
-        Assert.AreEqual("3m 0s", valid.DurationText);
+        Assert.AreEqual("3m 0.000s", valid.DurationText);
         StringAssert.Contains(valid.DurationTooltip, "Step source span");
         Assert.AreEqual(
             start.SourceTimestamp!.Value.ToLocalTime().ToString(
-                "MMM dd HH:mm:ss",
+                "MMM d HH:mm:ss.fff",
                 CultureInfo.InvariantCulture),
             valid.StartedText);
 
@@ -480,7 +725,7 @@ public sealed class Phase2ActivityHistoryTests
         var missing = new LiveActivityHistoryRowViewModel(
             start with { SourceTimestamp = null }, null, false, null, null, missingPair, Now, false);
         Assert.AreEqual("N/A", missing.DurationText);
-        Assert.AreEqual("—", missing.StartedText);
+        Assert.AreEqual("N/A", missing.StartedText);
     }
 
     [TestMethod]
@@ -491,7 +736,7 @@ public sealed class Phase2ActivityHistoryTests
 
         var active = new LiveActivityHistoryRowViewModel(start, null, false, null, null, state, Now, true);
         Assert.AreEqual(TimeSpan.FromMinutes(2).TotalSeconds, active.DurationSortSeconds);
-        Assert.AreEqual("2m 0s", active.DurationText);
+        Assert.AreEqual("2m 0.000s", active.DurationText);
         StringAssert.Contains(active.DurationTooltip, "Live source span");
         Assert.AreEqual("Step: in progress", active.ReportedStatusText);
 
@@ -813,8 +1058,22 @@ public sealed class Phase2ActivityHistoryTests
                         .Select(row => row.StartedSortTimestamp)
                         .ToArray());
                 viewModel.ShowActivityToolsFilter = false;
-                Assert.AreEqual(2, viewModel.FilteredActivityHistory.Count);
-                Assert.IsTrue(viewModel.FilteredActivityHistory.All(row => row.IsTextActivity));
+                Assert.AreEqual(3, viewModel.FilteredActivityHistory.Count);
+                Assert.AreEqual(
+                    2,
+                    viewModel.FilteredActivityHistory.Count(row => row.IsTextActivity));
+                Assert.AreEqual(
+                    1,
+                    viewModel.FilteredActivityHistory.Count(row => row.IsStepActivity));
+                Assert.IsFalse(viewModel.FilteredActivityHistory.Any(row => row.IsToolActivity));
+                CollectionAssert.AreEqual(
+                    viewModel.FilteredActivityHistory
+                        .Select(row => row.StartedSortTimestamp)
+                        .OrderByDescending(value => value)
+                        .ToArray(),
+                    viewModel.FilteredActivityHistory
+                        .Select(row => row.StartedSortTimestamp)
+                        .ToArray());
                 viewModel.ShowActivityTextFilter = false;
                 Assert.AreEqual(1, viewModel.FilteredActivityHistory.Count);
                 Assert.IsTrue(viewModel.FilteredActivityHistory[0].IsStepActivity);
@@ -853,6 +1112,95 @@ public sealed class Phase2ActivityHistoryTests
                 window.Close();
             }
         }
+
+        [TestMethod]
+        public void V2ToolRecords_FlowThroughSnapshotRowsAndFilteredActivityHistory()
+        {
+            using var workspace = new TestWorkspace();
+            workspace.WriteMetadata("job");
+            var timestamp = Now.AddMinutes(-2).ToUnixTimeMilliseconds();
+            var start = Now.AddMinutes(-4).ToUnixTimeMilliseconds();
+            var end = start + 4_000;
+            var lines = new List<string>(138);
+            for (var index = 0; index < 132; index++)
+            {
+                lines.Add(ToolRecordV2(
+                    timestamp + index,
+                    "shell",
+                    "completed",
+                    start,
+                    end,
+                    part: $"p-ok-{index}",
+                    callId: $"call-ok-{index}"));
+            }
+
+            for (var index = 0; index < 6; index++)
+            {
+                lines.Add(ToolRecordV2(
+                    timestamp + 132 + index,
+                    "edit",
+                    "error",
+                    null,
+                    null,
+                    part: $"p-error-{index}",
+                    callId: $"call-error-{index}"));
+            }
+
+            workspace.WriteLog("job", lines.ToArray());
+
+            var activity = Read(workspace, Prepare(workspace));
+            Assert.AreEqual(138, activity.History.Count);
+            Assert.AreEqual(138, activity.HistoryRecords.Count);
+
+            var jobSnapshot = Snapshot("job") with
+            {
+                SessionId = "ses",
+                ObservedAt = Now,
+                LiveActivity = activity
+            };
+            using var viewModel = new MainViewModel(
+                () => throw new InvalidOperationException(
+                    "The monitoring service is not used in this presentation test."),
+                Dispatcher.CurrentDispatcher,
+                workspace.RunsRoot);
+            viewModel.ApplySnapshot(new MonitoringSnapshot
+            {
+                ObservedAt = Now,
+                State = MonitoringState.Monitoring,
+                Jobs = [jobSnapshot],
+                Warnings = Array.Empty<string>()
+            });
+
+            var row = viewModel.Jobs.Single(job => job.JobId == "job");
+            Assert.AreEqual(138, row.LiveActivityHistory.Count);
+            Assert.AreEqual("Text (✓0)", viewModel.ActivityTextFilterLabel);
+            Assert.AreEqual("Tools (✓132 · ✕6)", viewModel.ActivityToolsFilterLabel);
+            Assert.AreEqual("Steps (0)", viewModel.ActivityStepsFilterLabel);
+
+            // Tool rows are hidden by the text-only default until Tools is enabled.
+            Assert.AreEqual(0, viewModel.FilteredActivityHistory.Count);
+            viewModel.ShowActivityToolsFilter = true;
+
+            var visible = viewModel.FilteredActivityHistory;
+            Assert.AreEqual(138, visible.Count);
+            Assert.AreEqual(
+                138,
+                visible.Select(candidate => candidate.Entry.PartId)
+                    .Distinct(StringComparer.Ordinal)
+                    .Count());
+            Assert.AreEqual(132, visible.Count(candidate => candidate.IsSuccessfulToolActivity));
+            Assert.AreEqual(6, visible.Count(candidate => candidate.IsErrorToolActivity));
+            Assert.IsTrue(visible.All(candidate => candidate.IsToolActivity));
+            Assert.IsFalse(visible.Any(candidate =>
+                candidate.IsTextActivity || candidate.IsStepActivity));
+
+            var completed = visible.Single(candidate => candidate.Entry.PartId == "p-ok-0");
+            Assert.AreEqual("shell · completed", completed.ReportedStatusText);
+            Assert.AreEqual(4d, completed.DurationSortSeconds);
+            var failed = visible.Single(candidate => candidate.Entry.PartId == "p-error-0");
+            Assert.AreEqual("edit · error", failed.ReportedStatusText);
+            Assert.AreEqual("N/A", failed.DurationText);
+        }
     }
 
     // ---------------- fixtures ----------------
@@ -865,11 +1213,61 @@ public sealed class Phase2ActivityHistoryTests
         long? end,
         string session = "ses",
         string part = "tool-part",
-        string message = "msg")
+        string message = "msg",
+        string? callId = null)
     {
         var partObject = new Dictionary<string, object?>
         {
             ["id"] = part,
+            ["messageID"] = message,
+            ["type"] = "tool",
+            ["tool"] = name
+        };
+        if (callId is not null)
+        {
+            partObject["callID"] = callId;
+        }
+        var state = new Dictionary<string, object?>();
+        if (status is not null)
+        {
+            state["status"] = status;
+        }
+
+        if (start is not null && end is not null)
+        {
+            state["time"] = new Dictionary<string, object?> { ["start"] = start, ["end"] = end };
+        }
+
+        partObject["state"] = state;
+        return JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["type"] = "tool_use",
+            ["timestamp"] = timestamp,
+            ["sessionID"] = session,
+            ["role"] = "assistant",
+            ["part"] = partObject
+        });
+    }
+
+    /// <summary>
+    /// OpenCode 2.x tool record: <c>partID</c> is the part identity and
+    /// <c>id</c> is the distinct tool-call identity.
+    /// </summary>
+    private static string ToolRecordV2(
+        long timestamp,
+        string name,
+        string? status,
+        long? start,
+        long? end,
+        string session = "ses",
+        string part = "tool-part",
+        string message = "msg",
+        string callId = "call-part")
+    {
+        var partObject = new Dictionary<string, object?>
+        {
+            ["id"] = callId,
+            ["partID"] = part,
             ["messageID"] = message,
             ["type"] = "tool",
             ["tool"] = name
@@ -895,6 +1293,15 @@ public sealed class Phase2ActivityHistoryTests
             ["part"] = partObject
         });
     }
+
+    private static string RawToolRecordV2(
+        long timestamp,
+        string partIdentityProperties,
+        string callProperties = "\"id\":\"call-raw\"",
+        string message = "msg") =>
+        "{\"type\":\"tool_use\",\"timestamp\":" + timestamp +
+        ",\"sessionID\":\"ses\",\"role\":\"assistant\",\"part\":{" + callProperties +
+        "," + partIdentityProperties + ",\"messageID\":\"" + message + "\",\"type\":\"tool\",\"tool\":\"shell\"}}";
 
     private static string RawToolRecord(
         long timestamp,

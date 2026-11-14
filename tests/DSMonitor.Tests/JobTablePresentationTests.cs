@@ -70,10 +70,10 @@ public sealed class JobTablePresentationTests
     public void Started_UsesExistingLocalConventionAndMissingShowsPlaceholder()
     {
         var row = new JobRowViewModel(Snapshot(started: Started));
-        Assert.AreEqual(Started.ToLocalTime().ToString("MMM dd, HH:mm"), row.StartedText);
+        Assert.AreEqual(StartedDisplayFormatter.Format(Started), row.StartedText);
 
         var missing = new JobRowViewModel(Snapshot(started: null));
-        Assert.AreEqual("—", missing.StartedText);
+        Assert.AreEqual("N/A", missing.StartedText);
     }
 
     [TestMethod]
@@ -83,7 +83,7 @@ public sealed class JobTablePresentationTests
             started: Started,
             lastActivity: Started.AddSeconds(3725)));
 
-        Assert.AreEqual("1h 2m", row.DurationText);
+        Assert.AreEqual("62m 5.000s", row.DurationText);
         Assert.AreEqual(3725d, row.DurationSortSeconds);
         StringAssert.Contains(row.DurationTooltip, "Observed duration 1h 2m 5s");
         StringAssert.Contains(row.DurationTooltip, "no live timer");
@@ -139,12 +139,12 @@ public sealed class JobTablePresentationTests
             lastActivity: Started.AddMinutes(5),
             status: ForgeJobStatus.Done);
         var row = new JobRowViewModel(snapshot);
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
         Assert.IsTrue(row.DurationHasReportedCompletion);
 
         row.Update(snapshot, Started.AddDays(30));
 
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
         Assert.AreEqual(300d, row.DurationSortSeconds);
         StringAssert.Contains(row.DurationTooltip, "Observed duration 5m 0s");
         StringAssert.Contains(row.DurationTooltip, "Frozen");
@@ -162,7 +162,7 @@ public sealed class JobTablePresentationTests
         row.RefreshElapsed(Started.AddMinutes(30));
 
         Assert.AreEqual("30m 0s", row.ElapsedText);
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
     }
 
     [TestMethod]

@@ -372,18 +372,18 @@ public sealed class LiveActivityHistoryTests
         var olderRow = row.LiveActivityHistory[1];
         var unknownRow = row.LiveActivityHistory[2];
 
-        Assert.AreEqual("2s", newerRow.DurationText);
+        Assert.AreEqual("2.000s", newerRow.DurationText);
         StringAssert.Contains(newerRow.DurationTooltip, "same-part");
         Assert.AreEqual(
             newer.SourceTimestamp!.Value.ToLocalTime().ToString(
-                "MMM dd HH:mm:ss",
+                "MMM d HH:mm:ss.fff",
                 CultureInfo.InvariantCulture),
             newerRow.StartedText);
         StringAssert.Contains(newerRow.StartedTooltip, "Source timestamp");
 
         Assert.AreEqual("N/A", olderRow.DurationText);
         StringAssert.Contains(olderRow.DurationTooltip, "no reliable same-part");
-        Assert.AreEqual("—", unknownRow.StartedText);
+        Assert.AreEqual("N/A", unknownRow.StartedText);
 
         // An exact matching parsed report supplies the same value shown in the jobs table.
         Assert.AreEqual("DONE", olderRow.ReportedStatusText);

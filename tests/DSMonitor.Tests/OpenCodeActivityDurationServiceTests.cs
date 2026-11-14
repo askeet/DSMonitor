@@ -341,18 +341,18 @@ public sealed class OpenCodeActivityDurationServiceTests
         Assert.AreEqual("0s", zero.DurationText);
 
         var shortDuration = Row(Message("msg_short", TimeSpan.FromMilliseconds(14_781)));
-        Assert.AreEqual("14s", shortDuration.DurationText);
+        Assert.AreEqual("14.781s", shortDuration.DurationText);
         StringAssert.Contains(
             shortDuration.DurationTooltip,
             "OpenCode assistant message duration");
 
         var longer = Row(Message("msg_long", TimeSpan.FromSeconds(65)));
-        Assert.AreEqual("1m 5s", longer.DurationText);
+        Assert.AreEqual("1m 5.000s", longer.DurationText);
 
         var tool = Row(
             Message("msg_tool", TimeSpan.FromMilliseconds(14_781)),
             toolDuration: TimeSpan.FromSeconds(2));
-        Assert.AreEqual("2s", tool.DurationText);
+        Assert.AreEqual("2.000s", tool.DurationText);
         StringAssert.Contains(tool.DurationTooltip, "same-part");
 
         var toolRow = Row(
@@ -397,7 +397,7 @@ public sealed class OpenCodeActivityDurationServiceTests
         Assert.AreEqual(FormatStarted(created), text.StartedText);
         StringAssert.Contains(text.StartedTooltip, $"time.created {created:O}");
         StringAssert.Contains(text.StartedTooltip, $"Forge source timestamp {sourceTimestamp:O}");
-        Assert.AreEqual("14s", text.DurationText);
+        Assert.AreEqual("14.000s", text.DurationText);
 
         var noSourceEntry = text.Entry with { SourceTimestamp = null };
         var createdWithoutSource = new LiveActivityHistoryRowViewModel(
@@ -479,7 +479,7 @@ public sealed class OpenCodeActivityDurationServiceTests
             duration);
 
     private static string FormatStarted(DateTimeOffset timestamp) =>
-        timestamp.ToLocalTime().ToString("MMM dd HH:mm:ss", CultureInfo.InvariantCulture);
+        timestamp.ToLocalTime().ToString("MMM d HH:mm:ss.fff", CultureInfo.InvariantCulture);
 
     private static OpenCodeActivityDurationService CreateService(
         FakeExecutor executor,

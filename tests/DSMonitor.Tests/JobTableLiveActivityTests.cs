@@ -20,12 +20,12 @@ public sealed class JobTableLiveActivityTests
             observedAt: Started.AddSeconds(10));
         var row = new JobRowViewModel(running);
 
-        Assert.AreEqual("10s", row.DurationText);
+        Assert.AreEqual("10.000s", row.DurationText);
         Assert.IsTrue(row.DurationUsesLiveClock);
         Assert.IsTrue(row.IsActive);
 
         row.RefreshDuration(Started.AddSeconds(65));
-        Assert.AreEqual("1m 5s", row.DurationText);
+        Assert.AreEqual("1m 5.000s", row.DurationText);
 
         row.Update(
             Snapshot(
@@ -34,12 +34,12 @@ public sealed class JobTableLiveActivityTests
                 lastActivity: Started.AddSeconds(70),
                 observedAt: Started.AddSeconds(71)),
             Started.AddSeconds(71));
-        Assert.AreEqual("1m 10s", row.DurationText);
+        Assert.AreEqual("1m 10.000s", row.DurationText);
         Assert.IsTrue(row.DurationHasReportedCompletion);
         Assert.IsFalse(row.DurationUsesLiveClock);
 
         row.RefreshDuration(Started.AddDays(1));
-        Assert.AreEqual("1m 10s", row.DurationText);
+        Assert.AreEqual("1m 10.000s", row.DurationText);
         StringAssert.Contains(row.DurationTooltip, "Frozen");
     }
 
@@ -56,7 +56,7 @@ public sealed class JobTableLiveActivityTests
 
         Assert.IsTrue(row.IsActive);
         Assert.IsTrue(row.DurationUsesLiveClock);
-        Assert.AreEqual("5s", row.DurationText);
+        Assert.AreEqual("5.000s", row.DurationText);
 
         var activeNotified = false;
         row.PropertyChanged += (_, args) =>
@@ -104,7 +104,7 @@ public sealed class JobTableLiveActivityTests
         Assert.IsTrue(activeNotified);
         Assert.IsFalse(row.IsActive);
         Assert.IsFalse(row.DurationUsesLiveClock);
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
         Assert.AreEqual(300d, row.DurationSortSeconds);
 
         var missingTimestamp = Snapshot(
@@ -113,7 +113,7 @@ public sealed class JobTableLiveActivityTests
             lastActivity: null,
             observedAt: sourceTime.AddSeconds(32));
         row.Update(missingTimestamp, sourceTime.AddSeconds(32));
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
         Assert.AreEqual(300d, row.DurationSortSeconds);
         StringAssert.Contains(row.DurationTooltip, "retained");
 
@@ -123,7 +123,7 @@ public sealed class JobTableLiveActivityTests
             Started.AddSeconds(-1),
             sourceTime.AddSeconds(33));
         row.Update(invalidTimestamp, sourceTime.AddSeconds(33));
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
         Assert.AreEqual(300d, row.DurationSortSeconds);
         StringAssert.Contains(row.DurationTooltip, "retained");
     }
@@ -137,13 +137,13 @@ public sealed class JobTableLiveActivityTests
             lastActivity: Started.AddMinutes(5),
             observedAt: Started.AddMinutes(1)));
 
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
         Assert.AreEqual(JobDurationBasis.ObservedSpan, row.DurationBasis);
         Assert.IsFalse(row.IsActive);
 
         row.RefreshDuration(Started.AddHours(2));
 
-        Assert.AreEqual("5m 0s", row.DurationText);
+        Assert.AreEqual("5m 0.000s", row.DurationText);
         StringAssert.Contains(row.DurationTooltip, "observed span");
         StringAssert.Contains(row.DurationTooltip, "not proof of completion");
         StringAssert.Contains(row.DurationTooltip, "No live timer");
@@ -160,7 +160,7 @@ public sealed class JobTableLiveActivityTests
             doing: TextActivity("finished result", offset: 100, timestamp: Started.AddMinutes(10)),
             done: TextActivity("finished result", offset: 100, timestamp: Started.AddMinutes(10))));
 
-        Assert.AreEqual("10m 0s", row.DurationText);
+        Assert.AreEqual("10m 0.000s", row.DurationText);
         Assert.AreEqual(JobDurationBasis.FinishedActivityHeuristic, row.DurationBasis);
         Assert.IsTrue(row.DurationHasHeuristicCompletion);
         Assert.IsFalse(row.DurationHasReportedCompletion);
@@ -168,7 +168,7 @@ public sealed class JobTableLiveActivityTests
 
         row.RefreshDuration(Started.AddDays(1));
 
-        Assert.AreEqual("10m 0s", row.DurationText);
+        Assert.AreEqual("10m 0.000s", row.DurationText);
         StringAssert.Contains(row.DurationTooltip, "heuristic only");
         StringAssert.Contains(row.DurationTooltip, "not authoritative completion");
     }
@@ -184,13 +184,13 @@ public sealed class JobTableLiveActivityTests
             doing: TextActivity("later work", offset: 200, timestamp: Started.AddMinutes(8)),
             done: TextActivity("intermediate result", offset: 100, timestamp: Started.AddMinutes(5))));
 
-        Assert.AreEqual("8m 0s", row.DurationText);
+        Assert.AreEqual("8m 0.000s", row.DurationText);
         Assert.AreEqual(JobDurationBasis.Live, row.DurationBasis);
         Assert.IsTrue(row.IsActive);
         Assert.IsFalse(row.DurationHasHeuristicCompletion);
 
         row.RefreshDuration(Started.AddDays(1));
-        Assert.AreEqual("8m 0s", row.DurationText);
+        Assert.AreEqual("8m 0.000s", row.DurationText);
     }
 
     [TestMethod]
@@ -213,7 +213,7 @@ public sealed class JobTableLiveActivityTests
         Assert.IsFalse(row.IsActive);
         Assert.AreEqual(JobDurationBasis.ObservedSpan, row.DurationBasis);
         Assert.IsFalse(row.DurationHasHeuristicCompletion);
-        Assert.AreEqual("6m 0s", row.DurationText);
+        Assert.AreEqual("6m 0.000s", row.DurationText);
     }
 
     [TestMethod]
@@ -227,7 +227,7 @@ public sealed class JobTableLiveActivityTests
             doing: TextActivity("reported finish", offset: 100, timestamp: Started.AddMinutes(4)),
             done: TextActivity("reported finish", offset: 100, timestamp: Started.AddMinutes(4))));
 
-        Assert.AreEqual("4m 0s", row.DurationText);
+        Assert.AreEqual("4m 0.000s", row.DurationText);
         Assert.AreEqual(JobDurationBasis.FinishedReportedMetadata, row.DurationBasis);
         StringAssert.Contains(row.DurationTooltip, "finish");
     }
@@ -241,13 +241,13 @@ public sealed class JobTableLiveActivityTests
             lastActivity: Started.AddMinutes(7),
             observedAt: Started.AddMinutes(7)));
 
-        Assert.AreEqual("7m 0s", row.DurationText);
+        Assert.AreEqual("7m 0.000s", row.DurationText);
         Assert.AreEqual(JobDurationBasis.FinishedTerminalMetadata, row.DurationBasis);
         Assert.IsTrue(row.DurationHasReportedCompletion);
 
         row.RefreshDuration(Started.AddDays(1));
 
-        Assert.AreEqual("7m 0s", row.DurationText);
+        Assert.AreEqual("7m 0.000s", row.DurationText);
         StringAssert.Contains(row.DurationTooltip, "Forge metadata reports FAILED");
     }
 
