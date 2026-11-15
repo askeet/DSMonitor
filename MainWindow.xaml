@@ -251,7 +251,8 @@
                 <TextBlock Grid.Column="1"
                            Text="{Binding ReportedStatusCellText}"
                            Style="{StaticResource JobCellText}"
-                           ToolTip="{Binding ReportedStatusCellTooltip}" />
+                           ToolTip="{Binding ReportedStatusCellTooltip}"
+                           MouseLeftButtonDown="ForgeJobReportedStatus_MouseLeftButtonDown" />
             </Grid>
         </DataTemplate>
 
@@ -277,7 +278,8 @@
                                 Visibility="{Binding IsCurrentActiveTarget, Converter={StaticResource BoolToVisibility}}" />
                 <TextBlock Grid.Column="2"
                            Text="{Binding ReportedStatusText}"
-                           ToolTip="{Binding ReportedStatusTooltip}">
+                           ToolTip="{Binding ReportedStatusTooltip}"
+                           MouseLeftButtonDown="ActivityHistoryStatus_MouseLeftButtonDown">
                     <TextBlock.Style>
                         <Style TargetType="TextBlock" BasedOn="{StaticResource JobCellText}">
                             <Setter Property="Margin" Value="0" />
@@ -1048,7 +1050,9 @@
                                                   Style="{StaticResource LiveActivityHistoryGrid}"
                                                   CanUserSortColumns="True"
                                                   ItemsSource="{Binding DataContext.ActivityHistoryDisplayRows, RelativeSource={RelativeSource AncestorType={x:Type Window}}}"
+                                                  SelectedItem="{Binding DataContext.SelectedActivityDisplayRow, RelativeSource={RelativeSource AncestorType={x:Type Window}}, Mode=TwoWay}"
                                                   SelectionChanged="LiveActivityHistoryGrid_SelectionChanged"
+                                                  Sorting="LiveActivityHistoryGrid_Sorting"
                                                   AutomationProperties.Name="Live activity history">
                                             <DataGrid.Columns>
                                                 <DataGridTemplateColumn Width="28"
@@ -1109,6 +1113,7 @@
                                                 </DataGridTemplateColumn>
                                                 <DataGridTemplateColumn Header="Started"
                                                                         Width="150"
+                                                                        CanUserSort="False"
                                                                         HeaderStyle="{StaticResource JobColumnHeaderStyle}">
                                                     <DataGridTemplateColumn.CellTemplate>
                                                         <DataTemplate>
@@ -1134,6 +1139,7 @@
 
                                                 <DataGridTemplateColumn Header="Reported Status"
                                                                         Width="*"
+                                                                        CanUserSort="False"
                                                                         HeaderStyle="{StaticResource JobColumnHeaderStyle}"
                                                                         CellTemplate="{StaticResource LiveActivityHistoryStatusCellTemplate}" />
                                             </DataGrid.Columns>

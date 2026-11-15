@@ -1044,9 +1044,11 @@ public sealed class Phase2ActivityHistoryTests
                 var rowA = viewModel.Jobs.Single(job => job.JobId == "jobA");
                 viewModel.SelectedJob = rowA;
 
-                // Parent text rows stay visible; child counts stay at zero until
-                // a future history projection supplies explicit group membership.
-                Assert.AreEqual("Text Part (0)", viewModel.ActivityTextFilterLabel);
+                // V2 groups both text messages; the representative text part is
+                // also a child, so the exact text-part count covers both parts.
+                // The tool and step messages have no retained text
+                // representative and stay exact Other rows.
+                Assert.AreEqual("Text Part (2)", viewModel.ActivityTextFilterLabel);
                 Assert.AreEqual("Tools (✓0 · ✕0)", viewModel.ActivityToolsFilterLabel);
                 Assert.AreEqual("Steps (0)", viewModel.ActivityStepsFilterLabel);
                 Assert.AreEqual("Other (3)", viewModel.ActivityOtherFilterLabel);
@@ -1066,7 +1068,7 @@ public sealed class Phase2ActivityHistoryTests
                 viewModel.ShowActivityToolsFilter = false;
                 viewModel.ShowActivityStepsFilter = false;
                 Assert.AreEqual(2, viewModel.FilteredActivityHistory.Count);
-                Assert.AreEqual("Text Part (0)", viewModel.ActivityTextFilterLabel);
+                Assert.AreEqual("Text Part (2)", viewModel.ActivityTextFilterLabel);
                 Assert.AreEqual("Tools (✓0 · ✕0)", viewModel.ActivityToolsFilterLabel);
                 Assert.AreEqual("Steps (0)", viewModel.ActivityStepsFilterLabel);
 

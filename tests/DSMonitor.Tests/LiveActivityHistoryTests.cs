@@ -663,7 +663,7 @@ public sealed class LiveActivityHistoryTests
                 var grid = window.FindName("LiveActivityHistoryGrid") as DataGrid;
                 Assert.IsNotNull(grid);
                 CollectionAssert.AreEqual(
-                    new[] { "", "Started", "Duration", "Reported Status" },
+                    new string?[] { null, "Started", "Duration", "Reported Status" },
                     grid.Columns.Select(column => column.Header?.ToString()).ToArray());
                 Assert.AreEqual("DurationSortSeconds", grid.Columns[2].SortMemberPath);
                 Assert.AreEqual(28d, grid.Columns[0].Width.Value);

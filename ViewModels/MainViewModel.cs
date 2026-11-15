@@ -60,6 +60,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _showActivityOtherFilter;
     private IReadOnlyList<LiveActivityHistoryRowViewModel> _filteredActivityHistory =
         Array.Empty<LiveActivityHistoryRowViewModel>();
+    private IReadOnlyList<ActivityHistoryDisplayRowViewModel> _activityHistoryDisplayRows =
+        Array.Empty<ActivityHistoryDisplayRowViewModel>();
+    private ActivityHistoryDisplayRowViewModel? _selectedActivityDisplayRow;
+    private ListSortDirection? _activityHistoryDurationSort;
     private readonly Dictionary<LiveActivityHistoryRowViewModel, ActivityHistoryMessageGroup> _messageGroups = new();
     private string _stateDetail = "Monitoring is stopped";
     private string _jobsSummaryText = "0 observed · 0 unknown";
@@ -306,6 +310,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 }
 
                 _messageGroups.Clear();
+                previous?.DiscardPendingDisplaySelection();
+                value?.DiscardPendingDisplaySelection();
+                PublishSelectedActivityDisplayRow(null);
                 if (previous is not null)
                 {
                     previous.PropertyChanged -= OnSelectedJobPropertyChanged;
@@ -359,18 +366,79 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// No membership is inferred here.
     /// </summary>
     public IReadOnlyList<ActivityHistoryDisplayRowViewModel> ActivityHistoryDisplayRows =>
-        ActivityHistoryDisplayRowViewModel.Project(
-            CurrentMessageGroups,
-            CurrentOtherRows,
-            _showActivityTextFilter,
-            _showActivityToolsFilter,
-            _showActivityStepsFilter,
-            _showActivityOtherFilter);
+        _activityHistoryDisplayRows;
 
     public bool HasActivityHistoryDisplayRows => ActivityHistoryDisplayRows.Count > 0;
 
+    /// <summary>
+    /// The exact parent/child grid row currently selected. The value is restored
+    /// by parent message identity or child physical part identity after a
+    /// snapshot, representative change, filter, collapse, or ItemsSource reset.
+    /// </summary>
+    public ActivityHistoryDisplayRowViewModel? SelectedActivityDisplayRow
+    {
+        get => _selectedActivityDisplayRow;
+        set
+        {
+            if (value?.IsStartMarker == true)
+            {
+                SelectedJob?.ClearSelectedActivityForPresentation();
+                PublishSelectedActivityDisplayRow(value);
+                return;
+            }
+
+            if (ReferenceEquals(_selectedActivityDisplayRow, value))
+            {
+                return;
+            }
+
+            // WPF clears SelectedItem when ItemsSource is replaced. Do not let
+            // that transient erase a live job's exact display selection.
+            if (value is null &&
+                _selectedActivityDisplayRow is not null &&
+                SelectedJob?.SelectedActivity is not null)
+            {
+                return;
+            }
+
+            PublishSelectedActivityDisplayRow(value);
+            if (value is null)
+            {
+                SelectedJob?.ClearSelectedDisplayRowKey();
+            }
+            else if (SelectedJob is { } job)
+            {
+                job.SelectActivityDisplayRow(value);
+            }
+        }
+    }
+
+    public ListSortDirection? ActivityHistoryDurationSort => _activityHistoryDurationSort;
+
+    /// <summary>
+    /// Grouped Duration sort: top-level message/Other blocks are ordered by the
+    /// displayed row's duration (unknown last); children remain chronological
+    /// under their parent. Null restores the default timestamp ordering.
+    /// </summary>
+    public void SetActivityHistoryDurationSort(ListSortDirection? direction)
+    {
+        if (_activityHistoryDurationSort == direction)
+        {
+            return;
+        }
+
+        _activityHistoryDurationSort = direction;
+        OnPropertyChanged(nameof(ActivityHistoryDurationSort));
+        RefreshActivityHistoryPresentation(ensureSelection: true);
+    }
+
+    /// <summary>
+    /// Re-evaluates the hierarchical projection after an expand/collapse. The
+    /// filtered rows, visible count and selection are refreshed from the same
+    /// in-memory groups; no source read is started.
+    /// </summary>
     public void RefreshActivityHistoryDisplayRows() =>
-        OnPropertyChanged(nameof(ActivityHistoryDisplayRows));
+        RefreshActivityHistoryPresentation(ensureSelection: true);
 
     private IReadOnlyList<ActivityHistoryMessageGroup> CurrentMessageGroups =>
         SelectedJob?.ActivityHistoryMessageGroups.Count > 0
@@ -392,17 +460,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private IReadOnlyList<LiveActivityHistoryRowViewModel> CurrentOtherRows =>
         GetCurrentOtherRows();
 
-    private IReadOnlyList<LiveActivityHistoryRowViewModel> GetCurrentOtherRows()
-    {
-        var rows = SelectedJob?.LiveActivityHistory ?? Array.Empty<LiveActivityHistoryRowViewModel>();
-        var groups = SelectedJob?.ActivityHistoryMessageGroups ?? Array.Empty<ActivityHistoryMessageGroup>();
-        var groupedRows = groups.SelectMany(group => group.Children.Append(group.Message)).ToHashSet();
-        return rows.Where(row =>
-                groups.Count > 0
-                    ? !groupedRows.Contains(row)
-                    : !row.IsTextActivity)
-            .ToArray();
-    }
+    private IReadOnlyList<LiveActivityHistoryRowViewModel> GetCurrentOtherRows() =>
+        SelectedJob?.OtherActivityRows ?? Array.Empty<LiveActivityHistoryRowViewModel>();
 
     public string ActivityTextFilterLabel =>
         $"Text Part ({CurrentMessageGroups.Sum(group => group.Children.Count(row => row.IsTextActivity))})";
@@ -467,7 +526,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             _messageGroups.Remove(stale);
         }
-        var filtered = ActivityHistoryDisplayRows.Select(row => row.Activity).ToArray();
+        _activityHistoryDisplayRows = ActivityHistoryDisplayRowViewModel.Project(
+            CurrentMessageGroups,
+            CurrentOtherRows,
+            _showActivityTextFilter,
+            _showActivityToolsFilter,
+            _showActivityStepsFilter,
+            _showActivityOtherFilter,
+            _activityHistoryDurationSort);
+        var displayRows = _activityHistoryDisplayRows;
+        var filtered = displayRows.Select(row => row.Activity).ToArray();
 
         if (!SequenceEqualByReference(_filteredActivityHistory, filtered))
         {
@@ -489,6 +557,118 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             job?.EnsureSelectedActivityVisible(filtered);
         }
+
+        // Restore the exact parent/child row after a row rebuild. A temporarily
+        // hidden child keeps its model key pending and the visible message parent
+        // is published as the only visible selection; revealing the child
+        // restores it.
+        var selectedRow = ResolveSelectedDisplayRow(job, displayRows, out var pendingFallback);
+        PublishSelectedActivityDisplayRow(selectedRow);
+        if (selectedRow is null)
+        {
+            if (job?.SelectedActivity is null)
+            {
+                job?.ClearSelectedDisplayRowKey();
+            }
+
+            return;
+        }
+
+        if (pendingFallback)
+        {
+            job?.MarkDisplaySelectionPending();
+            return;
+        }
+
+        job?.ClearDisplaySelectionPending();
+        if (job is not null &&
+            (job.SelectedDisplayRowKey is null ||
+             job.SelectedDisplayRowKey != selectedRow.Key))
+        {
+            job.SelectActivityDisplayRow(selectedRow);
+        }
+    }
+
+    private ActivityHistoryDisplayRowViewModel? ResolveSelectedDisplayRow(
+        JobRowViewModel? job,
+        IReadOnlyList<ActivityHistoryDisplayRowViewModel> displayRows,
+        out bool pendingFallback)
+    {
+        pendingFallback = false;
+        if (job?.SelectedActivity is null)
+        {
+            return null;
+        }
+
+        var key = job.SelectedDisplayRowKey;
+        ActivityHistoryDisplayRowViewModel? keyRow = null;
+        ActivityHistoryDisplayRowViewModel? currentRow = null;
+        ActivityHistoryDisplayRowViewModel? activityRow = null;
+        ActivityHistoryDisplayRowViewModel? messageParentFallback = null;
+        foreach (var row in displayRows)
+        {
+            if (key is { } selectedKey && row.Key == selectedKey)
+            {
+                keyRow ??= row;
+            }
+
+            if (ReferenceEquals(row, _selectedActivityDisplayRow))
+            {
+                currentRow = row;
+            }
+
+            if (ReferenceEquals(row.Activity, job.SelectedActivity))
+            {
+                activityRow ??= row;
+            }
+
+            if (key is { IsMessage: false } childKey &&
+                row.IsMessage &&
+                MatchesMessage(row.Key, childKey))
+            {
+                messageParentFallback ??= row;
+            }
+        }
+
+        if (keyRow is not null)
+        {
+            return keyRow;
+        }
+
+        if (key is { IsMessage: false } && messageParentFallback is not null)
+        {
+            pendingFallback = true;
+            return messageParentFallback;
+        }
+
+        // A current row that no longer represents the selected activity is a
+        // stale grid artifact, not a selection to preserve.
+        if (currentRow is not null &&
+            ReferenceEquals(currentRow.Activity, job.SelectedActivity))
+        {
+            return currentRow;
+        }
+
+        return activityRow;
+    }
+
+    private static bool MatchesMessage(
+        ActivityHistoryRowIdentity left,
+        ActivityHistoryRowIdentity right) =>
+        string.Equals(left.JobId, right.JobId, StringComparison.Ordinal) &&
+        string.Equals(left.SourcePath, right.SourcePath, StringComparison.Ordinal) &&
+        string.Equals(left.SessionId, right.SessionId, StringComparison.Ordinal) &&
+        string.Equals(left.MessageId, right.MessageId, StringComparison.Ordinal);
+
+    private void PublishSelectedActivityDisplayRow(ActivityHistoryDisplayRowViewModel? row)
+    {
+        if (ReferenceEquals(_selectedActivityDisplayRow, row))
+        {
+            return;
+        }
+
+        _selectedActivityDisplayRow = row;
+        OnPropertyChanged(nameof(SelectedActivityDisplayRow));
     }
 
     private static bool SequenceEqualByReference(

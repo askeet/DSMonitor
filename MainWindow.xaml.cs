@@ -1,6 +1,7 @@
 ﻿using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using DSMonitor.Services;
 using DSMonitor.ViewModels;
 
@@ -81,11 +82,47 @@ public partial class MainWindow : Window
         if (sender is DataGrid { SelectedItem: ActivityHistoryDisplayRowViewModel row } &&
             DataContext is MainViewModel viewModel)
         {
-            if (viewModel.SelectedJob is { } selectedJob)
+            // Keep the exact parent/child display identity, not only the shared
+            // activity entry, so a representative change or ItemsSource reset
+            // restores the row the user actually selected.
+            viewModel.SelectedActivityDisplayRow = row;
+        }
+    }
+
+    private void LiveActivityHistoryGrid_Sorting(object sender, DataGridSortingEventArgs e)
+    {
+        // Only Duration has a model-level grouped sort. Sorting a flat grid
+        // would detach children from their message; Started/Status stay in the
+        // deterministic timestamp order.
+        e.Handled = true;
+        if (sender is not DataGrid grid ||
+            !string.Equals(
+                e.Column.SortMemberPath,
+                nameof(ActivityHistoryDisplayRowViewModel.DurationSortSeconds),
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var direction = e.Column.SortDirection == ListSortDirection.Ascending
+            ? ListSortDirection.Descending
+            : ListSortDirection.Ascending;
+        foreach (var column in grid.Columns)
+        {
+            if (!ReferenceEquals(column, e.Column))
             {
-                selectedJob.SelectedActivity = row.Activity;
+                column.SortDirection = null;
             }
         }
+
+        if (DataContext is MainViewModel viewModel)
+        {
+            viewModel.SetActivityHistoryDurationSort(direction);
+        }
+
+        // Set the arrow after the grouped projection refresh so the ItemsSource
+        // replacement cannot clear the column's sort state.
+        e.Column.SortDirection = direction;
     }
 
     private void OriginalRequestShowAllButton_Click(object sender, RoutedEventArgs e) =>
@@ -93,6 +130,31 @@ public partial class MainWindow : Window
 
     private void SelectedMessageShowAllButton_Click(object sender, RoutedEventArgs e) =>
         FullTextDialog.Show(this, "Response", SelectedActivityTextBox.Text, SelectedActivityTextBox.FontSize);
+
+    private void ActivityHistoryStatus_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount == 2)
+        {
+            SelectedMessageShowAllButton_Click(sender, e);
+            e.Handled = true;
+        }
+    }
+
+    private void ForgeJobReportedStatus_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount == 2 &&
+            sender is FrameworkElement { DataContext: JobRowViewModel job } &&
+            DataContext is MainViewModel viewModel)
+        {
+            viewModel.SelectedJob = job;
+            FullTextDialog.Show(
+                this,
+                "Response",
+                job.SelectedActivityText,
+                SelectedActivityTextBox.FontSize);
+            e.Handled = true;
+        }
+    }
 
     private void UpdateLiveActivityLayout()
     {

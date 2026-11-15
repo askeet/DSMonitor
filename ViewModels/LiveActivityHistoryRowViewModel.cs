@@ -25,6 +25,7 @@ public sealed class LiveActivityHistoryRowViewModel
     private readonly LiveActivityStepPair? _step;
     private readonly DateTimeOffset? _observedNow;
     private readonly bool _isActiveStep;
+    private readonly bool _isGroupedChild;
 
     /// <param name="jobReportedStatus">
     /// The job-level value resolved once by
@@ -48,6 +49,12 @@ public sealed class LiveActivityHistoryRowViewModel
     /// record of a running job while monitoring is active. Anything else
     /// renders a neutral duration.
     /// </param>
+    /// <param name="isGroupedChild">
+    /// True only for a row shown under an Activity History message parent. A
+    /// text child may use its validated same-record part interval; the parent
+    /// representative keeps the existing message/event timing. Tool and step
+    /// rows are unaffected.
+    /// </param>
     public LiveActivityHistoryRowViewModel(
         LiveActivityHistoryEntry entry,
         ReportedStatusExtraction? reportedStatus,
@@ -56,12 +63,14 @@ public sealed class LiveActivityHistoryRowViewModel
         OpenCodeMessageDuration? messageDuration = null,
         LiveActivityStepPair? step = null,
         DateTimeOffset? observedNow = null,
-        bool isActiveStep = false)
+        bool isActiveStep = false,
+        bool isGroupedChild = false)
     {
         Entry = entry ?? throw new ArgumentNullException(nameof(entry));
         _step = step;
         _observedNow = observedNow;
         _isActiveStep = isActiveStep;
+        _isGroupedChild = isGroupedChild;
         _messageDuration = messageDuration is not null &&
                            messageDuration.Duration >= TimeSpan.Zero &&
                            KindOf == LiveActivityKind.Text &&
@@ -100,6 +109,8 @@ public sealed class LiveActivityHistoryRowViewModel
 
     public LiveActivityHistoryEntry Entry { get; }
 
+    internal OpenCodeMessageDuration? MessageDuration => _messageDuration;
+
     /// <summary>Exact activity class; a textual fallback exists only for legacy entries.</summary>
     public LiveActivityKind ActivityKind => KindOf;
 
@@ -111,6 +122,13 @@ public sealed class LiveActivityHistoryRowViewModel
 
     public bool IsStepActivity =>
         KindOf is LiveActivityKind.StepStart or LiveActivityKind.StepFinish;
+
+    /// <summary>
+    /// True only for a text part shown as a grouped child. The child row may use
+    /// the validated same-record text part interval; the parent representative
+    /// keeps message/event timing and is never marked as a child.
+    /// </summary>
+    public bool IsTextChild => IsTextActivity && _isGroupedChild;
 
     /// <summary>True only for an exact <c>state.status</c> completion.</summary>
     public bool IsSuccessfulToolActivity =>
@@ -158,9 +176,11 @@ public sealed class LiveActivityHistoryRowViewModel
     public string StartedText =>
         (IsToolActivity ? ToolStartUnixMilliseconds() : null) is { } toolStart
             ? FormatStarted(toolStart)
-            : (_messageDuration?.Created ?? Entry.SourceTimestamp) is { } timestamp
-                ? StartedDisplayFormatter.Format(timestamp)
-                : "N/A";
+            : TextPartStartUnixMilliseconds() is { } textStart
+                ? FormatStarted(textStart)
+                : (_messageDuration?.Created ?? Entry.SourceTimestamp) is { } timestamp
+                    ? StartedDisplayFormatter.Format(timestamp)
+                    : "N/A";
 
     /// <summary>Timestamp used to order all Activity History categories newest first.</summary>
     public DateTimeOffset? StartedSortTimestamp
@@ -176,6 +196,18 @@ public sealed class LiveActivityHistoryRowViewModel
                 catch (ArgumentOutOfRangeException)
                 {
                     // Invalid tool timing has no sortable Started value.
+                }
+            }
+
+            if (TextPartStartUnixMilliseconds() is { } textStart)
+            {
+                try
+                {
+                    return DateTimeOffset.FromUnixTimeMilliseconds(textStart);
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                    // Invalid text-part timing has no sortable Started value.
                 }
             }
 
@@ -195,6 +227,24 @@ public sealed class LiveActivityHistoryRowViewModel
                        $"observed {Entry.ObservedAt:O}. Job {Entry.JobId}; session {Entry.SessionId}; " +
                        $"message {Entry.MessageId}; part {Entry.PartId}. " +
                        "Same-part tool start evidence only; not job duration or completion.";
+            }
+
+            if (TextPartInterval() is { } textInterval)
+            {
+                try
+                {
+                    var startTime = FormatUnixMilliseconds(textInterval.Start);
+                    var endTime = FormatUnixMilliseconds(textInterval.End);
+                    return $"Validated text part time.start {startTime:O}, time.end {endTime:O}; " +
+                           $"root source timestamp {Entry.SourceTimestamp?.ToString("O") ?? "N/A"}; " +
+                           $"observed {Entry.ObservedAt:O}. Job {Entry.JobId}; session {Entry.SessionId}; " +
+                           $"message {Entry.MessageId}; part {Entry.PartId}. " +
+                           "Same-record text part interval only; not a message, job, or completion claim.";
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                    // Invalid timing falls back to message/event evidence below.
+                }
             }
 
             if (_messageDuration is { } messageDuration)
@@ -234,6 +284,17 @@ public sealed class LiveActivityHistoryRowViewModel
             if (IsStepActivity)
             {
                 return StepDurationTooltip();
+            }
+
+            if (TextPartInterval() is { } textInterval)
+            {
+                return $"Text part interval {FormatDurationDetail(
+                        TimeSpan.FromMilliseconds(textInterval.End - textInterval.Start))} " +
+                       $"from the same record's time.start {FormatUnixMilliseconds(textInterval.Start):O} " +
+                       $"and time.end {FormatUnixMilliseconds(textInterval.End):O}. " +
+                       $"Root source timestamp {Entry.SourceTimestamp?.ToString("O") ?? "N/A"}. " +
+                       "This is a text-part interval only; not a message duration, job duration, " +
+                       "execution-liveness proof, or completion evidence.";
             }
 
             return Entry.ObservedDuration is { } duration
@@ -278,6 +339,12 @@ public sealed class LiveActivityHistoryRowViewModel
                              $"{Entry.ToolStatus ?? "N/A"}; outcome {Entry.ToolOutcome}.";
             }
 
+            if (TextPartInterval() is { } textInterval)
+            {
+                baseValue += $" Text part time.start {textInterval.Start} and time.end " +
+                             $"{textInterval.End} Unix ms from this exact record.";
+            }
+
             if (IsStepActivity && _step is { } step)
             {
                 baseValue += $" Step state {step.State}; start part {Entry.PartId} at byte " +
@@ -311,11 +378,44 @@ public sealed class LiveActivityHistoryRowViewModel
 
     private long? ToolStartUnixMilliseconds() => Entry.ToolStartUnixMilliseconds;
 
+    private long? TextPartStartUnixMilliseconds() =>
+        TextPartInterval() is { } interval ? interval.Start : null;
+
+    /// <summary>
+    /// A text child may use only an ordered same-record part interval. The parent
+    /// representative and all tool/step rows never enter this branch.
+    /// </summary>
+    private (long Start, long End)? TextPartInterval()
+    {
+        if (!IsTextChild ||
+            Entry.TextStartUnixMilliseconds is not { } start ||
+            Entry.TextEndUnixMilliseconds is not { } end)
+        {
+            return null;
+        }
+
+        if (start < 0 ||
+            start > MaxUnixMilliseconds ||
+            end < start ||
+            end > MaxUnixMilliseconds ||
+            end - start > TimeSpan.MaxValue.TotalMilliseconds)
+        {
+            return null;
+        }
+
+        return (start, end);
+    }
+
     private TimeSpan? ResolveDuration()
     {
         if (IsStepActivity)
         {
             return StepDuration();
+        }
+
+        if (TextPartInterval() is { } textInterval)
+        {
+            return TimeSpan.FromMilliseconds(textInterval.End - textInterval.Start);
         }
 
         return Entry.ObservedDuration ?? _messageDuration?.Duration;
@@ -397,6 +497,9 @@ public sealed class LiveActivityHistoryRowViewModel
                 return "N/A — no reliable step pairing evidence; no duration is inferred.";
         }
     }
+
+    private static readonly long MaxUnixMilliseconds =
+        DateTimeOffset.MaxValue.ToUnixTimeMilliseconds();
 
     private static string FormatStarted(long unixMilliseconds)
     {

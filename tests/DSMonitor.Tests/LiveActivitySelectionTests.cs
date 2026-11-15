@@ -664,7 +664,9 @@ public sealed class LiveActivitySelectionTests
                         grid,
                         Selector.SelectedItemProperty);
                     Assert.IsNotNull(selectedBinding);
-                    Assert.AreEqual("SelectedActivity", selectedBinding.Path.Path);
+                    Assert.AreEqual(
+                        "DataContext.SelectedActivityDisplayRow",
+                        selectedBinding.Path.Path);
                 }
                 finally
                 {

@@ -54,7 +54,12 @@ public sealed class JobRowViewModel : ObservableObject
         Array.Empty<LiveActivityHistoryRowViewModel>();
     private IReadOnlyList<ActivityHistoryMessageGroup> _activityHistoryMessageGroups =
         Array.Empty<ActivityHistoryMessageGroup>();
+    private IReadOnlyList<LiveActivityHistoryRowViewModel> _otherActivityRows =
+        Array.Empty<LiveActivityHistoryRowViewModel>();
     private LiveActivityHistoryRowViewModel? _selectedActivity;
+    private ActivityHistoryRowIdentity? _selectedDisplayRowKey;
+    private bool _isDisplaySelectionPending;
+    private bool _settingDisplayRow;
     private string _selectedActivityText = "N/A";
     private bool _selectedActivityTextIsComplete;
     private string _selectedActivityCompletenessText = "No activity selected.";
@@ -222,8 +227,10 @@ public sealed class JobRowViewModel : ObservableObject
 
     /// <summary>
     /// Explicit message/part membership for the grouped history presentation.
-    /// The current history producer leaves this empty until it can supply
-    /// verified associations; presentation does not infer them.
+    /// Groups are built only from the post-continuity, de-duplicated projected
+    /// rows by exact job/session/message; the representative parent is the first
+    /// text row under the shared history policy. Presentation never infers
+    /// membership from timestamps, paths, or shared text.
     /// </summary>
     public IReadOnlyList<ActivityHistoryMessageGroup> ActivityHistoryMessageGroups
     {
@@ -233,6 +240,17 @@ public sealed class JobRowViewModel : ObservableObject
             ArgumentNullException.ThrowIfNull(value);
             SetProperty(ref _activityHistoryMessageGroups, value);
         }
+    }
+
+    /// <summary>
+    /// Eligible projected rows whose exact message group has no retained text
+    /// representative. They stay top-level "Other" rows; a row that belongs to a
+    /// grouped message is never also exposed here.
+    /// </summary>
+    public IReadOnlyList<LiveActivityHistoryRowViewModel> OtherActivityRows
+    {
+        get => _otherActivityRows;
+        private set => SetProperty(ref _otherActivityRows, value);
     }
 
     public bool HasLiveActivityHistory => _liveActivityHistory.Count > 0;
@@ -284,7 +302,83 @@ public sealed class JobRowViewModel : ObservableObject
                 return;
             }
 
+            // A direct activity selection replaces a retained display-row choice.
+            // Display-driven selection (grid binding) sets the flag because it
+            // intentionally keeps a parent or child row object distinct from the
+            // activity identity.
+            if (value is not null &&
+                !_settingDisplayRow &&
+                !ReferenceEquals(_selectedActivity, value))
+            {
+                _selectedDisplayRowKey = null;
+                _isDisplaySelectionPending = false;
+            }
+
             SetSelectedActivityValue(value);
+        }
+    }
+
+    /// <summary>
+    /// Exact parent/child display-row identity retained independently of the
+    /// activity row object. A parent uses message identity; a child uses its
+    /// physical part identity, so a representative change or row rebuild does
+    /// not silently transfer or clear the user's child selection.
+    /// </summary>
+    public ActivityHistoryRowIdentity? SelectedDisplayRowKey => _selectedDisplayRowKey;
+
+    /// <summary>
+    /// True while the exact selected child row is temporarily hidden by a
+    /// collapsed/filtered view. The child key stays stable and is restored when
+    /// the row becomes visible again.
+    /// </summary>
+    public bool IsDisplaySelectionPending => _isDisplaySelectionPending;
+
+    internal void SelectActivityDisplayRow(ActivityHistoryDisplayRowViewModel row)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        _selectedDisplayRowKey = row.Key;
+        _isDisplaySelectionPending = false;
+        _settingDisplayRow = true;
+        try
+        {
+            SelectedActivity = row.Activity;
+        }
+        finally
+        {
+            _settingDisplayRow = false;
+        }
+    }
+
+    internal void MarkDisplaySelectionPending() => _isDisplaySelectionPending = true;
+
+    internal void ClearDisplaySelectionPending() => _isDisplaySelectionPending = false;
+
+    internal void DiscardPendingDisplaySelection()
+    {
+        if (_isDisplaySelectionPending)
+        {
+            _selectedDisplayRowKey = null;
+            _isDisplaySelectionPending = false;
+        }
+    }
+
+    internal void ClearSelectedDisplayRowKey()
+    {
+        _selectedDisplayRowKey = null;
+        _isDisplaySelectionPending = false;
+    }
+
+    internal void ClearSelectedActivityForPresentation()
+    {
+        ClearSelectedDisplayRowKey();
+        _settingDisplayRow = true;
+        try
+        {
+            SetSelectedActivityValue(null);
+        }
+        finally
+        {
+            _settingDisplayRow = false;
         }
     }
 
@@ -349,6 +443,35 @@ public sealed class JobRowViewModel : ObservableObject
         {
             OnPropertyChanged(nameof(SelectedActivity));
             return;
+        }
+
+        // A grouped child and its parent represent the same physical entry
+        // identity. When collapse/filter hides the child copy, keep the same
+        // selected source identity by moving to the still-visible row (the
+        // parent representative when one exists) without a source read.
+        if (_selectedActivity is { } hidden)
+        {
+            var identity = LiveActivitySelectionIdentity.FromEntry(hidden.Entry);
+            var sameIdentity = visibleRows.FirstOrDefault(row =>
+                LiveActivitySelectionIdentity.FromEntry(row.Entry).Equals(identity));
+            if (sameIdentity is not null)
+            {
+                SetSelectedActivityValue(sameIdentity, notifySelectionChanged: false);
+                return;
+            }
+
+            // A selected text child may be collapsed under a visible message
+            // parent. Keeping its exact source identity avoids a spurious
+            // selection change or source read merely because a group closed.
+            // Non-text children fall through so a tool/step row can never keep
+            // the Response panel on hidden non-text evidence.
+            var message = MessageKey(hidden.Entry);
+            if (hidden.IsTextActivity &&
+                visibleRows.Any(row => MessageKey(row.Entry) == message))
+            {
+                OnPropertyChanged(nameof(SelectedActivity));
+                return;
+            }
         }
 
         SetSelectedActivityValue(visibleRows[0], notifySelectionChanged: false);
@@ -475,6 +598,12 @@ public sealed class JobRowViewModel : ObservableObject
     {
         var previousKey = _selectedActivityLoadKey;
         var nextKey = value is null ? (LiveActivityLoadKey?)null : LiveActivityLoadKey.FromRow(value);
+        if (value is null)
+        {
+            _selectedDisplayRowKey = null;
+            _isDisplaySelectionPending = false;
+        }
+
         _selectedActivity = value;
 
         if (value is null)
@@ -1186,6 +1315,11 @@ public sealed class JobRowViewModel : ObservableObject
         var previousIdentity = _selectedActivity is { } previous
             ? LiveActivitySelectionIdentity.FromEntry(previous.Entry)
             : (LiveActivitySelectionIdentity?)null;
+        var previousDisplayKey = _selectedDisplayRowKey;
+        var previousExpanded = _activityHistoryMessageGroups
+            .Where(group => group.DisplayRow.IsExpanded)
+            .Select(group => MessageIdentity(group.Message.Entry))
+            .ToHashSet(StringComparer.Ordinal);
         var entries = LiveActivityHistoryPolicy.Order(
             snapshot.LiveActivity.History.Where(entry =>
                 string.Equals(entry.JobId, snapshot.JobId, StringComparison.Ordinal)));
@@ -1202,8 +1336,11 @@ public sealed class JobRowViewModel : ObservableObject
             ReportedStatusPresentation.ResolveJobReportedStatus(snapshot);
         var jobActive = _monitoringActive && snapshot.Status == ForgeJobStatus.Running;
         var latestLifecycle = snapshot.LiveActivity.LatestLifecycleByteOffset;
-        var rows = projected
-            .Select(item => new LiveActivityHistoryRowViewModel(
+
+        LiveActivityHistoryRowViewModel CreateRow(
+            ProjectedActivity item,
+            bool isGroupedChild) =>
+            new(
                 item.Entry,
                 snapshot.ReportedStatus,
                 _monitoringActive && MatchesCurrentActiveTarget(snapshot, doing, item.Entry),
@@ -1211,20 +1348,95 @@ public sealed class JobRowViewModel : ObservableObject
                 MessageDurationFor(snapshot, item.Entry),
                 item.Step,
                 snapshot.ObservedAt,
-                IsDefensiblyActiveStep(item, jobActive, latestLifecycle)))
+                IsDefensiblyActiveStep(item, jobActive, latestLifecycle),
+                isGroupedChild);
+
+        // Canonical rows stay the flat job history used for selection restore
+        // and V1-compatible counts. Grouped children are separate row objects so
+        // only a child text part can use its same-record part interval.
+        var rows = projected.Select(item => CreateRow(item, isGroupedChild: false)).ToArray();
+
+        // Partition once by exact job/session/message. Each list preserves the
+        // projected source order; group construction never rescans all rows per
+        // message on the dispatcher refresh path.
+        var members = new Dictionary<
+            (string, string, string),
+            List<(ProjectedActivity Item, int Index)>>();
+        var representatives = new Dictionary<(string, string, string), int>();
+        for (var index = 0; index < projected.Count; index++)
+        {
+            var item = projected[index];
+            var key = MessageKey(item.Entry);
+            if (!members.TryGetValue(key, out var memberList))
+            {
+                memberList = new List<(ProjectedActivity, int)>();
+                members[key] = memberList;
+            }
+
+            memberList.Add((item, index));
+
+            if (LiveActivityHistoryProjection.ResolveKind(item.Entry) == LiveActivityKind.Text &&
+                !representatives.ContainsKey(key))
+            {
+                representatives[key] = index;
+            }
+        }
+
+        var groups = new List<ActivityHistoryMessageGroup>(representatives.Count);
+        foreach (var pair in representatives.OrderBy(pair => pair.Value))
+        {
+            var parent = rows[pair.Value];
+            var children = members[pair.Key]
+                .Select(member => CreateRow(member.Item, isGroupedChild: true))
+                .OrderBy(child => child.StartedSortTimestamp is null)
+                .ThenBy(child => child.StartedSortTimestamp ?? DateTimeOffset.MinValue)
+                .ThenBy(child => child.Entry.ByteOffset)
+                .ThenBy(child => child.Entry.SessionId, StringComparer.Ordinal)
+                .ThenBy(child => child.Entry.MessageId, StringComparer.Ordinal)
+                .ThenBy(child => child.Entry.PartId, StringComparer.Ordinal)
+                .ToArray();
+            var group = new ActivityHistoryMessageGroup(parent, children);
+            group.DisplayRow.IsExpanded =
+                previousExpanded.Contains(MessageIdentity(parent.Entry));
+            groups.Add(group);
+        }
+
+        var groupedMessages = representatives.Keys.ToHashSet();
+        var otherRows = projected
+            .Select((item, index) => (item, index))
+            .Where(pair => !groupedMessages.Contains(MessageKey(pair.item.Entry)))
+            .Select(pair => rows[pair.index])
             .ToArray();
+
         _liveActivityHistory = rows;
+        OtherActivityRows = otherRows;
+        ActivityHistoryMessageGroups = groups;
         // Reset the ItemsSource before restoring selection so a DataGrid that
         // clears SelectedItem on a collection reset cannot erase this job's
         // independent activity choice.
         OnPropertyChanged(nameof(LiveActivityHistory));
         OnPropertyChanged(nameof(HasLiveActivityHistory));
 
-        var selected = previousIdentity is { } identity
-            ? rows.FirstOrDefault(row =>
-                LiveActivitySelectionIdentity.FromEntry(row.Entry).Equals(identity))
+        var selected = previousDisplayKey is { } displayKey
+            ? FindActivityForDisplayRowKey(displayKey, groups, otherRows)
             : null;
-        selected ??= rows.FirstOrDefault();
+        if (selected is null)
+        {
+            selected = previousIdentity is { } identity
+                ? rows.FirstOrDefault(row =>
+                    LiveActivitySelectionIdentity.FromEntry(row.Entry).Equals(identity))
+                : null;
+            selected ??= rows.FirstOrDefault();
+            // A key whose exact row disappeared is not reused for a different
+            // part; the next display refresh may infer a visible parent instead.
+            _selectedDisplayRowKey = null;
+            _isDisplaySelectionPending = false;
+        }
+        else if (previousDisplayKey is null)
+        {
+            _isDisplaySelectionPending = false;
+        }
+
         if (!ReferenceEquals(_selectedActivity, selected))
         {
             SetSelectedActivityValue(selected);
@@ -1232,6 +1444,67 @@ public sealed class JobRowViewModel : ObservableObject
 
         ActivityHistoryUpdated?.Invoke(this, EventArgs.Empty);
     }
+
+    private static LiveActivityHistoryRowViewModel? FindActivityForDisplayRowKey(
+        ActivityHistoryRowIdentity key,
+        IReadOnlyList<ActivityHistoryMessageGroup> groups,
+        IReadOnlyList<LiveActivityHistoryRowViewModel> otherRows)
+    {
+        if (key.IsMessage)
+        {
+            foreach (var group in groups)
+            {
+                if (MatchesMessageIdentity(key, group.Message.Entry))
+                {
+                    return group.Message;
+                }
+            }
+
+            return null;
+        }
+
+        foreach (var group in groups)
+        {
+            foreach (var child in group.Children)
+            {
+                if (MatchesPartIdentity(key, child.Entry))
+                {
+                    return child;
+                }
+            }
+        }
+
+        foreach (var row in otherRows)
+        {
+            if (MatchesPartIdentity(key, row.Entry))
+            {
+                return row;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool MatchesMessageIdentity(
+        ActivityHistoryRowIdentity key,
+        LiveActivityHistoryEntry entry) =>
+        string.Equals(key.JobId, entry.JobId, StringComparison.Ordinal) &&
+        string.Equals(key.SourcePath, entry.SourcePath, StringComparison.Ordinal) &&
+        string.Equals(key.SessionId, entry.SessionId, StringComparison.Ordinal) &&
+        string.Equals(key.MessageId, entry.MessageId, StringComparison.Ordinal);
+
+    private static bool MatchesPartIdentity(
+        ActivityHistoryRowIdentity key,
+        LiveActivityHistoryEntry entry) =>
+        MatchesMessageIdentity(key, entry) &&
+        string.Equals(key.PartId, entry.PartId, StringComparison.Ordinal);
+
+    private static (string JobId, string SessionId, string MessageId) MessageKey(
+        LiveActivityHistoryEntry entry) =>
+        (entry.JobId, entry.SessionId, entry.MessageId);
+
+    private static string MessageIdentity(LiveActivityHistoryEntry entry) =>
+        entry.JobId + "\n" + entry.SessionId + "\n" + entry.MessageId;
 
     /// <summary>
     /// An unpaired step start may be presented as active only when the job is

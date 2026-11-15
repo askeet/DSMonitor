@@ -327,7 +327,8 @@ public static class JobLiveActivityReader
                     LiveActivityHistoryEntry? HistoryEntry(
                         string text,
                         string kind,
-                        bool toolRecord)
+                        bool toolRecord,
+                        bool textRecord = false)
                     {
                         // History identity must be exact and displayable; a
                         // missing/unsafe part id cannot be de-duplicated.
@@ -357,6 +358,15 @@ public static class JobLiveActivityReader
                             toolStart = toolStartMilliseconds;
                         }
 
+                        long? textStart = null;
+                        long? textEnd = null;
+                        if (textRecord &&
+                            TryGetTextInterval(part, out var textStartMilliseconds, out var textEndMilliseconds))
+                        {
+                            textStart = textStartMilliseconds;
+                            textEnd = textEndMilliseconds;
+                        }
+
                         return new LiveActivityHistoryEntry(
                             job.JobId,
                             session!,
@@ -373,7 +383,9 @@ public static class JobLiveActivityReader
                         {
                             DurationStartUnixMilliseconds = durationStart,
                             DurationEndUnixMilliseconds = durationEnd,
-                            ToolStartUnixMilliseconds = toolStart
+                            ToolStartUnixMilliseconds = toolStart,
+                            TextStartUnixMilliseconds = textStart,
+                            TextEndUnixMilliseconds = textEnd
                         };
                     }
                     void RememberHistory(LiveActivityHistoryEntry? entry)
@@ -425,7 +437,8 @@ public static class JobLiveActivityReader
                         RememberHistory(HistoryEntry(
                             text,
                             verifiedAssistant ? AssistantTextKind : RolelessTextKind,
-                            toolRecord: false));
+                            toolRecord: false,
+                            textRecord: true));
                     }
                     else if (isTool)
                     {
@@ -1867,6 +1880,42 @@ public static class JobLiveActivityReader
                TryGetInt64(time, "start", out startMilliseconds) &&
                startMilliseconds >= 0 &&
                startMilliseconds <= MaxUnixMilliseconds;
+    }
+
+    /// <summary>
+    /// Reads a text part's <c>time.start/end</c> only as one ordered pair from
+    /// the same record. A missing, duplicated, malformed, negative, unordered,
+    /// or non-representable value yields no part interval rather than a partial
+    /// or inferred one. The record's root timestamp remains the provenance time.
+    /// </summary>
+    private static bool TryGetTextInterval(
+        JsonElement part,
+        out long startMilliseconds,
+        out long endMilliseconds)
+    {
+        startMilliseconds = 0;
+        endMilliseconds = 0;
+        if (!TryGetSingleObject(part, "time", out var time) ||
+            !TryGetInt64(time, "start", out startMilliseconds) ||
+            !TryGetInt64(time, "end", out endMilliseconds))
+        {
+            startMilliseconds = 0;
+            endMilliseconds = 0;
+            return false;
+        }
+
+        if (startMilliseconds < 0 ||
+            startMilliseconds > MaxUnixMilliseconds ||
+            endMilliseconds < startMilliseconds ||
+            endMilliseconds > MaxUnixMilliseconds ||
+            endMilliseconds - startMilliseconds > TimeSpan.MaxValue.TotalMilliseconds)
+        {
+            startMilliseconds = 0;
+            endMilliseconds = 0;
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>

@@ -106,6 +106,18 @@ public sealed record LiveActivityHistoryEntry(
     /// </summary>
     public long? ToolStartUnixMilliseconds { get; init; }
 
+    /// <summary>
+    /// Validated text-part <c>time.start</c> in Unix milliseconds. It is set
+    /// only together with <see cref="TextEndUnixMilliseconds"/> when both values
+    /// came from the same text record and form an ordered, representable pair.
+    /// It is used only by a grouped child text row; the parent representative
+    /// keeps message/event timing. Tool and step timing are never affected.
+    /// </summary>
+    public long? TextStartUnixMilliseconds { get; init; }
+
+    /// <summary>Validated text-part <c>time.end</c> paired with the start above.</summary>
+    public long? TextEndUnixMilliseconds { get; init; }
+
     /// <summary>Exact activity class of this record.</summary>
     public LiveActivityKind ActivityKind { get; init; }
 
