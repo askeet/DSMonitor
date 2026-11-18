@@ -247,7 +247,7 @@
                                 Margin="0,0,6,0"
                                 Style="{StaticResource ActivitySpinner}"
                                 ToolTip="Job-scoped activity/lifecycle evidence; not proof of worker liveness."
-                                Visibility="{Binding IsActive, Converter={StaticResource BoolToVisibility}}" />
+                                Visibility="{Binding IsJobActivitySpinnerVisible, Converter={StaticResource BoolToVisibility}}" />
                 <TextBlock Grid.Column="1"
                            Text="{Binding ReportedStatusCellText}"
                            Style="{StaticResource JobCellText}"
@@ -761,6 +761,7 @@
                                   Style="{StaticResource JobsGrid}"
                                   ItemsSource="{Binding JobsView}"
                                   SelectedItem="{Binding SelectedJob, Mode=TwoWay}"
+                                  PreviewKeyDown="SelectableDataGrid_PreviewKeyDown"
                                   Margin="5,0,5,0"
                                   AutomationProperties.Name="Forge jobs">
                             <DataGrid.Columns>
@@ -780,7 +781,7 @@
 
                                 <DataGridTextColumn Header="Started"
                                                     Binding="{Binding StartedText}"
-                                                    Width="96"
+                                                    Width="116"
                                                     ElementStyle="{StaticResource JobCellText}"
                                                     HeaderStyle="{StaticResource JobColumnHeaderStyle}" />
 
@@ -963,12 +964,21 @@
                                                        FontWeight="SemiBold"
                                                        VerticalAlignment="Center" />
                                         </StackPanel>
-                                        <Button x:Name="OriginalRequestShowAllButton"
-                                                Grid.Column="2"
-                                                Content="Show All"
-                                                Style="{StaticResource GhostButton}"
-                                                Padding="8,2"
-                                                Click="OriginalRequestShowAllButton_Click" />
+                                        <StackPanel Grid.Column="2"
+                                                    Orientation="Horizontal"
+                                                    VerticalAlignment="Center">
+                                            <Button x:Name="OriginalRequestCopyAllButton"
+                                                    Content="Copy All"
+                                                    Style="{StaticResource GhostButton}"
+                                                    Padding="8,2"
+                                                    Margin="0,0,6,0"
+                                                    Click="OriginalRequestCopyAllButton_Click" />
+                                            <Button x:Name="OriginalRequestShowAllButton"
+                                                    Content="Show All"
+                                                    Style="{StaticResource GhostButton}"
+                                                    Padding="8,2"
+                                                    Click="OriginalRequestShowAllButton_Click" />
+                                        </StackPanel>
                                     </Grid>
 
                                     <TextBox x:Name="OriginalRequestTextBox"
@@ -1009,7 +1019,7 @@
                                             <ContentControl Margin="0,0,6,0"
                                                             Style="{StaticResource ActivitySpinner}"
                                                             ToolTip="Job-scoped activity/lifecycle evidence; not proof of worker liveness."
-                                                            Visibility="{Binding IsActive, Converter={StaticResource BoolToVisibility}}" />
+                                                            Visibility="{Binding IsJobActivitySpinnerVisible, Converter={StaticResource BoolToVisibility}}" />
                                             <CheckBox Style="{StaticResource ActivityHistoryFilterCheckBox}"
                                                   IsChecked="{Binding DataContext.ShowActivityTextFilter, RelativeSource={RelativeSource AncestorType={x:Type Window}}, Mode=TwoWay}"
                                                   AutomationProperties.Name="Text activity filter">
@@ -1051,6 +1061,7 @@
                                                   CanUserSortColumns="True"
                                                   ItemsSource="{Binding DataContext.ActivityHistoryDisplayRows, RelativeSource={RelativeSource AncestorType={x:Type Window}}}"
                                                   SelectedItem="{Binding DataContext.SelectedActivityDisplayRow, RelativeSource={RelativeSource AncestorType={x:Type Window}}, Mode=TwoWay}"
+                                                  PreviewKeyDown="SelectableDataGrid_PreviewKeyDown"
                                                   SelectionChanged="LiveActivityHistoryGrid_SelectionChanged"
                                                   Sorting="LiveActivityHistoryGrid_Sorting"
                                                   AutomationProperties.Name="Live activity history">
@@ -1198,12 +1209,21 @@
                                                    Margin="12,0,0,0"
                                                    TextTrimming="CharacterEllipsis"
                                                    Visibility="{Binding SelectedActivityTextIsComplete, Converter={StaticResource InverseBoolToVisibility}}" />
-                                        <Button x:Name="SelectedMessageShowAllButton"
-                                                Grid.Column="2"
-                                                Content="Show All"
-                                                Style="{StaticResource GhostButton}"
-                                                Padding="8,2"
-                                                Click="SelectedMessageShowAllButton_Click" />
+                                        <StackPanel Grid.Column="2"
+                                                    Orientation="Horizontal"
+                                                    VerticalAlignment="Center">
+                                            <Button x:Name="SelectedMessageCopyAllButton"
+                                                    Content="Copy All"
+                                                    Style="{StaticResource GhostButton}"
+                                                    Padding="8,2"
+                                                    Margin="0,0,6,0"
+                                                    Click="SelectedMessageCopyAllButton_Click" />
+                                            <Button x:Name="SelectedMessageShowAllButton"
+                                                    Content="Show All"
+                                                    Style="{StaticResource GhostButton}"
+                                                    Padding="8,2"
+                                                    Click="SelectedMessageShowAllButton_Click" />
+                                        </StackPanel>
                                     </Grid>
 
                                     <TextBox x:Name="SelectedActivityTextBox"

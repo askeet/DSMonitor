@@ -89,6 +89,27 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SelectableDataGrid_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (sender is not DataGrid grid ||
+            e.Key is not (Key.Up or Key.Down) ||
+            Keyboard.Modifiers != ModifierKeys.None ||
+            grid.Items.Count == 0)
+        {
+            return;
+        }
+
+        var direction = e.Key == Key.Down ? 1 : -1;
+        var targetIndex = grid.SelectedIndex < 0
+            ? (direction > 0 ? 0 : grid.Items.Count - 1)
+            : Math.Clamp(grid.SelectedIndex + direction, 0, grid.Items.Count - 1);
+
+        e.Handled = true;
+        grid.SelectedIndex = targetIndex;
+        grid.ScrollIntoView(grid.Items[targetIndex]);
+        grid.Focus();
+    }
+
     private void LiveActivityHistoryGrid_Sorting(object sender, DataGridSortingEventArgs e)
     {
         // Only Duration has a model-level grouped sort. Sorting a flat grid
@@ -123,6 +144,20 @@ public partial class MainWindow : Window
         // Set the arrow after the grouped projection refresh so the ItemsSource
         // replacement cannot clear the column's sort state.
         e.Column.SortDirection = direction;
+    }
+
+    private void OriginalRequestCopyAllButton_Click(object sender, RoutedEventArgs e) =>
+        CopyAllText(OriginalRequestTextBox.Text);
+
+    private void SelectedMessageCopyAllButton_Click(object sender, RoutedEventArgs e) =>
+        CopyAllText(SelectedActivityTextBox.Text);
+
+    private static void CopyAllText(string text)
+    {
+        if (!string.IsNullOrEmpty(text))
+        {
+            Clipboard.SetText(text);
+        }
     }
 
     private void OriginalRequestShowAllButton_Click(object sender, RoutedEventArgs e) =>

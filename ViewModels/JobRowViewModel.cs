@@ -127,6 +127,19 @@ public sealed class JobRowViewModel : ObservableObject
     /// </summary>
     public bool IsActive => IsObservedActive(_currentTime);
 
+    /// <summary>
+    /// Jobs-table activity indicator. In addition to observed activity, keep
+    /// the indicator visible when the job's reported response is unavailable
+    /// and the bounded activity history has no message groups.
+    /// </summary>
+    public bool IsJobActivitySpinnerVisible =>
+        IsActive ||
+        HasUnavailableResponseWithoutMessages;
+
+    private bool HasUnavailableResponseWithoutMessages =>
+        string.Equals(ReportedStatusCellText, "N/A", StringComparison.Ordinal) &&
+        ActivityHistoryMessageGroups.Count == 0;
+
     private bool IsObservedActive(DateTimeOffset now) =>
         _monitoringActive &&
         (_status.IsActive() || HasFreshUnknownJobActivity(now) || HasFreshLifecycleEvidence(now)) &&
@@ -495,6 +508,7 @@ public sealed class JobRowViewModel : ObservableObject
         if (wasActive != IsActive)
         {
             OnPropertyChanged(nameof(IsActive));
+            OnPropertyChanged(nameof(IsJobActivitySpinnerVisible));
         }
 
         RefreshDuration(_currentTime);
@@ -639,6 +653,7 @@ public sealed class JobRowViewModel : ObservableObject
         OnPropertyChanged(nameof(SelectedActivityText));
         OnPropertyChanged(nameof(SelectedActivityTextIsComplete));
         OnPropertyChanged(nameof(SelectedActivityCompletenessText));
+        OnPropertyChanged(nameof(IsJobActivitySpinnerVisible));
     }
 
     /// <summary>
@@ -856,6 +871,7 @@ public sealed class JobRowViewModel : ObservableObject
             _status = snapshot.Status;
             OnPropertyChanged(nameof(StatusText));
             OnPropertyChanged(nameof(IsActive));
+            OnPropertyChanged(nameof(IsJobActivitySpinnerVisible));
             OnPropertyChanged(nameof(ForgeStatusLabel));
         }
 
@@ -899,6 +915,7 @@ public sealed class JobRowViewModel : ObservableObject
                      nameof(DoneText), nameof(DoingProvenance), nameof(DoneProvenance),
                      nameof(LiveActivityNotice), nameof(LiveUpdatedText), nameof(StatusProvenance),
                      nameof(IsActive),
+                     nameof(IsJobActivitySpinnerVisible),
                      nameof(ReportedStatusText), nameof(ReportedStatusTooltip),
                      nameof(ReportedStatusCellText), nameof(ReportedStatusCellTooltip) })
             OnPropertyChanged(property);
@@ -953,8 +970,8 @@ public sealed class JobRowViewModel : ObservableObject
 
     /// <summary>
     /// Advances the table's live Duration without reading logs. The shared
-    /// dispatcher clock calls this about once per second; finished and
-    /// observed-span rows are left frozen.
+    /// dispatcher clock calls this about once per second. Duration advances
+    /// while the activity indicator is visible and freezes otherwise.
     /// </summary>
     public void RefreshDuration(DateTimeOffset now)
     {
@@ -964,6 +981,7 @@ public sealed class JobRowViewModel : ObservableObject
         if (wasActive != isActive)
         {
             OnPropertyChanged(nameof(IsActive));
+            OnPropertyChanged(nameof(IsJobActivitySpinnerVisible));
         }
 
         if (_durationStartedAt is not { } started)
@@ -971,7 +989,7 @@ public sealed class JobRowViewModel : ObservableObject
             return;
         }
 
-        if (isActive)
+        if (IsJobActivitySpinnerVisible)
         {
             _durationBasis = JobDurationBasis.Live;
             SetLiveDuration(started, now);
@@ -1416,6 +1434,7 @@ public sealed class JobRowViewModel : ObservableObject
         // independent activity choice.
         OnPropertyChanged(nameof(LiveActivityHistory));
         OnPropertyChanged(nameof(HasLiveActivityHistory));
+        OnPropertyChanged(nameof(IsJobActivitySpinnerVisible));
 
         var selected = previousDisplayKey is { } displayKey
             ? FindActivityForDisplayRowKey(displayKey, groups, otherRows)

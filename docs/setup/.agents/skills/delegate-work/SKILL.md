@@ -13,11 +13,29 @@ For software development, including debugging, implementation, testing, code aud
 
 For noncoding delegation, use these mechanics without imposing the full coding workflow. Honor the user's requested provider and scope, source-sharing boundaries, and platform approvals. Never infer authorization for installations, system/security changes, elevation, destructive operations, or unrelated private data from a delegation request. Report missing authorization or readiness rather than bypassing it.
 
+## General development rules
+
+- Preserve existing behavior and all user changes unless explicitly authorized otherwise.
+- Make focused changes using existing patterns; avoid unrelated refactoring.
+- Fix root causes rather than weakening tests or hard-coding test cases.
+- Never install dependencies, change system/security settings, elevate privileges, or commit without required approval.
+- Validate affected behavior with relevant tests; preserve existing regression coverage.
+- Report actual checks, failures, limitations, and unverified behavior.
+
+
 ## Prepare a supported call
 
 Inspect the current supported delegation tool schema and accessible configuration/capabilities before use; reuse applicable verified evidence. For coding tasks, follow the controlling skill's readiness and root `AGENTS.md` authorization process rather than redefining it here. Do not use a paid worker call as a capability or authentication probe. Supply explicit supported `model`, `directory`, `agent`, or other selections when the controlling workflow requires them; never omit them merely because a default exists or assume a default is cheap, free, authenticated, or authorized. Verify the worker's actual access to task files instead of assuming it can read the whole project. If a user-requested provider or necessary capability is unavailable, report that fact rather than silently substituting another provider or native implementation.
 
-Give the worker a bounded task with goal, acceptance criteria, allowed paths, exclusions, applicable contracts, checks, and evidence to return. Prefer paths and the minimum necessary context over source dumps, conversation histories, or unrelated logs. State whether the assignment is read-only or permits edits. For surveys and audits, ask for structured, path-backed findings, including relevant absences and uncertainty. Ground important claims in source and spot-check them before adopting the conclusion; for coding, the controlling workflow owns the verdict and any required independent QA.
+
+For coding tasks, use the handoff defined by `cost-efficient-coding` without duplicating its workflow instructions.
+
+For noncoding tasks, provide a bounded goal, acceptance criteria, authorized scope, exclusions, checks, and expected evidence.
+
+Prefer relevant paths and concise context over source dumps, conversation histories, or unrelated logs.
+
+For audits, request structured, path-backed findings and uncertainties. Verify important claims before relying on them; coding QA and acceptance remain with the controlling workflow.
+
 
 ## Execute, track, and continue
 
