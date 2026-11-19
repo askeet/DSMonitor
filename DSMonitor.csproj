@@ -10,6 +10,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Include="docs\setup\.agents\skills\cost-efficient-coding\references\desktop-ui.md" />
+    <None Include="docs\setup\.agents\skills\cost-efficient-coding\references\mstest-windows.md" />
+    <None Include="docs\setup\.agents\skills\cost-efficient-coding\SKILL.md" />
+    <None Include="docs\setup\.agents\skills\delegate-work\SKILL.md" />
+    <None Include="docs\setup\.config\opencode\agents\deepseek-bounded.md" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.14" />
   </ItemGroup>
 
