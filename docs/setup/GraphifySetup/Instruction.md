@@ -17,18 +17,12 @@ Keep the Graphify setup files in a separate folder outside your projects:
 ```text
 
 GraphifySetup/
-
-├── Graphify\_Codex\_Windows.bat
-
-├── Graphify\_Codex\_Setup.md
-
+├── Graphify_Codex_Windows.bat
+├── Graphify_Codex_Setup.md
 ├── AGENTS.md
-
 └── .codex/
-
-&#x20;   ├── skills/graphify/
-
-&#x20;   └── hooks.json
+    ├── skills/graphify/
+    └── hooks.json
 
 ```
 
@@ -74,8 +68,7 @@ YourProject/
 
 
 
-\*\*Important:\*\* Preserve existing `AGENTS.md` and `.codex/` configurations. Merge Graphify instructions without overwriting other agent rules. Ensure that `AGENTS.md` contains complete Graphify usage and maintenance instructions, not just the `## Graphify` heading.
-
+\*\*Important:\*\* The setup must safely merge Graphify into the target project's existing AGENTS.md and .codex/ configuration, preserving all unrelated instructions, skills, and hooks. If AGENTS.md contains only a ## Graphify heading, populate it with the complete Graphify usage, freshness-check, and incremental-update rules. Never overwrite existing project configuration.
 
 
 The `.bat` script and setup documentation remain in the shared `GraphifySetup` folder for reuse across projects.

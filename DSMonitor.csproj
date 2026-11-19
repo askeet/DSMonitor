@@ -10,6 +10,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Content Include=".codex\hooks.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include=".codex\skills\graphify\.graphify_version" />
+    <None Include=".codex\skills\graphify\references\query.md" />
+    <None Include=".codex\skills\graphify\references\update.md" />
+    <None Include=".codex\skills\graphify\SKILL.md" />
     <None Include="docs\setup\.agents\skills\cost-efficient-coding\references\desktop-ui.md" />
     <None Include="docs\setup\.agents\skills\cost-efficient-coding\references\mstest-windows.md" />
     <None Include="docs\setup\.agents\skills\cost-efficient-coding\SKILL.md" />
