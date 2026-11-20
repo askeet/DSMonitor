@@ -16,6 +16,8 @@ rem GraphifySetup/
 rem   Graphify_Codex_Windows.bat
 rem   Graphify_Codex_Setup.md
 rem   AGENTS.md
+rem   Merge-ProjectInstructions.ps1
+rem   .github/copilot-instructions.md
 rem   .codex/
 rem     hooks.json
 rem     skills/
@@ -65,7 +67,7 @@ if not "%MODE%"=="" goto USAGE
 
 echo.
 echo ================================================
-echo       Graphify for Codex CLI - Windows
+echo       Graphify for Codex and GitHub Copilot - Windows
 echo ================================================
 echo.
 echo 1. CHECK existing Graphify configuration
@@ -127,7 +129,7 @@ if errorlevel 1 (
 
 echo.
 echo ======================================================
-echo Graphify for Codex CLI
+echo Graphify for Codex and GitHub Copilot
 echo ======================================================
 echo Mode:    %MODE%
 echo Project: "%CD%"
@@ -299,7 +301,7 @@ call :SETUP_HOOK
 
 if "%HAS_FAIL%"=="1" goto CHECK_INTEGRATION
 
-call :SETUP_AGENTS
+call :SETUP_INSTRUCTIONS
 
 if "%HAS_FAIL%"=="1" goto CHECK_INTEGRATION
 
@@ -453,6 +455,7 @@ if defined CLI_VERSION (
 
 exit /b 0
 
+
 rem ============================================================
 rem Setup Codex hook
 rem ============================================================
@@ -525,177 +528,23 @@ if errorlevel 1 (
 exit /b 0
 
 rem ============================================================
-rem Setup AGENTS.md
+rem Merge the Codex and Copilot instruction sections
 rem ============================================================
 
-:SETUP_AGENTS
+:MERGE_INSTRUCTIONS
 
-if not exist "%KIT%AGENTS.md" (
-    echo [FAIL] Setup package AGENTS.md template missing.
-    set "HAS_FAIL=1"
-    exit /b 1
-)
+set "GRAPHIFY_PS=powershell.exe"
+where pwsh.exe >nul 2>&1
+if not errorlevel 1 set "GRAPHIFY_PS=pwsh.exe"
 
-rem Require the complete template, not only a heading.
-findstr /I /C:"## Graphify" "%KIT%AGENTS.md" >nul 2>&1
+"%GRAPHIFY_PS%" -NoProfile -File "%KIT%Merge-ProjectInstructions.ps1" -Mode %~1
+exit /b %ERRORLEVEL%
 
-if errorlevel 1 goto BAD_TEMPLATE
 
-findstr /I /C:"graphify update" "%KIT%AGENTS.md" >nul 2>&1
+:SETUP_INSTRUCTIONS
 
-if errorlevel 1 goto BAD_TEMPLATE
-
-findstr /I /C:"graphify query" "%KIT%AGENTS.md" >nul 2>&1
-
-if errorlevel 1 goto BAD_TEMPLATE
-
-findstr /I /C:"Get-Command graphify" "%KIT%AGENTS.md" >nul 2>&1
-
-if errorlevel 1 goto BAD_TEMPLATE
-
-goto TEMPLATE_OK
-
-:BAD_TEMPLATE
-
-echo [FAIL] Bundled AGENTS.md contains incomplete Graphify rules.
-echo        Expected queries, updates, and Windows CLI fallback.
-set "HAS_FAIL=1"
-
-exit /b 1
-
-:TEMPLATE_OK
-
-if exist "AGENTS.md" goto AGENTS_EXIST
-
-echo.
-choice /C YN /M "Create project AGENTS.md with Graphify instructions?"
-
-if errorlevel 2 (
-    echo [WARN] AGENTS.md creation declined.
-    set "HAS_WARN=1"
-    exit /b 0
-)
-
-copy "%KIT%AGENTS.md" "AGENTS.md" >nul
-
-if errorlevel 1 (
-    echo [FAIL] Could not create AGENTS.md.
-    set "HAS_FAIL=1"
-    exit /b 1
-)
-
-echo [PASS] AGENTS.md created.
-
-exit /b 0
-
-rem ============================================================
-rem Existing AGENTS.md
-rem ============================================================
-
-:AGENTS_EXIST
-
-findstr /I /C:"## Graphify" "AGENTS.md" >nul 2>&1
-
-if not errorlevel 1 goto AGENTS_HAS_GRAPHIFY
-
-echo.
-echo [INFO] Existing AGENTS.md has no Graphify section.
-
-choice /C YN /M "Append Graphify rules and preserve existing instructions?"
-
-if errorlevel 2 (
-    echo [WARN] Graphify instructions not appended.
-    set "HAS_WARN=1"
-    exit /b 0
-)
-
-call :BACKUP_CONFIG
-
-if "%HAS_FAIL%"=="1" exit /b 1
-
-rem Append as UTF-8 without replacing earlier instructions.
-powershell -NoProfile -NonInteractive -Command "try { $p='AGENTS.md'; $src=Join-Path $env:KIT 'AGENTS.md'; $a=[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8); $b=[IO.File]::ReadAllText($src,[Text.Encoding]::UTF8); $e=New-Object Text.UTF8Encoding($false); [IO.File]::WriteAllText($p,$a.TrimEnd([char]13,[char]10)+[Environment]::NewLine+[Environment]::NewLine+$b.TrimStart([char]0xFEFF),$e); exit 0 } catch { exit 1 }" >nul 2>&1
-
-if errorlevel 1 (
-    echo [FAIL] Could not append Graphify instructions.
-    set "HAS_FAIL=1"
-    exit /b 1
-)
-
-echo [PASS] Graphify rules appended.
-echo [PASS] Existing project instructions preserved.
-
-exit /b 0
-
-rem ============================================================
-rem Existing Graphify section
-rem ============================================================
-
-:AGENTS_HAS_GRAPHIFY
-
-rem Detect a file containing only the empty Graphify heading.
-powershell -NoProfile -NonInteractive -Command "$s=[IO.File]::ReadAllText('AGENTS.md'); if($s.Trim([char]0xFEFF).Trim() -eq '## Graphify'){exit 0}else{exit 1}" >nul 2>&1
-
-if not errorlevel 1 goto AGENTS_ONLY_STUB
-
-rem Check for important existing instructions.
-findstr /I /C:"graphify update" "AGENTS.md" >nul 2>&1
-
-if errorlevel 1 goto AGENTS_INCOMPLETE
-
-findstr /I /C:"graphify query" "AGENTS.md" >nul 2>&1
-
-if errorlevel 1 goto AGENTS_INCOMPLETE
-
-findstr /I /C:"Get-Command graphify" "AGENTS.md" >nul 2>&1
-
-if errorlevel 1 goto AGENTS_INCOMPLETE
-
-findstr /I /C:"delegated" "AGENTS.md" >nul 2>&1
-
-if errorlevel 1 goto AGENTS_INCOMPLETE
-
-echo [PASS] Existing Graphify instructions preserved.
-
-exit /b 0
-
-:AGENTS_ONLY_STUB
-
-echo.
-echo [INFO] AGENTS.md contains only an empty Graphify heading.
-
-choice /C YN /M "Replace the empty stub with complete Graphify rules?"
-
-if errorlevel 2 (
-    echo [WARN] Empty Graphify section preserved.
-    set "HAS_WARN=1"
-    exit /b 0
-)
-
-call :BACKUP_CONFIG
-
-if "%HAS_FAIL%"=="1" exit /b 1
-
-copy /Y "%KIT%AGENTS.md" "AGENTS.md" >nul
-
-if errorlevel 1 (
-    echo [FAIL] Could not replace AGENTS.md stub.
-    set "HAS_FAIL=1"
-    exit /b 1
-)
-
-echo [PASS] Empty Graphify section replaced.
-
-exit /b 0
-
-:AGENTS_INCOMPLETE
-
-echo.
-echo [WARN] Existing Graphify instructions appear incomplete.
-echo        Existing AGENTS.md was NOT overwritten.
-echo        Manually merge the Graphify section from the setup kit.
-set "HAS_WARN=1"
-
+call :MERGE_INSTRUCTIONS Setup
+if errorlevel 1 set "HAS_FAIL=1"
 exit /b 0
 
 
@@ -794,47 +643,6 @@ echo [PASS] Graphify incremental update command succeeded.
 exit /b 0
 
 rem ============================================================
-rem Backup original project configuration
-rem ============================================================
-
-:BACKUP_CONFIG
-
-if defined BACKUP_DIR exit /b 0
-
-set "BACKUP_DIR=%TEMP%\GraphifyCodexBackup_%RANDOM%_%RANDOM%"
-
-mkdir "%BACKUP_DIR%" >nul 2>&1
-
-if errorlevel 1 (
-    echo [FAIL] Could not create backup directory.
-    set "HAS_FAIL=1"
-    exit /b 1
-)
-
-if exist "AGENTS.md" (
-    copy /Y "AGENTS.md" "%BACKUP_DIR%\AGENTS.md" >nul
-    if errorlevel 1 (
-        echo [FAIL] Could not back up AGENTS.md.
-        set "HAS_FAIL=1"
-        exit /b 1
-    )
-)
-
-if exist ".codex\hooks.json" (
-    copy /Y ".codex\hooks.json" "%BACKUP_DIR%\hooks.json" >nul
-    if errorlevel 1 (
-        echo [FAIL] Could not back up hooks.json.
-        set "HAS_FAIL=1"
-        exit /b 1
-    )
-)
-
-echo [INFO] Configuration backup:
-echo "%BACKUP_DIR%"
-
-exit /b 0
-
-rem ============================================================
 rem Check project integration
 rem ============================================================
 
@@ -850,6 +658,7 @@ if exist ".graphifyignore" (
     echo [WARN] .graphifyignore missing.
     set "HAS_WARN=1"
 )
+
 rem ------------------------------------------------------------
 rem Codex CLI
 rem ------------------------------------------------------------
@@ -892,45 +701,11 @@ if not exist ".codex\skills\graphify\references\" (
 )
 
 rem ------------------------------------------------------------
-rem AGENTS.md
+rem Codex and Copilot project instructions
 rem ------------------------------------------------------------
 
-if not exist "AGENTS.md" goto AGENTS_MISSING
-
-findstr /I /C:"## Graphify" "AGENTS.md" >nul 2>&1
-if errorlevel 1 goto AGENTS_INSUFFICIENT
-
-findstr /I /C:"graphify query" "AGENTS.md" >nul 2>&1
-if errorlevel 1 goto AGENTS_INSUFFICIENT
-
-findstr /I /C:"graphify update" "AGENTS.md" >nul 2>&1
-if errorlevel 1 goto AGENTS_INSUFFICIENT
-
-findstr /I /C:"Get-Command graphify" "AGENTS.md" >nul 2>&1
-if errorlevel 1 goto AGENTS_INSUFFICIENT
-
-findstr /I /C:"delegated" "AGENTS.md" >nul 2>&1
-if errorlevel 1 goto AGENTS_INSUFFICIENT
-
-echo [PASS] AGENTS.md contains Graphify instructions.
-
-goto CHECK_HOOK
-
-:AGENTS_MISSING
-
-echo [FAIL] AGENTS.md missing.
-set "HAS_FAIL=1"
-
-goto CHECK_HOOK
-
-:AGENTS_INSUFFICIENT
-
-echo [FAIL] Graphify instructions in AGENTS.md incomplete.
-set "HAS_FAIL=1"
-
-rem ------------------------------------------------------------
-rem Codex hook
-rem ------------------------------------------------------------
+call :MERGE_INSTRUCTIONS Check
+if errorlevel 1 set "HAS_FAIL=1"
 
 :CHECK_HOOK
 

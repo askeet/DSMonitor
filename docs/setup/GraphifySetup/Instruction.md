@@ -1,223 +1,158 @@
-\# Graphify for Codex CLI: Windows Setup
+# Graphify Setup for Codex & GitHub Copilot (Windows)
 
+This package configures Graphify for **Codex CLI, Codex Desktop, and GitHub Copilot in Visual Studio**.
 
+It supports any project language, including Python, C#, .NET/WPF, JavaScript, and TypeScript.
 
-This package configures Graphify for Codex CLI in any local project, on an existing or new Windows machine.
+## 1. Run the installer
 
+Open the `GraphifySetup` folder and run:
 
+**`Graphify_Codex_Windows.bat`**
 
-\## Step 1. Prepare the setup package
-
-
-
-Keep the Graphify setup files in a separate folder outside your projects:
-
-
+The installer displays:
 
 ```text
+1. CHECK existing Graphify configuration
+2. SETUP Graphify for a project
 
-GraphifySetup/
-├── Graphify_Codex_Windows.bat
-├── Graphify_Codex_Setup.md
-├── AGENTS.md
-└── .codex/
-    ├── skills/graphify/
-    └── hooks.json
-
+Choose operation [1,2]?
 ```
 
+Select **2 (SETUP)** and enter the absolute path to your project:
 
+```text
+Enter absolute project path: D:\Repositories\YourProject
+```
 
-\*\*Do not copy the setup package into each project.\*\* The setup script should configure the target repository.
-
-
-
-Run the script from the setup folder, specifying the target project:
-
-
+Alternatively, run the installer directly from a terminal:
 
 ```powershell
-
-.\\Graphify\_Codex\_Windows.bat --setup "D:\\Repositories\\YourProject"
-
+.\Graphify_Codex_Windows.bat --setup "D:\Repositories\YourProject"
 ```
 
+**No additional commands are required for normal installation.**
 
+## 2. Follow the setup prompts
+
+The installer handles the following steps:
+
+1. Detect the Graphify CLI and verify its version.
+2. Offer to install missing prerequisites when supported, with explicit approval.
+3. Install or update the bundled Graphify skill.
+4. Offer each missing `## Graphify` and `## Project Map` section in `AGENTS.md` separately.
+5. Offer each missing `## Graphify` and `## Project Knowledge` section in `.github/copilot-instructions.md` separately.
+6. Configure `.codex/hooks.json` without overwriting unrelated configuration.
+7. Copy `.graphifyignore` to the project root if it does not already exist.
+8. Offer to build the initial code-only knowledge graph.
+9. Run integration checks and display a final PASS/WARN/FAIL report.
+
+Review any prompts before approving changes.
+
+**Existing project instructions, unrelated skills, and GitHub configuration must be preserved.** Updating the Graphify skill replaces only its own folder, after confirmation and backup.
+
+Existing instruction files are backed up before sections are appended. Existing sections are preserved; duplicate headings or missing references require manual review. Repeated setup does not append a section that is already present.
+
+Keep `Merge-ProjectInstructions.ps1` and both instruction templates in the shared setup folder beside the BAT. The merger uses PowerShell 7 when available or Windows PowerShell under the existing execution policy.
+
+## 3. Expected project structure
 
 After setup, the target project should contain:
 
-
-
 ```text
-
 YourProject/
-
-├── .codex/
-
-│   ├── skills/graphify/
-
-│   └── hooks.json
-
 ├── AGENTS.md
-
-├── .graphifyignore       # If configured
-
-└── graphify-out/         # Generated project graph
-
+├── .graphifyignore
+├── .codex/
+│   ├── hooks.json
+│   └── skills/
+│       └── graphify/
+│           ├── SKILL.md
+│           ├── .graphify_version
+│           └── references/
+│               ├── query.md
+│               └── update.md
+├── .github/
+│   └── copilot-instructions.md
+└── graphify-out/
+    └── graph.json
 ```
 
+`graphify-out/` is generated only if graph creation is approved and succeeds.
 
+The installer does not generate `docs/AI/PROJECT_MAP.md`. Agents create or maintain that project-specific document from the project's source and documentation according to the Project Map instructions in `AGENTS.md`.
 
-\*\*Important:\*\* The setup must safely merge Graphify into the target project's existing AGENTS.md and .codex/ configuration, preserving all unrelated instructions, skills, and hooks. If AGENTS.md contains only a ## Graphify heading, populate it with the complete Graphify usage, freshness-check, and incremental-update rules. Never overwrite existing project configuration.
+The reusable `GraphifySetup` package remains in its original location. It can be reused for other repositories without copying the installer into each project.
 
+## 4. Verify the installation
 
-The `.bat` script and setup documentation remain in the shared `GraphifySetup` folder for reuse across projects.
+The installer automatically performs integration checks after setup.
 
+For a later verification, run the same `.bat` file and select:
 
+**1 (CHECK)**
 
-\## Step 2. Open PowerShell
-
-
-
-Open PowerShell in the project directory.
-
-
-
-Example:
-
-
+Or use:
 
 ```powershell
-
-cd D:\\Repositories\\Python\\YourProject
-
+.\Graphify_Codex_Windows.bat --check "D:\Repositories\YourProject"
 ```
 
+The checks cover the Graphify executable, skill, both sections in each instruction file, hooks, project graph, and a real graph query when a graph exists. Existing sections are checked for their skill or map reference; review their content when checks report missing references or duplicate headings.
 
+Some warnings may be expected, especially if graph creation was skipped or optional components were unavailable.
 
-\## Step 3. Check existing installation
+## 5. Verify agent integration (optional)
 
-
-
-```powershell
-
-.\\Graphify\_Codex\_Windows.bat --check .
-
-```
-
-
-
-This checks the existing Graphify installation and project integration.
-
-
-
-Warnings are expected on a new machine.
-
-
-
-\## Step 4. Install or configure Graphify
-
-
-
-```powershell
-
-.\\Graphify\_Codex\_Windows.bat --setup .
-
-```
-
-
-
-Review and approve any proposed installations or configuration changes.
-
-
-
-The setup should configure the project-local Codex integration.
-
-
-
-\## Step 5. Verify configuration
-
-
-
-Confirm that:
-
-
-
-\- Graphify CLI runs successfully.
-
-\- `.codex/skills/graphify/SKILL.md` exists.
-
-\- `AGENTS.md` contains actual Graphify usage and update instructions, not just the `## Graphify` heading.
-
-\- `.codex/hooks.json` references a valid executable on this machine.
-
-\- A Graphify knowledge graph exists and can be queried.
-
-
-
-If the graph has not been created, run:
-
-
-
-```powershell
-
-graphify extract . --code-only
-
-```
-
-
-
-Use the full executable path if `graphify` is unavailable on PATH.
-
-
-
-\## Step 6. Verify inside Codex CLI
-
-
-
-Open a new Codex session in the project and enter:
-
-
+Open a new Codex session in the configured project and enter:
 
 ```text
+Analyze the project's main components and dependencies.
 
-Analyze the main components and their dependencies.
-
-Follow the Graphify instructions in AGENTS.md.
-
-Report the Graphify commands executed and graph freshness.
+Automatically follow AGENTS.md and the Graphify skill.
+Check graph freshness before analysis.
+Report Graphify commands executed and freshness status.
 
 Do not modify source code.
-
 ```
 
+Codex should discover the Graphify instructions without manual skill selection.
 
+For **GitHub Copilot in Visual Studio**, use Agent Mode with the necessary command execution permissions. Copilot can follow the repository instructions, but ordinary inline code completion does not guarantee Graphify execution.
 
-You do not need to select the Graphify skill manually.
+## 6. Daily use
 
+Graphify maintenance is **agent-driven**:
 
+- **Before analysis:** Check graph freshness. Create a missing graph or update an outdated graph when writes are permitted.
+- **After code changes:** Run `graphify update .` from the repository root.
+- **After delegated changes:** The coordinator refreshes the graph before dependency analysis or independent QA.
+- **Documentation-only changes:** No graph update is required.
+- **Explicitly read-only tasks:** Do not modify graph files; use source inspection when necessary.
 
-\## Daily use
+The skill handles executable resolution across Windows, macOS, and Linux. This installer itself is Windows-specific.
 
+### Git and generated files
 
+Add the following entry to the project's `.gitignore`:
 
-Codex should:
+```gitignore
+# Graphify generated data
+graphify-out/
+```
 
+Commit the Graphify configuration and agent instructions, but normally exclude generated graphs and caches.
 
+When a repository is cloned onto another computer, the graph can be created on first use by an appropriately authorized agent.
 
-1\. Check graph freshness before relevant codebase analysis.
+### Important limitations
 
-2\. Use Graphify for dependencies and impact analysis.
+- Graphify does not continuously monitor files in the background.
+- Manual edits or Git operations in Visual Studio do not immediately update the graph.
+- Codex or Copilot Agent Mode can check and refresh it at the next relevant task.
+- The existing `graphify hook-check` is a no-op in version 0.9.112.
+- Git hooks, file watchers, software installation, and system configuration changes require explicit approval.
 
-3\. Run `graphify update .` after code changes, including delegated changes.
+---
 
-4\. Report if the graph is current, updated, or stale.
-
-
-
-Graph updates depend on Codex following these instructions. The existing no-op hook does not enforce updates.
-
-
-
-\*\*Setup is complete when a real Graphify query succeeds and Codex demonstrates that it can use the graph without manual skill selection.\*\*
-
+**Setup is complete when the installer reports successful integration and an agent can discover and use Graphify without manual skill selection.**
